@@ -1,0 +1,96 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename "${0}") <git url>" 1>&2
+    exit 1
+}
+
+URL=""
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${URL}" ]; then
+                URL="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${URL}" ] && usage
+PARENT_DIR="$(pwd)"
+
+function choose() {
+    local prompt="${1}"
+    shift
+    local list="${@}"
+    # print names with numbers prefixed and prompt for number
+    echo 1>&2
+    echo "${prompt}" 1>&2
+    for i in $(seq 1 $(echo "${list}" | wc -l)); do
+        echo "${i}) $(echo "${list}" | sed -n ${i}p)" 1>&2
+    done
+    read -p "Choose number: " -r REPLY
+    [ -z "${REPLY}" ] && echo "Abort." 1>&2 && exit 1
+    choice="$(echo "${list}" | sed -n ${REPLY}p)"
+    echo "Chose '${choice}'" 1>&2
+    echo "${choice}"
+}
+
+if [[ ! "${URL}" =~ ^(https?|ssh)://.* ]] && [[ ! "${URL}" =~ ^git@.* ]]; then
+    echo 1>&2
+    echo "Looking for repository: ${URL}" 1>&2
+    repo="$(git-search "${URL}")"
+    if [ -z "${repo}" ]; then
+        echo "ERROR: No such repository: ${URL}" 1>&2
+        exit 1
+    fi
+    count=$(echo "${repo}" | wc -l)
+    if [ ${count} -gt 1 ]; then
+        repo="$(choose "Choose repository:" "${repo}")"
+    else 
+        echo "Found repository: ${repo}" 1>&2
+    fi
+    if [[ "${repo}" =~ github\.com/ ]]; then
+        repo_url="$(gh repo view "${repo}" --json sshUrl | jq -r '.sshUrl')"
+    else
+        repo_url="$(glab repo view "${repo}" -F json | jq -r '.ssh_url_to_repo')"
+    fi
+    if [ -n "${repo_url}" ]; then
+        URL="${repo_url}"
+        echo "${URL}" 1>&2
+        echo 1>&2
+    fi
+fi
+
+REPO_PATH=""
+if [[ "${URL}" =~ ^git@.* ]]; then
+    REPO_PATH="$(echo "${URL}" | cut -d':' -f2-)"
+elif [[ "${URL}" =~ ^(https?|ssh)://.* ]]; then
+    REPO_PATH="$(echo "${URL}" | cut -d'/' -f4-)"
+fi
+
+[ -n "${REPO_PATH}" ] && PARENT_DIR="${WORKSPACE}/$(dirname "${REPO_PATH}")"
+
+read -e -p "Enter parent directory to clone into: " -i "${PARENT_DIR}" PARENT_DIR 1>&2
+[ -z "${PARENT_DIR}" ] && echo "Abort." 1>&2 && exit 1
+
+mkdir -p "${PARENT_DIR}" 1>&2
+cd "${PARENT_DIR}" 1>&2
+PARENT_DIR="$(pwd)"
+
+DIR_NAME="$(basename "${URL}" .git)"
+if [ -d "${DIR_NAME}" ]; then
+    read -p "WARNING: ${PARENT_DIR}/${DIR_NAME} already exists, remove it first? [y/N] " -r 1>&2
+    [[ ! $REPLY =~ ^[Yy]$ ]] && echo "Abort." 1>&2 && exit 1
+    rm -rf "${DIR_NAME}" 1>&2
+fi
+
+git clone "${URL}" 1>&2
+dev-find-project --update-listing
+echo "${PARENT_DIR}/${DIR_NAME}"

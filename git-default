@@ -1,0 +1,44 @@
+#!/bin/bash
+
+usage() {
+    cat <<EOF 1>&2
+usage: $(basename "${0}") [OPTIONS]
+
+Prints the name of the default remote branch, e.g. "master" or "main".
+
+Options:
+    -h, --help                 Show this help message
+    --fqn, --fully-qualified   Print the fully qualified name
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+fqn=0
+
+while [ ${#} -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --fqn|--fully-qualified)
+            fqn=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
+ref="$(git -C "${git_dir}" symbolic-ref --short refs/remotes/origin/HEAD)" || fail "Not a git repo?"
+[ "${fqn}" -eq 0 ] && basename "${ref}" || echo "${ref}"

@@ -1,0 +1,244 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename $0) [-c|--create] [-m|--copy-message] [-i|--issue] [-b|--branch <branch>] [-A|--all] <project>" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: $1" 1>&2
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+fail() {
+    local message="$1"
+    [ -z "${message}" ] && message="Failed."
+    error "${message}" 1>&2
+    exit 1
+}
+
+commit-to-title() {
+    local last_commit_message
+    last_commit_message="$(git log -1 --pretty=%s)"
+    if [[ "${last_commit_message}" =~ ^[[:alnum:]]+\([^\)]+\):[[:space:]]*(.+)$ ]]; then
+        last_commit_message="${BASH_REMATCH[1]}"
+    fi
+    # uppercase first letter
+    [ -n "${last_commit_message}" ] && last_commit_message="${last_commit_message^}"
+    echo "${last_commit_message}"
+    return 0
+}
+
+wait_for_mr() {
+    local branch="${1}"
+    local iid=""
+    local attempts=0
+    while [ -z "${mr_json}" ]; do
+        attempts=$((attempts + 1))
+        glab_mr_list_args=("--source-branch" "${branch}" "--output" "json")
+        iid="$(glab mr list "${glab_mr_list_args[@]}" | jq -r '.[0].iid // empty')"
+        if [ -n "${iid}" ]; then
+            echo "${iid}"
+            return 0
+        fi
+        [ "${attempts}" -ge 6 ] && break
+        sleep 5
+    done
+    return 1
+}
+
+copy_message() {
+    local mr_iid="${1}"
+    local mr_json=""
+    local glab_mr_view_args=("${mr_iid}" "--output" "json")
+    mr_json="$(glab mr view "${glab_mr_view_args[@]}")"
+    if [ -n "${mr_json}" ]; then
+        echo "${mr_json}" \
+            | jq -r '. | "@hier *" + .title + "* (`" + .source_branch + "` → `" + .target_branch + "`)" + "\n" + .web_url' \
+            | clip
+        echo "Channel message copied to clipboard." 1>&2
+        return 0
+    fi
+    return 1
+}
+
+NL=$'\n'
+all=0
+create=0
+branch=""
+cd_project=1
+copy_message=0
+issue=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        -c|--create)
+            create=1
+            ;;
+        -A|--all)
+            all=1
+            ;;
+        -b|--branch)
+            shift
+            [ -z "${1}" ] && usage
+            branch="${1}"
+            ;;
+        -m|--copy-message)
+            copy_message=1
+            ;;
+        -i|--issue)
+            issue=1
+            ;;
+        *)
+            [ -z "${project}" ] || usage
+            project="${1}"
+            ;;
+    esac
+    shift
+done
+
+[ "${all}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-A|--all can not be combined with -c|--create" && usage
+[ "${copy_message}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-m|--copy-message can not be combined with -c|--create" && usage
+[ "${issue}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-i|--issue can not be combined with -c|--create" && usage
+[ "${issue}" -eq 1 ] && [ "${copy_message}" -eq 1 ] && error "-i|--issue can not be combined with -m|--copy-message" && usage
+
+if [ -z "${project}" ]; then
+    git_dir="$(git rev-parse --show-toplevel 2>/dev/null)"
+    [ -n "${git_dir}" ] && cd "${git_dir}"
+    if project="$(git remote get-url origin)"; then
+        cd_project=0
+    else
+        fail "Failed to determine project"
+    fi
+fi
+
+if [ ${cd_project} -eq 1 ]; then
+    folder="$(dev-find-project "${project}")" || fail "Failed to find project: ${project}"
+    cd "${folder}" 1> /dev/null || fail "Failed to change to: ${folder}"
+fi
+url="$(git remote get-url origin)" || fail "Failed to determine origin"
+previous_branch="$(git branch --show-current)"
+
+[[ "${url}" =~ "github.com" ]] && fail "Not a gitlab repository: ${url}"
+
+if [ -z "${branch}" ]; then
+    sleep 1 # might be a subsequent call, right after the branch was created
+    if ! branch="$(git branch --show-current)"; then
+        fail "Failed to determine branch"
+    fi
+else
+    if git-checkout "${branch}"; then
+        git pull
+    else
+        error "Failed to checkout branch: ${branch}, continue anyway"
+    fi
+fi
+
+echo
+echo "URL:    ${url}"
+echo "Branch: ${branch}"
+echo
+
+if [ "${create}" -eq 0 ]; then
+    glab_mr_list_args=()
+    if [ "${branch}" == "$(git-default)" ]; then
+        glab_mr_list_args+=("--target-branch")
+    else
+        glab_mr_list_args+=("--source-branch")
+    fi
+    glab_mr_list_args+=("${branch}")
+    [ "${all}" -eq 1 ] && glab_mr_list_args+=("--all")
+    if [ "${issue}" -eq 1 ]; then
+        glab_mr_list_args+=("-P")
+        glab_mr_list_args+=("10")
+        echo "Open MRs: "
+        glab mr list --order "updated_at" "${glab_mr_list_args[@]}"
+        echo
+        echo "Merged MRs:"
+        glab mr list --order "merged_at" --merged "${glab_mr_list_args[@]}"
+        echo
+        mr="$(prompt-input "Choose MR:")"
+        mr_json="$(glab mr view "${mr}" --output "json")"
+        mr_link="$(echo "${mr_json}" | jq -r '.web_url // empty')"
+        mr_title="$(echo "${mr_json}" | jq -r '.title // empty')"
+        mr_description="$(echo "${mr_json}" | jq -r '.description // empty')"
+        [ -z "${mr_title}" ] && fail "Failed to read MR title"
+
+        qwen_json="$(qwen-auto -c /issue:from-pr-mr "${mr_title}${NL}${mr_description}")"
+        title="$(echo "${qwen_json}" | jq -r '.title // empty')"
+        description="$(echo "${qwen_json}" | jq -r '.description // empty')"
+        description="$(echo -e "${description}\n\nSee: ${mr_link}")"
+        title="$(prompt-input "Title:" --default "${title}")" || abort
+        assignee="$(prompt-input "Assignee:" --default "dgrieser")"
+        glab_issue_create_args=("--assignee" "${assignee}")
+        glab_issue_create_args+=("--title" "${title}")
+        if [ -n "${description}" ]; then
+            glab_issue_create_args+=("--description" "${description}")
+            echo -e "Description:\n${description}"
+        fi
+        glab_issue_create_args+=("--web")
+        echo
+        prompt-continue || abort
+        glab issue create "${glab_issue_create_args[@]}"
+    else
+        glab_mr_list_args+=("-P")
+        glab_mr_list_args+=("100")
+        glab mr list --order "updated_at" "${glab_mr_list_args[@]}"
+        echo
+        mr=$(prompt-input "Choose MR:")
+        if [ "${copy_message}" -eq 1 ]; then
+            copy_message "${mr}"
+        else
+            glab mr show "${mr}"
+            glab mr diff "${mr}"
+            echo
+            prompt-continue || abort
+            glab mr approve "${mr}" && \
+            glab mr merge "${mr}"
+        fi
+    fi
+else
+    target_branch=""
+    source_branch=""
+    # really not sure about this automagic
+    if [ "${branch}" == "${previous_branch}" ]; then
+        source_branch="${branch}"
+        target_branch="$(git-default)"
+    else
+        target_branch="${branch}"
+        source_branch="${previous_branch}"
+    fi
+    echo "Creating MR for ${source_branch} → ${target_branch}..."
+
+    git fetch --all
+
+    last_commit_message="$(commit-to-title)"
+    echo
+    prompt_args=()
+    [ -n "${last_commit_message}" ] && prompt_args+=("--default" "${last_commit_message}")
+    title="$(prompt-input "Title:" "${prompt_args[@]}")" || abort
+    [ -z "${title}" ] && abort
+    draft="$(prompt-no-yes "Draft?" && echo 1 || echo 0)"
+    if [ "${source_branch}" == "$(git-default)" ]; then
+        keep_source_branch=1
+    else
+        keep_source_branch="$(prompt-no-yes "Keep source branch ${branch}?" && echo 1 || echo 0)"
+    fi
+    squash_before_merge="$(prompt-no-yes "Squash before merge?" && echo 1 || echo 0)"
+    glab_mr_create_args=("--source-branch" "${source_branch}" "--target-branch" "${target_branch}" "--title" "${title}" "--assignee" "dgrieser")
+    # --fill will automatically push source branch changes, so don't fill when source branch is (master/main)
+    [ "${source_branch}" != "$(git-default)" ] && glab_mr_create_args+=("--fill" "--fill-commit-body")
+    [ "${keep_source_branch}" -eq 0 ] && glab_mr_create_args+=("--remove-source-branch")
+    [ "${squash_before_merge}" -eq 1 ] && glab_mr_create_args+=("--squash-before-merge")
+    [ "${draft}" -eq 1 ] && glab_mr_create_args+=("--draft")
+    glab mr create "${glab_mr_create_args[@]}"
+    mr_iid="$(wait_for_mr "${source_branch}")" && copy_message "${mr_iid}"
+fi
+
+cd - &> /dev/null

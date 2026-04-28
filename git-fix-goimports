@@ -1,0 +1,32 @@
+#!/bin/bash
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+git-track-branches || exit 1
+git checkout master || fail "Not a git repo?" 
+branches="$(git branch --list --format="%(refname:short)" --sort=-committerdate | head -n 10)"
+choice="$(choose -n -p "Choose branch:" "${branches}")"
+[ $? -eq 0 ] || abort
+git checkout "${choice}" || fail "Failed to checkout branch ${choice}"
+echo; echo "Running make imports..." 1>&2
+make imports && echo "Done." 1>&2 || warning "Failed to run make imports"
+echo; echo "Running goimports..."
+goimports -w -d $(find . -type f -name '*.go' -not -name 'zz_generated.*') && echo "Done." 1>&2 || warning "Failed to run goimports"
+echo
+git-push

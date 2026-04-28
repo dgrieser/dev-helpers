@@ -1,0 +1,133 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") [<tag>] [-d|--delete] [-r|--recreate] [-y|--yes]" 1>&2
+    exit 1
+}
+
+warning() {
+    echo -e "\e[1mWARNING\e[0m: ${1}" 1>&2
+}
+
+error() {
+    echo -e "\e[1mERROR\e[0m: ${1}" 1>&2
+}
+
+fail() {
+    local message="${1}"
+    [ -z "${message}" ] && message="Failed."
+    error "${message}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+get_fq_tag() {
+    local tag="${1}"
+    local fq_tag
+    fq_tag="$(git show-ref --tags "${tag}" | awk '{ print $2 }' | head -n 1)"
+    [ -z "${fq_tag}" ] && fq_tag="refs/tags/${tag}" && warning "Assuming fully qualified tag name \e[1m${fq_tag}\e[0m"
+    echo "${fq_tag}"
+}
+
+yes=0
+create=1
+delete=0
+tag=""
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -d|--delete)
+            create=0
+            delete=1
+            ;;
+        -r|--recreate)
+            create=1
+            delete=1
+            ;;
+        -y|--yes)
+            yes=1
+            ;;
+        *)
+            if [ -z "${tag}" ]; then
+                tag="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+git fetch --all || fail "No git repo? Abort."
+recent_tags="$(git tag --sort=-v:refname | head -n 10 | tac)"
+last_tag="$(echo "${recent_tags}" | tail -n 1)"
+next_tag=""
+[ -n "${last_tag}" ] && [ "${create}" -eq 1 ] && next_tag="$(bump-version "${last_tag}" --no-semver 2>/dev/null)"
+[ -z "${last_tag}" ] && [ "${create}" -eq 1 ] && next_tag="v0.0.1"
+echo -e "\e[1mRecent tags\e[0m:" && echo "${recent_tags}" && echo
+echo -e "\e[1mCurrent branch\e[0m:\n$(git branch --show-current)" && echo
+
+if [ -z "${tag}" ]; then
+    message="Tag name"
+    if [ "${delete}" -eq 1 ]; then
+        next_tag="${last_tag}"
+        [ "${create}" -eq 1 ] && message="${message} to recreate" || message="${message} to delete"
+    fi
+    [ "${yes}" -eq 1 ] && tag="${next_tag}" || tag="$(prompt --single-line --default "${next_tag}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
+    [ -z "${tag}" ] && abort
+fi
+
+if [ "${delete}" -eq 1 ]; then
+    if [ "${yes}" -eq 0 ]; then
+        echo && warning "This will delete \e[1m${tag}\e[0m"
+        echo
+        prompt-continue-yes || abort
+        echo; echo -e "Checking for matching packages for \e[1m${tag}\e[0m..."
+        if git-package check &>/dev/null; then
+            git-package delete --version "${tag}"; exit_code=$?
+            [ "${exit_code}" -eq 130 ] && exit 130
+        else
+            echo -e "No matching packages found for \e[1m${tag}\e[0m"
+        fi
+        echo
+    fi
+    echo -e "\e[1m${tag}\e[0m -> \e[1m✗\e[0m" && echo
+    fq_tag="$(get_fq_tag "${tag}")"
+    if ! git tag -d "${tag}"; then
+        echo && error "$(echo -e "Failed to delete tag locally \e[1m${tag}\e[0m")"
+        if [ "${yes}" -eq 0 ]; then
+            prompt-continue || abort
+        fi
+    fi
+    git push --delete origin "${fq_tag}"
+fi
+
+if [ "${create}" -eq 1 ]; then
+    [ "${delete}" -eq 1 ] && echo
+    if [ "${yes}" -eq 0 ]; then
+        echo -e "This will tag \e[1m$(git branch --show-current)\e[0m -> \e[1m${tag}\e[0m"
+        echo
+        prompt-continue-yes || abort 
+    fi
+    echo -e "\e[1m$(git branch --show-current)\e[0m -> \e[1m${tag}\e[0m" && echo
+    fq_tag="$(get_fq_tag "${tag}")"
+    git tag -f "${tag}" && git push origin "${fq_tag}"
+    [ $? -ne 0 ] && abort
+
+    url=$(git config --get remote.origin.url)
+    [[ "${url}" =~ "github.com" ]] && exit 0
+
+    sleep 2
+    echo
+    ci_count=$(glab ci list -F json | jq 'length' 2>/dev/null | sed 's/^$/0/')
+    if [ "${ci_count}" -gt 0 ]; then
+        glab ci status -l -b "${tag}" || true
+    fi
+fi

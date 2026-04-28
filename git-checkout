@@ -1,0 +1,62 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+GIT_METADATA_FOLDER="${HOME}/.git-metadata"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [BRANCH]
+
+Checkout the given branch, or the default branch if none is given.
+
+BRANCH          The name of the branch to checkout.
+                If no branch is given, checkout master or main.
+                To checkout the previous branch, use "-".
+
+Options:
+    -h|--help   show this help
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+branch=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${branch}" ]; then
+                branch="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
+default_branch="$(git-default)" || fail "Failed to get default branch"
+checkout_history="${GIT_METADATA_FOLDER}/${git_dir#/}/checkout.history"
+mkdir -p "$(dirname "${checkout_history}")" || fail "Failed to create checkout history folder ${checkout_history}"
+
+[ -z "${branch}" ] && branch="${default_branch}"
+
+if [ "${branch}" = "-" ]; then
+    current_branch="$(git -C "${git_dir}" branch --show-current)"
+    previous_branch="$(cat "${checkout_history}" 2>/dev/null | cut -f2- | grep -vFx "${current_branch}" | tail -n 1)"
+    [ -n "${previous_branch}" ] && branch="$(echo "${previous_branch}" | cut -f2-)" || branch="${default_branch}"
+fi
+
+git -C "${git_dir}" checkout "${branch}" && echo -e "$(date +%s)\t${branch}" >> "${checkout_history}"

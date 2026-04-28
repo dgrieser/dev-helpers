@@ -1,0 +1,13 @@
+#!/bin/bash
+
+if [ "$#" -ne 1 ]; then
+	echo "Usage: $(basename $0) <branch-name>"
+	exit 1
+fi
+
+echo
+echo -n "Create branch \"${1}\"?"
+read
+echo
+
+git checkout -b $1

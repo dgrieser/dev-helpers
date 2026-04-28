@@ -1,0 +1,210 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} COMMAND [ID] [OPTIONS]
+
+List, inspect, filter, and delete GitLab packages for the current repository.
+
+COMMAND
+    check                   check if the repository has packages
+    list                    list packages
+    delete                  delete packages
+
+ID                          package id
+
+Options:
+    -h|--help               show this help
+    -n|--name <NAME>        filter packages by name
+    -v|--version <VERSION>  filter packages by version
+    -o|--output <txt|json>  output format: txt or json
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 130
+}
+
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "missing required command: ${1}"
+}
+
+project_id() {
+    if [ -z "${PROJECT_ID:-}" ]; then
+        PROJECT_ID="$(glab repo view -F json | jq -r '.id')"
+        [ -z "${PROJECT_ID}" ] && fail "failed to determine GitLab project id"
+        [ "${PROJECT_ID}" = "null" ] && fail "failed to determine GitLab project id"
+    fi
+    printf '%s\n' "${PROJECT_ID}"
+}
+
+list_packages_json() {
+    glab api "projects/$(project_id)/packages" --paginate && return 0 || return 1
+}
+
+filter_packages_json() {
+    local id="${1}"; shift
+    local name="${1}"; shift
+    local version="${1}"; shift
+    local result=""
+
+    result="$(list_packages_json)"
+    echo "${result}" | jq \
+        --arg id "${id}" \
+        --arg name "${name}" \
+        --arg version "${version}" \
+        '
+        [
+            .[]
+            | select(($id == "" or (.id | tostring) == $id) and ($name == "" or .name == $name) and ($version == "" or .version == $version))
+        ]
+        '
+}
+
+print_packages_table() {
+    jq -r '
+        (["ID", "NAME", "VERSION"] | @tsv),
+        (.[] | [(.id | tostring), .name, (.version // "")] | @tsv)
+    ' | column -t -s "$(printf '\t')"
+}
+
+show_selection() {
+    local id="${1}"; shift
+    local name="${1}"; shift
+    local version="${1}"; shift
+    local output="${1}"; shift
+    local result=""
+
+    result="$(filter_packages_json "${id}" "${name}" "${version}")"
+    [ "${output}" = "txt" ] && result="$(print_packages_table <<< "${result}")"
+    echo "${result}"
+}
+
+delete_selection() {
+    local id="${1}"; shift
+    local name="${1}"; shift
+    local version="${1}"; shift
+    local json=""
+    local ids=()
+    local current_id=""
+    local current_name=""
+    local current_version=""
+
+    json="$(filter_packages_json "${id}" "${name}" "${version}")"
+    readarray -t ids < <(jq -r '.[] | .id' <<< "$json")
+    [ "${#ids[@]}" -eq 0 ] && fail "No matching packages found"
+
+    for current_id in "${ids[@]}"; do
+        current_name="$(jq -r ".[] | select(.id == ${current_id}) | .name" <<< "${json}")"
+        current_version="$(jq -r ".[] | select(.id == ${current_id}) | .version // \"\"" <<< "${json}")"
+        echo 1>&2
+        warning "Deleting package ${current_name}:${current_version} (${current_id})"
+        prompt-yes-no "Are you sure?"; exit_code=$?
+        [ "${exit_code}" -eq 0 ] && glab api --method DELETE "projects/$(project_id)/packages/${current_id}" && echo "Deleted package ${current_name}:${current_version} (${current_id})."
+        [ "${exit_code}" -eq 1 ] && echo "Skipping package."
+        [ "${exit_code}" -eq 130 ] && abort
+    done
+}
+
+need_cmd glab
+need_cmd jq
+need_cmd column
+
+action=""
+id=""
+name_arg=""
+version_arg=""
+output="txt"
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -n|--name)
+            shift
+            [ -z "${1:-}" ] && usage && error "Missing name argument" && usage
+            name_arg="${1}"
+            ;;
+        -v|--version)
+            shift
+            [ -z "${1:-}" ] && usage && error "Missing version argument" && usage
+            version_arg="${1}"
+            ;;
+        -o|--output)
+            shift
+            [ -z "${1:-}" ] && usage && error "Missing output argument" && usage
+            [ "${1}" != "txt" ] && [ "${1}" != "json" ] && error "Invalid output argument: ${1}" && usage
+            output="${1}"
+            ;;
+        list|delete|check)
+            [ -n "${action}" ] && error "Unknown command: ${action}" && usage
+            action="${1}"
+            ;;
+        *)
+            if [ -z "${id}" ]; then
+                ! [[ "${1:-}" =~ ^[0-9]+$ ]] && error "Invalid package id: ${1}" && usage
+                id="${1}"
+            else
+                error "Unknown argument: ${1}"
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${action}" ] && action="get"
+
+if [ "${action}" == "delete" ] || [ "${action}" == "get" ]; then
+    # argument checks
+    [ -z "${id}" ] && [ -z "${name_arg}" ] && [ -z "${version_arg}" ] && error "Either ID, --name, or --version must be specified" && usage
+    [ -n "${id}" ] && { [ -n "${name_arg}" ] || [ -n "${version_arg}" ]; } && error "Either ID or --name/--version must be specified" && usage
+elif [ -n "${id}" ] || [ -n "${name_arg}" ] || [ -n "${version_arg}" ]; then
+    error "Unexpected arguments for command ${action}" && usage
+fi
+
+case "${action}" in
+    check)
+        result="$(list_packages_json 2>/dev/null)"; exit_code=$?
+        count="$(jq -r '. | length' <<< "${result}")"
+        if [ "${exit_code}" -eq 0 ]; then
+            [ "${count}" -gt 0 ] && echo "${count} packages found" && exit 0
+            fail "No packages found"
+        else
+            fail "Failed to list packages"
+        fi
+        ;;
+    list)
+        result="$(list_packages_json)"
+        [ "${output}" == "txt" ] && result="$(print_packages_table <<< "${result}")"
+        echo "${result}"
+        ;;
+    delete)
+        delete_selection "${id}" "${name_arg}" "${version_arg}"
+        ;;
+    get)
+        show_selection "${id}" "${name_arg}" "${version_arg}" "${output}"
+        ;;
+    *)
+        usage
+        ;;
+esac
+exit 0

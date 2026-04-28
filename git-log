@@ -1,0 +1,132 @@
+#!/bin/bash
+
+APP="$(basename "${0}")"
+
+usage() {
+    echo "usage: ${APP} [-h|--help] [--print] [-d|--diff <commit>] [-p|--create-patch <commit>] [-r|--revert <commit>] [-q|--query <query>] [<path ...>]" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+GIT_DIR="$(git rev-parse --show-toplevel)"
+HEADER="COMMIT  DATE  AUTHOR  MESSAGE"
+NL=$'\n'
+KEYS="alt-p,alt-r,alt-d,esc,ctrl-c,ctrl-d,enter"
+paths=()
+mode="list"
+commit=""
+key_result=""
+query=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -d|--diff|-p|--create-patch|-r|--revert)
+            [ "${mode}" != "list" ] && fail "Either use -d|--diff, -p|--create-patch or -r|--revert"
+            case "${1}" in
+                -d|--diff)
+                    mode="diff"
+                    ;;
+                -p|--create-patch)
+                    mode="patch"
+                    ;;
+                -r|--revert)
+                    mode="revert"
+                    ;;
+            esac 
+            shift
+            [ -z "${1}" ] && fail "You must specify a commit"
+            commit="${1}"
+            ;;
+        --print)
+            mode="print"
+            ;;
+        -q|--query)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for query"
+            query="${1}"
+            ;;
+        --key)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for key"
+            key_result="${1}"
+            ;;
+        *)
+            paths+=("${1}")
+            ;;
+    esac
+    shift
+done
+
+if [ -n "${key_result}" ]; then
+    key="$(echo "${key_result}" | head -n 1)"
+    line="$(echo "${key_result}" | tail -n 1)"
+    commit="$(echo "${line}" | awk '{print $1}')"
+    case "${key}" in
+        alt-p)
+            mode="patch"
+            ;;
+        alt-r)
+            mode="revert"
+            ;;
+        alt-d)
+            mode="diff"
+            ;;
+        esc|ctrl-c|ctrl-d)
+            exit 255
+            ;;
+        enter)
+            echo "${line}"
+            echo -n "${commit}" | clip
+            exit 1
+            ;;
+        *)
+            fail "Unknown key: ${key}"
+            ;;
+    esac
+fi
+
+case "${mode}" in
+    diff)
+        git --no-pager diff --color=always "${commit}^!" -- "${paths[@]}" | less -R
+        exit 1
+        ;;
+    patch)
+        git format-patch -1 "${commit}"
+        exit 1
+        ;;
+    revert)
+        git revert --no-commit "${commit}"
+        echo "Run git commit..."
+        exit 1
+        ;;
+esac
+
+
+result="$(echo "${HEADER}${NL}$(git log --color=always --pretty=format:"%h  %C(6)%cI%Creset  %C(33)%cl%Creset  %s" "${paths[@]}")" | k-format)"
+
+case "${mode}" in
+    list)
+        echo "${result}" | fzf-with-header --key-command "${APP} --key" \
+                                           --columns 2,3,4,5 \
+                                           --command "${APP} --print ${paths[@]}" \
+                                           "${query}" \
+                                           --preview='git show --color=always {1}' \
+                                           --preview-window=right:50%,wrap \
+                                           --expect="${KEYS}" \
+                                           --no-sort 
+        ;;
+    print)
+        echo "${result}"
+        ;;
+esac

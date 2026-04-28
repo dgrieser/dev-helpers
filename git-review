@@ -1,0 +1,75 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename $0) <URL|ID>" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: $1" 1>&2
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+fail() {
+    local message="$1"
+    [ -z "${message}" ] && message="Failed."
+    error "${message}" 1>&2
+    exit 1
+}
+
+id=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${id}" ]; then
+                id="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${id}" ] && usage
+
+source_branch=""
+
+if [[ "${id}" =~ ^https?:// ]]; then
+    base_url="${id%%/-/*}"
+    [ -z "${base_url}" ] && fail "Unsupported URL: ${id}"
+    mr_id="$(echo "${id}" | grep -oE '/merge_requests/[0-9]+' | grep -oE '[0-9]+')"
+    if [ -z "${mr_id}" ]; then
+        source_branch="$(echo "${id}" | grep -oE '/tree/.+$' | sed -E 's|^/tree/([^\?]+).*$|\1|')"
+        [ -z "${source_branch}" ] && fail "Unsupported URL: ${id}"
+    else
+        id="${mr_id}"
+    fi
+    cd "$(dev-find-project "${base_url}")" 2> /dev/null || fail "Unable to find project for URL: ${id}"
+elif [[ "${id}" =~ ^!?[0-9]+$ ]]; then
+    id="$(echo "${id}" | grep -oE '[0-9]+')"
+    git_root_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not inside a Git repository"
+    cd "${git_root_dir}" 1>&2 || fail "Unable to change directory to: ${git_root_dir}"
+else
+    fail "Unsupported ID: ${id}"
+fi
+
+git-checkout 1>&2 || fail "Unable to checkout remote branch"
+git pull 1>&2 || fail "Unable to pull remote branch"
+if [ -z "${source_branch}" ]; then
+    source_branch="$(glab mr view "${id}" -F json | jq -r '.source_branch')" || fail "Unable to get source branch for MR: ${id}"
+    target_branch="$(glab mr view "${id}" -F json | jq -r '.target_branch')" || fail "Unable to get target branch for MR: ${id}"
+else
+    echo "Switching to source branch: ${source_branch}" 1>&2
+fi
+git-checkout "${source_branch}" 1>&2 || fail "Unable to switch to source branch: ${source_branch}"
+git pull 1>&2 || fail "Unable to pull source branch: ${source_branch}"
+echo "$(pwd)"

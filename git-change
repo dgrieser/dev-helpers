@@ -1,0 +1,111 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") <branch>" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+branch=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${branch}" ]; then
+                branch="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
+
+current_branch="$(git -C "${git_dir}" branch --show-current)"
+default_branch="$(git-default)"
+reset_hash_default_branch=""
+if [ "${current_branch}" == "${default_branch}" ] && [ "$(git -C "${git_dir}" rev-list --count @{u}..HEAD 2>/dev/null)" -gt 0 ]; then
+    warning "You have unpushed commits"
+    git log --oneline @{u}..HEAD
+    echo
+    prompt-no-yes "Move those commits to new branch?"; exit_code=$?
+    [ ${exit_code} -eq 0 ] && reset_hash_default_branch="$(git -C "${git_dir}" merge-base HEAD @{u})"
+    [ ${exit_code} -eq 130 ] && abort
+fi
+
+untracked="$(git -C "${git_dir}" ls-files --others --exclude-standard 2>/dev/null | wc -l)"
+unstaged="$(git -C "${git_dir}" diff --name-only 2>/dev/null | wc -l)"
+anychanges="$(( ${untracked} + ${unstaged} ))"
+
+if [ -z "${branch}" ]; then
+    prompt_args=( "--single-line" "--prompt" "Enter branch name:" )
+    if [ "${current_branch}" != "${default_branch}" ]; then
+        prompt_args+=( "--default" "${current_branch}" )
+    else
+        cmai_args=( "--branch-name-only" )
+        if [ -n "${reset_hash_default_branch}" ] && [ "${anychanges}" -eq 0 ]; then
+            cmai_args+=( "--diff" "${reset_hash_default_branch}...HEAD" )
+        else
+            cmai_args+=( "--unstaged" )
+        fi
+        suggestion="$(cmai "${cmai_args[@]}" 2>/dev/null)"
+        [ -n "${suggestion}" ] && prompt_args+=( "--default" "${suggestion}" )
+    fi
+    branch="$(prompt "${prompt_args[@]}")" || abort
+    [ -z "${branch}" ] && abort
+fi
+
+echo "Branch: ${branch}" 1>&2
+
+git-diff
+echo
+
+
+prompt-continue-yes "Create branch \"${branch}\"?" || abort
+if ! git -C "${git_dir}" branch "${branch}"; then
+    error "Failed to create branch \"${branch}\"."
+    if git -C "${git_dir}" rev-parse --verify --quiet "${branch}" 1>/dev/null; then
+        prompt-yes-no "Use existing branch \"${branch}\"?" || abort
+    else
+        abort
+    fi
+fi
+
+if [ -n "${reset_hash_default_branch}" ]; then
+    git -C "${git_dir}" reset --hard "${reset_hash_default_branch}"
+fi
+git -C "${git_dir}" switch "${branch}" || abort
+git -C "${git_dir}" init
+if [ "${anychanges}" -gt 0 ]; then
+    git-add || abort
+    git -C "${git_dir}" commit || abort
+fi
+git -C "${git_dir}" push -u origin ${branch} || fail "Failed to push branch \"${branch}\"."
+git_host="$(git-browse --print --host-only)"
+if [ "${git_host}" == "github.com" ]; then
+    git-pr -c || abort
+else
+    git-mr -c || abort
+fi

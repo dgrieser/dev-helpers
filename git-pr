@@ -1,0 +1,270 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS]
+
+List open pull requests, or fetch unresolved review content in feedback mode.
+
+Options:
+  -b, --branch  Filter PR listing by head branch and prompt approve/merge flow
+  -c, --create  Create a new PR from the current branch
+      --feedback
+                List PRs, prompt for a PR ID, then print unresolved review
+                content as JSON (current behavior)
+  -h, --help    Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+prompt_pr_id() {
+    local pr
+    pr="$(prompt-input "Choose PR:")"
+    [ -z "${pr}" ] && return 1
+    ! [[ "${pr}" =~ ^[0-9]+$ ]] && error "PR ID must be an integer" && return 1
+    echo "${pr}"
+    return 0
+}
+
+run_approve_merge_flow() {
+    local pr_id="${1}"
+    local action
+
+    cat <<EOF
+Select action:
+  1) approve + merge
+  2) approve only
+  3) merge only
+  4) skip
+EOF
+    action="$(prompt-input "Choice [1-4]: ")" || abort
+    echo
+    case "${action}" in
+        1)
+            gh pr review "${pr_id}" --approve || fail "Failed to approve PR #${pr_id}"
+            gh pr merge "${pr_id}" || fail "Failed to merge PR #${pr_id}"
+            ;;
+        2)
+            gh pr review "${pr_id}" --approve || fail "Failed to approve PR #${pr_id}"
+            ;;
+        3)
+            gh pr merge "${pr_id}" || fail "Failed to merge PR #${pr_id}"
+            ;;
+        4)
+            ;;
+        *)
+            fail "Invalid choice: ${action}"
+            ;;
+    esac
+}
+
+commit-to-title() {
+    local last_commit_message
+    last_commit_message="$(git log -1 --pretty=%s)"
+    if [[ "${last_commit_message}" =~ ^[[:alnum:]]+\([^\)]+\):[[:space:]]*(.+)$ ]]; then
+        last_commit_message="${BASH_REMATCH[1]}"
+    fi
+    # uppercase first letter
+    [ -n "${last_commit_message}" ] && last_commit_message="${last_commit_message^}"
+    echo "${last_commit_message}"
+    return 0
+}
+
+show_feedback() {
+    local id="${1}"; shift
+    PR_BASE_JSON="$(gh api graphql -f query='
+      query($owner: String!, $repo: String!, $pr: Int!) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $pr) {
+            # A) Review threads (fetch IDs only, unresolved filtered later)
+            reviewThreads(first: 100) {
+              nodes {
+                id
+                isResolved
+              }
+            }
+
+            # B) Review-level comments (overall review messages)
+            reviews(first: 100) {
+              nodes {
+                id
+                createdAt
+                body
+                state
+                author { login }
+              }
+            }
+          }
+        }
+      }
+    ' -F owner=':owner' -F repo=':repo' -F pr="${id}")" \
+    || fail "Failed to fetch pull request metadata"
+
+    UNRESOLVED_THREAD_IDS="$(echo "${PR_BASE_JSON}" | jq -r '
+      .data.repository.pullRequest.reviewThreads.nodes[]
+      | select(.isResolved == false)
+      | .id
+    ')"
+
+    THREAD_COMMENTS_JSON='[]'
+    if [ -n "${UNRESOLVED_THREAD_IDS}" ]; then
+        THREAD_COMMENTS_JSON="$(
+            while IFS= read -r THREAD_ID; do
+                [ -z "${THREAD_ID}" ] && continue
+                gh api graphql -f query='
+                  query($id: ID!) {
+                    node(id: $id) {
+                      ... on PullRequestReviewThread {
+                        id
+                        comments(first: 100) {
+                          nodes {
+                            id
+                            createdAt
+                            body
+                            author { login }
+                            path
+                            originalLine
+                            replyTo { id }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ' -F id="${THREAD_ID}" || exit 1
+            done <<< "${UNRESOLVED_THREAD_IDS}" \
+            | jq -s '
+                map(
+                  .data.node
+                  | select(. != null)
+                  | {
+                      threadId: .id,
+                      comments: (.comments.nodes | sort_by(.createdAt))
+                    }
+                )
+              '
+        )" || fail "Failed to fetch unresolved thread comments"
+    fi
+
+    jq -n \
+      --argjson pr "${PR_BASE_JSON}" \
+      --argjson unresolvedThreads "${THREAD_COMMENTS_JSON}" '
+      if ($unresolvedThreads | length) == 0 then
+        []
+      else
+        $pr.data.repository.pullRequest as $pr
+        | ($unresolvedThreads
+           | map(.comments[]?.createdAt)
+           | unique) as $threadCreatedAts
+        | [
+            # 1) review-level comments FIRST
+            ($pr.reviews.nodes[] as $review
+             | select($threadCreatedAts | index($review.createdAt))
+             | {
+                 kind: "review",
+                 createdAt: $review.createdAt,
+                 body: $review.body,
+                 author: $review.author,
+                 state: $review.state
+               }
+            ),
+
+            # 2) then unresolved thread comments
+            ($unresolvedThreads[]
+             | .threadId as $threadId
+             | .comments[]
+             | {
+                 kind: "thread",
+                 threadId: $threadId,
+                 createdAt,
+                 body,
+                 author,
+                 path,
+                 originalLine,
+                 parent: (.replyTo?.id // null)
+               }
+            )
+          ]
+        | sort_by(.createdAt) as $all
+        | if ($all | length) == 0 then
+            []
+          else
+            ($all[0].createdAt[0:10]) as $firstDate
+            | $all
+            | map(select(.createdAt[0:10] == $firstDate))
+          end
+      end
+    '
+}
+
+create=0
+branch=""
+feedback=0
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -b|--branch)
+            shift
+            [ -z "${1}" ] && usage
+            branch="${1}"
+            ;;
+        --feedback)
+            feedback=1
+            ;;
+        -c|--create)
+            create=1
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            error "Unexpected argument: ${1}"
+            usage
+            ;;
+    esac
+    shift
+done
+# use current branch if not specified
+[ -z "${branch}" ] && branch="$(git branch --show-current)"
+
+if [ "${create}" -eq 1 ]; then
+    last_commit_message="$(commit-to-title)"
+    prompt_args=()
+    [ -n "${last_commit_message}" ] && prompt_args+=("--default" "${last_commit_message}")
+    title="$(prompt-input "Title:" "${prompt_args[@]}")" || abort
+    [ -z "${title}" ] && abort
+    draft="$(prompt-no-yes "Draft?" && echo 1 || echo 0)"
+    gh_args=( "--head" "${branch}" "--title" "${title}" )
+    [ "${draft}" -eq 1 ] && gh_args+=( "--draft" )
+    gh pr create "${gh_args[@]}" || fail "Failed to create pull request"
+else
+    gh pr list --state open --head "${branch}" 1>&2 || fail "Failed to list pull requests"
+    echo
+    id="$(prompt_pr_id)" || abort
+    echo
+
+    if [ "${feedback}" -eq 0 ]; then
+        run_approve_merge_flow "${id}"
+    else
+        show_feedback "${id}"
+    fi
+fi
+

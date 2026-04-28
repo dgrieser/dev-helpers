@@ -1,0 +1,12 @@
+#!/bin/bash
+
+git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo."
+git -C "${git_dir}" --no-pager diff HEAD
+readarray -t untracked < <(git ls-files --others --exclude-standard)
+print_header=1
+for f in "${untracked[@]}"; do
+    if [ -e "${f}" ]; then
+        [ ${print_header} -eq 1 ] && echo -e "\n\e[1;31mUNTRACKED\e[0m\n" && print_header=0
+        git -C "${git_dir}" --no-pager diff --no-index /dev/null "${f}"
+    fi
+done

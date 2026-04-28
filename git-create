@@ -1,0 +1,9 @@
+#!/bin/bash
+
+dir="$(prompt-folder)"
+
+repo="${dir#${WORKSPACE}/}"
+LC_ALL=C mkdir -vp "${WORKSPACE}/${repo}"
+LC_ALL=C cd "${WORKSPACE}/${repo}"
+
+glab repo create --group "$(dirname ${repo})" --defaultBranch master

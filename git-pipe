@@ -1,0 +1,43 @@
+#!/bin/bash
+
+usage() {
+    echo "Usage: $(basename $0) [<project>]" 1>&2
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            [ -z "${project}" ] || usage
+            project="${1}"
+            ;;
+    esac
+    shift
+done
+
+cded=0
+if [ -n "$project" ]; then
+    cd "$(dev-find-project "${project}")" || abort
+    cded=1
+fi
+
+current="$(git rev-parse --abbrev-ref HEAD)"
+tags="$(git ls-remote --tags -q | sort -k2 -V | tail -n 5 | sed -E 's|^.+/tags/||')"
+branches="$(git ls-remote --heads -q | sed -E 's|^.+/heads/||')"
+
+echo "${branches}"
+echo "${tags}"
+
+echo
+ref=$(prompt-input "Choose ref" --default "${current}")
+glab ci status --branch "${ref}"
+
+[ "${cded}" -eq 1 ] && cd - &> /dev/null

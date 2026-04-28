@@ -1,0 +1,111 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+ROOT_MODE=0
+GITIGNORE_FILE=".gitignore"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] FILE...
+
+Add file paths, directories, or ignore patterns to the .gitignore in the current directory.
+
+Options:
+  -r, --root        Add entries to the root .gitignore in the git repository root
+  -h, --help        Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+append_ignore_entry() {
+    file="${1}"
+    entry="${2}"
+
+    if [ ! -e "${file}" ]; then
+        : > "${file}"
+    fi
+
+    if grep -Fxq -- "${entry}" "${file}"; then
+        warning "Already ignored: ${entry}"
+        return 0
+    fi
+
+    printf '%s\n' "${entry}" >> "${file}"
+}
+
+normalize_entry() {
+    entry="${1}"
+
+    case "${entry}" in
+        */)
+            printf '%s/\n' "${entry%/}"
+            ;;
+        *)
+            if [ -d "${entry}" ]; then
+                printf '%s/\n' "${entry}"
+            else
+                printf '%s\n' "${entry}"
+            fi
+            ;;
+    esac
+}
+
+entries=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -r|--root)
+            ROOT_MODE=1
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            entries="${entries}${entries:+
+}${1}"
+            ;;
+    esac
+    shift
+done
+
+[ -z "${entries}" ] && usage
+
+if [ ! -d "." ]; then
+    fail "Current directory is not available."
+fi
+
+if [ "${ROOT_MODE}" -eq 1 ]; then
+    GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not inside a git repository."
+    GITIGNORE_FILE="${GIT_ROOT}/.gitignore"
+fi
+
+old_ifs="${IFS}"
+IFS='
+'
+for entry in ${entries}; do
+    [ -z "${entry}" ] && fail "Empty file path is not allowed."
+    append_ignore_entry "${GITIGNORE_FILE}" "$(normalize_entry "${entry}")"
+done
+IFS="${old_ifs}"

@@ -1,0 +1,364 @@
+#!/bin/bash
+
+APP="$(basename "${0}")"
+
+usage() {
+    echo"usage: ${APP} [-h|--help] [-p|--print] [<path ...>] [-s|--stage <path>] [-u|--unstage <path>] [-d|--delete <path>] [-r|--reset <path>] [-i|--ignore <path>] [-q|--query <query>]" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+RED='\e[31m'
+GREEN='\e[32m'
+YELLOW='\e[33m'
+NC='\e[0m'
+
+HEADER="KEY\tTYPE\tPATH"
+KEYS="alt-+,alt--,alt-d,alt-r,alt-i,ctrl-d,ctrl-e,esc,ctrl-c,enter,del,insert,+,-"
+ 
+GIT_DIR="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
+
+RM_CMD="$(command -v trash &>/dev/null && echo 'trash' || echo 'rm')"
+
+UNTRACKED_LIST_CMD='git -C '"${GIT_DIR}"' ls-files --others --exclude-standard -z'
+UNTRACKED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --no-index /dev/null -- '
+
+UNSTAGED_LIST_CMD='git -C '"${GIT_DIR}"' diff --name-only -z'
+UNSTAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --'
+
+STAGED_LIST_CMD='git --no-pager -C '"${GIT_DIR}"' diff --cached --name-only -z'
+STAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --cached --'
+
+STAGE_CMD='git -C '"${GIT_DIR}"' add --'
+UNSTAGE_CMD='git -C '"${GIT_DIR}"' restore --staged --'
+RESET_CMD='git -C '"${GIT_DIR}"' restore --'
+IGNORE_CMD='git-ignore'
+
+PREVIEW_COMMAND='case {2} in'
+PREVIEW_COMMAND+=' untracked) '"${UNTRACKED_DIFF_CMD}"' {3} ;;'
+PREVIEW_COMMAND+=' unstaged) '"${UNSTAGED_DIFF_CMD}"' {3} ;;'
+PREVIEW_COMMAND+=' staged) '"${STAGED_DIFF_CMD}"' {3} ;;'
+PREVIEW_COMMAND+='esac'
+
+print_diff() {
+    local current_state="${1}"; shift
+    local path="${1}"; shift
+    local color=1
+    [ "${1}" == "0" ] && color=0
+    local diff_cmd=""
+    case ${current_state} in
+        untracked) diff_cmd="${UNTRACKED_DIFF_CMD}" ;;
+        unstaged) diff_cmd="${UNSTAGED_DIFF_CMD}" ;;
+        staged) diff_cmd="${STAGED_DIFF_CMD}" ;;
+    esac
+    if [ "${color}" -eq 0 ]; then
+        # remove "--color=always" from diff command
+        diff_cmd="$(echo "${diff_cmd}" | sed 's/ --color=always//g')"
+    fi
+    ${diff_cmd} "${path}"
+}
+
+edit_file() {
+    local current_state="${1}"; shift
+    local path="${1}"; shift
+    local lineno="$(print_diff "${current_state}" "${path}" 0 | awk '/^@@/ {if (match($0, /\+[0-9]+/)) {print substr($0, RSTART+1, RLENGTH-1); exit}}')"
+    if [[ "${lineno}" =~ ^[0-9]+$ ]]; then
+        # add the regular 3 lines of context
+        lineno=$((lineno+3))
+    else
+        lineno=1
+    fi
+    echo "vim" > "${POST_COMMAND_FILE}"
+    echo "+${lineno}" >> "${POST_COMMAND_FILE}"
+    echo "${path}" >> "${POST_COMMAND_FILE}"
+    cat "${POST_COMMAND_FILE}" | tr '\n' ' ' | sed -E 's/^/+ /g ; s/ $/\n/' 1>&2
+}
+
+contains_path() {
+    local path="${1}"; shift
+    local cmd="${1}"; shift
+    local paths
+    mapfile -d '' -t paths < <(${cmd})
+    local p
+    for p in "${paths[@]}"; do
+        [[ "${p}" == "${path}" ]] && return 0
+    done
+    return 1
+}
+
+list_untracked() {
+    ${UNTRACKED_LIST_CMD}
+}
+
+is_untracked() {
+    local path="${1}"; shift
+    contains_path "${path}" "${UNTRACKED_LIST_CMD}"; exit_code=$?
+    return ${exit_code}
+}
+
+list_unstaged() {
+    ${UNSTAGED_LIST_CMD}
+}
+
+is_unstaged() {
+    local path="${1}"; shift
+    contains_path "${path}" "${UNSTAGED_LIST_CMD}"; exit_code=$?
+    return ${exit_code}
+}
+
+list_staged() {
+    ${STAGED_LIST_CMD}
+}
+
+is_staged() {
+    local path="${1}"; shift
+    contains_path "${path}" "${STAGED_LIST_CMD}"; exit_code=$?
+    return ${exit_code}
+}
+
+paths=()
+stage_path=""
+unstage_path=""
+delete_path=""
+reset_path=""
+ignore_path=""
+mode="list"
+key_result=""
+query=""
+id=$$
+
+[ -z "${GIT_DIR}" ] && fail "Not a git repo?"
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -p|--print)
+            mode="print"
+            ;;
+        -q|--query)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for query"
+            query="${1}"
+            ;;
+        -s|--stage)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for stage"
+            [ -n "${stage_path}" ] && fail "Only one path can be staged at a time"
+            stage_path="${1}"
+            mode="update"
+            ;;
+        -u|--unstage)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for unstage"
+            [ -n "${unstage_path}" ] && fail "Only one path can be unstaged at a time"
+            unstage_path="${1}"
+            mode="update"
+            ;;
+        -d|--delete)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for delete"
+            [ -n "${delete_path}" ] && fail "Only one path can be deleted at a time"
+            delete_path="${1}"
+            mode="update"
+            ;;
+        -r|--reset)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for reset"
+            reset_path="${1}"
+            mode="update"
+            ;;
+        -i|--ignore)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for ignore"
+            ignore_path="${1}"
+            mode="update"
+            ;;
+        --key)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for key"
+            key_result="${1}"
+            mode="update"
+            ;;
+        --id)
+            shift
+            [ -n "${1}" ] && id="${1}"
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            paths+=("${1}")
+            ;;
+    esac
+    shift
+done
+
+POST_COMMAND_FILE="/tmp/${APP}-${id}.post_command"
+PREVIOUS_UPDATE_FILE="/tmp/${APP}-${id}.previous_update"
+
+if [ -n "${key_result}" ]; then
+    key="$(echo "${key_result}" | head -n 1)"
+    line="$(echo "${key_result}" | tail -n 1)"
+    read -r _ current_state path <<<"${line}"
+    case "${key}" in
+        ctrl-d)
+            echo -e "${current_state}\t${path}"
+            print_diff "${current_state}" "${path}"
+            exit 1
+            ;;
+        ctrl-e)
+            edit_file "${current_state}" "${path}"
+            exit 1
+            ;;
+        alt-+|insert|+)
+            stage_path="${path}"
+            ;;
+        alt--|del|-)
+            unstage_path="${path}"
+            ;;
+        alt-d)
+            delete_path="${path}"
+            ;;
+        alt-r)
+            reset_path="${path}"
+            ;;
+        alt-i)
+            ignore_path="${path}"
+            ;;
+        esc|ctrl-c)
+            exit 255
+            ;;
+        enter)
+            echo -e "${current_state}\t${path}"
+            exit 1
+            ;;
+        *)
+            fail "Unknown key: ${key}"
+            ;;
+    esac
+fi
+
+if [ -n "${stage_path}" ]; then
+    # check if already staged, then do nothing
+    if is_unstaged "${stage_path}" || is_untracked "${stage_path}"; then
+        ${STAGE_CMD} "${stage_path}"
+        [ -n "${key_result}" ] && echo -e "stage\n${stage_path}" > "${PREVIOUS_UPDATE_FILE}"
+    fi
+fi
+if [ -n "${unstage_path}" ]; then
+    # check if actually staged, otherwise do nothing
+    if ! is_unstaged "${unstage_path}"; then
+        ${UNSTAGE_CMD} "${unstage_path}"
+        [ -n "${key_result}" ] && echo -e "unstage\n${unstage_path}" > "${PREVIOUS_UPDATE_FILE}"
+    fi
+fi
+if [ -n "${delete_path}" ]; then
+    echo "${delete_path}" 1>&2
+    # if staged, unstage AND delete file; if not staged, delete file only
+    if is_untracked "${delete_path}"; then
+        (
+            cd "${GIT_DIR}"
+            ${RM_CMD} "${delete_path}"
+            [ -n "${key_result}" ] && echo -e "delete\n${delete_path}" > "${PREVIOUS_UPDATE_FILE}"
+        )
+    else
+        ${UNSTAGE_CMD} "${delete_path}" 2>/dev/null
+        (
+            cd "${GIT_DIR}"
+            ${RM_CMD} "${delete_path}"
+            [ -n "${key_result}" ] && echo -e "delete\n${delete_path}" > "${PREVIOUS_UPDATE_FILE}"
+        )
+    fi
+fi
+if [ -n "${reset_path}" ]; then
+    ${RESET_CMD} "${reset_path}"
+    [ -n "${key_result}" ] && echo -e "reset\n${reset_path}" > "${PREVIOUS_UPDATE_FILE}"
+fi
+
+if [ -n "${ignore_path}" ]; then
+    ${IGNORE_CMD} "${ignore_path}"
+    [ -n "${key_result}" ] && echo -e "ignore\n${ignore_path}" > "${PREVIOUS_UPDATE_FILE}"
+fi
+
+[ "${mode}" == "update" ] && exit 0
+
+previous_update=""
+if [ -f "${PREVIOUS_UPDATE_FILE}" ]; then
+    previous_update=$(cat "${PREVIOUS_UPDATE_FILE}" | head -n 1)
+    rm -f "${PREVIOUS_UPDATE_FILE}"
+fi
+
+mapfile -d '' -t UNTRACKED < <(list_untracked)
+mapfile -d '' -t UNSTAGED  < <(list_unstaged)
+mapfile -d '' -t STAGED    < <(list_staged)
+
+declare -A STATUS
+
+for f in "${UNTRACKED[@]}"; do
+  STATUS["${f}"]="untracked"
+done
+for f in "${UNSTAGED[@]}"; do
+  [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="unstaged"
+done
+for f in "${STAGED[@]}"; do
+  [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="staged"
+done
+
+sort_args=("-t" $'\t')
+if [ -z "$previous_update" ] || [ "${previous_update}" == "stage" ]; then
+    sort_args+=("-k1,1nr")
+else
+    sort_args+=("-k1,1n")
+fi
+sort_args+=("-k3,3")
+
+content=$(
+  for f in "${!STATUS[@]}"; do
+    case "${STATUS[${f}]}" in
+      unstaged)  key=3; color="${YELLOW}";;
+      untracked) key=2; color="${RED}";;
+      staged)    key=1; color="${GREEN}";;
+    esac
+    printf "%s\t%b%s%b\t%b%s%b\n" "${key}" "${color}" "${STATUS[${f}]}" "${NC}" "${color}" "${f}" "${NC}"
+  done | sort "${sort_args[@]}"
+)
+
+result="$(echo -e "${HEADER}\n${content}" | column -t -s $'\t')"
+column_count=$(echo -e "${HEADER}" | tr $'\t' $'\n' | wc -l)
+columns="$(seq -s ',' 2 ${column_count})"
+
+case "${mode}" in
+    list)
+        rm -f "${POST_COMMAND_FILE}"
+        echo "${result}" | fzf-with-header --key-command "${APP} --id "${id}" --key" \
+                                           --columns "${columns}" \
+                                           --command "${APP} --id "${id}" --print ${paths[@]}" \
+                                           "${query}" \
+                                           --preview="${PREVIEW_COMMAND}" \
+                                           --preview-window=right:70%,nowrap \
+                                           --expect="${KEYS}"
+        if [ -f "${POST_COMMAND_FILE}" ]; then
+            post_command="$(cat "${POST_COMMAND_FILE}")"
+            # first line is cmd, rest are args
+            rm -f "${POST_COMMAND_FILE}"
+            cmd="$(echo "${post_command}" | head -n 1)"
+            # read line by line into an array
+            readarray -t args < <(echo "${post_command}" | tail -n +2)
+            exec ${cmd} "${args[@]}"
+        fi
+        ;;
+    print)
+        echo "${result}"
+        ;;
+esac

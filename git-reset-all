@@ -1,0 +1,16 @@
+#!/bin/bash
+
+NL=$'\n'
+#list all files which will be reset and or cleaned
+changed="$(git status --porcelain | cut -c4-)"
+changed="${changed}${NL}$(git diff --name-only)"
+changed="$(echo "${changed}" | grep -v '^$' | sort -u)"
+changed_count="$(echo -n "${changed}" | wc -l)"
+if [ "${changed_count}" -gt 0 ]; then
+    echo "The following files will be reset and cleaned:"
+    echo
+    echo "${changed}" | sed 's/^/  /'
+    echo
+fi
+prompt-continue "Are you sure you want to reset all files? [y/N]" || exit 1
+LC_ALL=C git reset && LC_ALL=C git checkout -- . && LC_ALL=C git clean -ffd && echo "Done"

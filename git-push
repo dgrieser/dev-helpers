@@ -1,0 +1,74 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") [-p|--push-only] [<branch>]" 1>&2
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+fail() {
+    local message="${1}"
+    [ -z "${message}" ] && message="Failed."
+    error "${message}"
+    exit 1
+}
+
+BRANCH=""
+PUSH_ONLY=0
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        -p|--push-only)
+            PUSH_ONLY=1
+            ;;
+        *)
+            if [ -z "${BRANCH}" ]; then
+                [ -z "${1}" ] && usage
+                BRANCH="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+git_dir="$(git rev-parse --show-toplevel)" || fail
+[ -z "${BRANCH}" ] && BRANCH=$(git -C "${git_dir}" branch --show-current)
+
+BRANCH_SHORT="${BRANCH}"
+BRANCH_FQ="$(git -C "${git_dir}" show-ref --heads "${BRANCH}" | awk '{print $2}')"
+if [ -n "${BRANCH_FQ}" ]; then
+    BRANCH_SHORT="${BRANCH_FQ##*/}"
+    BRANCH="${BRANCH_FQ}"
+fi
+
+message="Commit and push to \"${BRANCH_SHORT}\"?"
+[ "${PUSH_ONLY}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\"?"
+echo -n "${message}"
+read
+echo
+git -C "${git_dir}" init
+ok=1
+if [ "${PUSH_ONLY}" -eq 0 ]; then
+    ok=0
+    if git-add; then
+        changes="$(git -C "${git_dir}" status --porcelain)"
+        if [ -n "${changes}" ]; then
+            git -C "${git_dir}" commit && ok=1
+        else
+            echo "No changes to commit."
+            ok=1
+        fi
+    fi
+fi
+[ "${ok}" -ne 1 ] && abort
+git -C "${git_dir}" push -u origin "${BRANCH}"

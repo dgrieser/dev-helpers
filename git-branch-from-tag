@@ -1,0 +1,73 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") [<tag>]" 1>&2
+    exit 1
+}
+
+warning() {
+    echo -e "\e[1mWARNING\e[0m: ${1}" 1>&2
+}
+
+error() {
+    echo -e "\e[1mERROR\e[0m: ${1}" 1>&2
+}
+
+fail() {
+    local message="${1}"
+    [ -z "${message}" ] && message="Failed."
+    error "${message}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+get_fq_tag() {
+    local tag="${1}"
+    local fq_tag
+    fq_tag="$(git show-ref --tags "${tag}" | awk '{ print $2 }' | head -n 1)"
+    [ -z "${fq_tag}" ] && fq_tag="refs/tags/${tag}" && warning "Assuming fully qualified tag name \e[1m${fq_tag}\e[0m"
+    echo "${fq_tag}"
+}
+
+tag=""
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [ -z "${tag}" ]; then
+                tag="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+git fetch --all || fail "No git repo? Abort."
+recent_tags="$(git tag --sort=-v:refname | head -n 15 | tac)"
+last_tag="$(echo "${recent_tags}" | tail -n 1)"
+echo -e "\e[1mRecent tags\e[0m:" && echo "${recent_tags}" && echo
+
+if [ -z "${tag}" ]; then
+    message="Tag name"
+    tag="$(prompt --single-line --default "${last_tag}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
+    [ -z "${tag}" ] && abort
+fi
+
+# remove leading v and replace all . with -
+new_branch="$(echo "${tag}" | sed 's/^v//g' | sed 's/\./-/g')"
+
+message="Branch name"
+new_branch="$(prompt --single-line --default "${new_branch}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
+[ -z "${new_branch}" ] && abort
+
+git checkout -b "${new_branch}" "$(get_fq_tag "${tag}")"
+prompt-no-yes "Push?" && git push --set-upstream origin "${new_branch}"

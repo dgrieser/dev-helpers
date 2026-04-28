@@ -1,0 +1,58 @@
+#!/bin/bash
+
+usage() {
+    cat <<EOF 1>&2
+usage: $(basename "${0}") [OPTIONS]
+
+Forks the current repo on github.com
+
+Options:
+    -h, --help                 Show this help message
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+while [ ${#} -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
+
+cd "${git_dir}"
+echo "Current status:"; echo
+git -c color.ui=always remote -v | sed 's/^/  /'
+echo
+git -c color.ui=always status --short | sed 's/^/  /'
+echo
+
+prompt-yes-no "Fork?" || abort
+echo
+
+gh repo fork --remote=true --clone=false
+
+echo; echo "Updated remotes:"; echo
+git -c color.ui=always remote -v | sed 's/^/  /'
+echo
+echo "Done."

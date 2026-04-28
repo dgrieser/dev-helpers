@@ -1,0 +1,126 @@
+#!/bin/bash
+
+usage() {
+    echo "usage: $(basename "${0}") [-p|--print] [--host-only] [--include-branch]" 1>&2
+    exit 1
+}
+
+print_only=0
+host_only=0
+include_branch=0
+
+urlencode() {
+    local raw="${1}"
+    local encoded=""
+    local i char
+
+    for ((i = 0; i < ${#raw}; i++)); do
+        char="${raw:i:1}"
+        case "${char}" in
+            [a-zA-Z0-9.~_-])
+                encoded+="${char}"
+                ;;
+            *)
+                printf -v encoded '%s%%%02X' "${encoded}" "'${char}"
+                ;;
+        esac
+    done
+
+    echo "${encoded}"
+}
+
+find_github_pr_url() {
+    local repo="${1}"
+    local branch="${2}"
+    local pr_url=""
+
+    command -v gh >/dev/null 2>&1 || return 1
+    [ -n "${repo}" ] || return 1
+    [ -n "${branch}" ] || return 1
+
+    pr_url=$(gh pr view "${branch}" -R "${repo}" --json url --jq .url 2>/dev/null) || return 1
+    [ -n "${pr_url}" ] || return 1
+
+    echo "${pr_url}"
+}
+
+find_gitlab_mr_url() {
+    local repo="${1}"
+    local branch="${2}"
+    local mr_url=""
+
+    command -v glab >/dev/null 2>&1 || return 1
+    [ -n "${repo}" ] || return 1
+    [ -n "${branch}" ] || return 1
+
+    mr_url=$(glab mr list -R "${repo}" --source-branch "${branch}" -F json 2>/dev/null | jq -r '.[0].web_url // empty') || return 1
+    [ -n "${mr_url}" ] || return 1
+
+    echo "${mr_url}"
+}
+
+while [ ${#} -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -p|--print)
+            print_only=1
+            ;;
+        --host-only)
+            host_only=1
+            ;;
+        --include-branch)
+            include_branch=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
+
+git_url=$(git config --get remote.origin.url)
+if [ -z "${git_url}" ]; then
+    echo "WARNING: Not a git repo" 1>&2
+    # get relative directory from $WORKSPACE
+    relative_dir="$(echo "${PWD}" | sed -E "s|^${WORKSPACE}/||")"
+    git_url="https://gitlab.mittwald.it/${relative_dir}"
+fi
+
+# create valid URL from 'ssh:' and 'git@whatever:' URLs
+if [[ "${git_url}" =~ ^ssh:/{0,2}git@([^:/]+)(:[0-9]+)?/(.+)$ ]]; then
+    git_url="https://${BASH_REMATCH[1]}/${BASH_REMATCH[3]}"
+elif [[ "${git_url}" =~ ^git@([^:]+):(.+)$ ]]; then
+    git_url="https://${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+fi
+
+# Remove port number from the URL
+git_url=$(echo "${git_url}" | sed -E 's/:[0-9]+//')
+git_url=$(echo "${git_url}" | sed -E 's/\.git$//')
+
+open_target="${git_url}"
+if [ ${host_only} -eq 1 ]; then
+    host_name=$(echo "${git_url}" | sed -E 's|^[a-z]+://||; s|/.*$||')
+    [ ${print_only} -eq 1 ] && echo "${host_name}" && exit 0
+    open_target="https://${host_name}"
+elif [ ${include_branch} -eq 1 ]; then
+    host_name=$(echo "${git_url}" | sed -E 's|^[a-z]+://||; s|/.*$||')
+    repo_path=$(echo "${git_url}" | sed -E 's|^[a-z]+://[^/]+/||')
+    current_branch=$(git branch --show-current 2>/dev/null)
+
+    if [ -n "${current_branch}" ]; then
+        if [[ "${host_name}" == *github* ]]; then
+            repo_selector="${host_name}/${repo_path}"
+            open_target=$(find_github_pr_url "${repo_selector}" "${current_branch}" || true)
+            [ -n "${open_target}" ] || open_target="${git_url}/tree/${current_branch}"
+        elif [[ "${host_name}" == *gitlab* ]]; then
+            open_target=$(find_gitlab_mr_url "${git_url}" "${current_branch}" || true)
+            [ -n "${open_target}" ] || open_target="${git_url}/-/tree/$(urlencode "${current_branch}")"
+        fi
+    fi
+fi
+
+[ ${print_only} -eq 1 ] && echo "${open_target}" && exit 0
+
+gio open "${open_target}"

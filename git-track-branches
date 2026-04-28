@@ -1,0 +1,47 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS]
+
+Track all remote branches
+
+Options:
+    -h, --help  Show this help
+    -C, --clear Clear local branches which don't exist on remote
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+clear_local_branches=0
+
+while [ "$#" -gt 0 ]; do
+    case "${1}" in
+        -h|--help) usage ;;
+        -C|--clear) clear_local_branches=1 ;;
+        *) usage ;;
+    esac
+    shift
+done
+
+LC_ALL=C git pull --all || fail "No git repo?"
+remote_branches="$(LC_ALL=C git branch --list --remotes --format="%(refname:lstrip=2)" | grep -v "HEAD")"
+for branch in ${remote_branches}; do
+    [ -n "$(LC_ALL=C git branch --list "${branch#origin/}")" ] && continue
+    LC_ALL=C git branch --track "${branch#origin/}" "${branch}"
+done
+if [ "${clear_local_branches}" -eq 1 ]; then
+    LC_ALL=C git fetch --prune
+    LC_ALL=C git branch -vv | awk '/: gone]/{print $1}' | LC_ALL=C xargs git branch -D
+fi

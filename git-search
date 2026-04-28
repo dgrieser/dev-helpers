@@ -1,0 +1,50 @@
+#!/bin/bash
+
+usage()
+{
+    echo "Usage: $(basename "${0}") <query> [--gitlab|--github]" 1>&2
+    exit 1
+}
+
+NL=$'\n'
+query=""
+gitlab=1
+github=1
+
+while [ $# -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --gitlab)
+            github=0
+            gitlab=1
+            ;;
+        --github)
+            github=1
+            gitlab=0
+            ;;
+        *)
+            if [ -z "${query}" ]; then
+                query="${1}"
+            else
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${query}" ] && usage
+
+matches=""
+if [ ${gitlab} -eq 1 ]; then
+    [ -n "${matches}" ] && matches="${matches}${NL}"
+    matches="${matches}$(glab repo search -s "${query}" -F json | jq -r '.[].web_url')"
+fi
+if [ ${github} -eq 1 ]; then
+    [ -n "${matches}" ] && matches="${matches}${NL}"
+    matches="${matches}$(gh search repos "${query}" --json url | jq -r '.[].url')"
+fi
+[ -n "${matches}" ] && echo "${matches}"
+exit 0
