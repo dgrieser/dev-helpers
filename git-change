@@ -46,7 +46,7 @@ git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
 current_branch="$(git -C "${git_dir}" branch --show-current)"
 default_branch="$(git-default)"
 reset_hash_default_branch=""
-if [ "${current_branch}" == "${default_branch}" ] && [ "$(git -C "${git_dir}" rev-list --count @{u}..HEAD 2>/dev/null)" -gt 0 ]; then
+if [ "${current_branch}" == "${default_branch}" ] && [[ "$(git -C "${git_dir}" rev-list --count @{u}..HEAD 2>/dev/null)" -gt 0 ]]; then
     warning "You have unpushed commits"
     git log --oneline @{u}..HEAD
     echo
@@ -70,8 +70,8 @@ if [ -z "${branch}" ]; then
         else
             cmai_args+=( "--unstaged" )
         fi
-        suggestion="$(cmai "${cmai_args[@]}" 2>/dev/null)"
-        [ -n "${suggestion}" ] && prompt_args+=( "--default" "${suggestion}" )
+        suggestion="$(cmai "${cmai_args[@]}" 2>/dev/null)"; exit_code=$?
+        [ ${exit_code} -eq 0 ] && [ -n "${suggestion}" ] && prompt_args+=( "--default" "${suggestion}" )
     fi
     branch="$(prompt "${prompt_args[@]}")" || abort
     [ -z "${branch}" ] && abort

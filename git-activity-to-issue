@@ -1,0 +1,1391 @@
+#!/usr/bin/env python3
+"""Resolve GitLab activity feed items to issue references."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import date, datetime, time, timedelta, timezone
+import json
+import re
+import subprocess
+import sys
+import urllib.parse
+from dataclasses import dataclass
+from typing import Any
+
+
+ISSUE_URL_RE = re.compile(r"/-/issues/(\d+)\b")
+WORK_ITEM_URL_RE = re.compile(r"/-/work_items/(\d+)\b")
+ABSOLUTE_ISSUE_URL_RE = re.compile(r"https?://[^/\s)]+/([^)\s]+?)/-/issues/(\d+)\b")
+ABSOLUTE_WORK_ITEM_URL_RE = re.compile(
+    r"https?://[^/\s)]+/([^)\s]+?)/-/work_items/(\d+)\b"
+)
+ISSUE_REF_RE = re.compile(r"(?<![\w/])#(\d+)\b")
+FULL_ISSUE_REF_RE = re.compile(
+    r"(?<![\w/])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)#(\d+)\b"
+)
+MERGE_BRANCH_RE = re.compile(r"Merge branch '([^']+)' into '([^']+)'")
+INTEGRATION_BRANCHES = {"main", "master", "develop", "development", "prod", "production"}
+
+
+@dataclass(frozen=True)
+class IssueRef:
+    project_id: int
+    iid: int
+    source: str
+    title: str | None = None
+    web_url: str | None = None
+
+    def key(self) -> tuple[int, int]:
+        return (self.project_id, self.iid)
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "project_id": self.project_id,
+            "iid": self.iid,
+            "source": self.source,
+        }
+        if self.title:
+            data["title"] = self.title
+        if self.web_url:
+            data["web_url"] = self.web_url
+        return data
+
+
+class GitLabApi:
+    def __init__(self, *, verbose: bool = False) -> None:
+        self.verbose = verbose
+        self.cache: dict[str, Any] = {}
+        self._current_username: str | None = None
+
+    def get(self, path: str) -> Any:
+        if path in self.cache:
+            return self.cache[path]
+
+        if self.verbose:
+            print(f"glab api {path}", file=sys.stderr)
+
+        proc = subprocess.run(
+            ["glab", "api", path],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if self.verbose:
+            if proc.stdout:
+                print(proc.stdout.rstrip(), file=sys.stderr)
+            if proc.stderr:
+                print(proc.stderr.rstrip(), file=sys.stderr)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or f"glab api failed: {path}")
+
+        try:
+            data = json.loads(proc.stdout or "null")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid JSON from glab api {path}: {exc}") from exc
+
+        self.cache[path] = data
+        return data
+
+    def graphql(self, query: str, variables: dict[str, str]) -> Any:
+        cmd = ["glab", "api", "graphql", "--raw-field", f"query={query}"]
+        for key, value in variables.items():
+            cmd.extend(["--raw-field", f"{key}={value}"])
+
+        if self.verbose:
+            print(" ".join(cmd), file=sys.stderr)
+
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if self.verbose:
+            if proc.stdout:
+                print(proc.stdout.rstrip(), file=sys.stderr)
+            if proc.stderr:
+                print(proc.stderr.rstrip(), file=sys.stderr)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "glab api graphql failed")
+
+        try:
+            data = json.loads(proc.stdout or "null")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid JSON from glab api graphql: {exc}") from exc
+
+        if isinstance(data, dict) and data.get("errors"):
+            raise RuntimeError(f"GitLab GraphQL errors: {data['errors']}")
+        return data
+
+
+def verbose_log(enabled: bool, message: str) -> None:
+    if enabled:
+        print(message, file=sys.stderr)
+
+
+def warning(message: str) -> None:
+    print(f"WARNING: {message}", file=sys.stderr)
+
+
+def project_web_url(api: GitLabApi, project_id: int) -> str | None:
+    data = api.get(f"projects/{project_id}")
+    if not isinstance(data, dict):
+        return None
+    web_url = data.get("web_url")
+    return web_url if isinstance(web_url, str) and web_url else None
+
+
+def project_from_path(api: GitLabApi, path_with_namespace: str) -> dict[str, Any] | None:
+    encoded = urllib.parse.quote(path_with_namespace, safe="")
+    data = api.get(f"projects/{encoded}")
+    return data if isinstance(data, dict) else None
+
+
+def issue_from_project_path(
+    api: GitLabApi,
+    path_with_namespace: str,
+    iid: int,
+    source: str,
+    *,
+    merge_request_refs: bool = True,
+) -> list[IssueRef]:
+    project = project_from_path(api, path_with_namespace)
+    if project is None:
+        return []
+
+    project_id = int_or_none(project.get("id"))
+    if project_id is None:
+        return []
+
+    return issues_from_project_ref(
+        api,
+        project_id,
+        iid,
+        source,
+        merge_request_refs=merge_request_refs,
+    )
+
+
+def issue_from_project_iid(
+    api: GitLabApi, project_id: int, iid: int, source: str
+) -> IssueRef | None:
+    try:
+        data = api.get(f"projects/{project_id}/issues/{iid}")
+    except RuntimeError as exc:
+        verbose_log(
+            api.verbose,
+            f"resolve issue project={project_id} iid={iid}: not found: {exc}",
+        )
+        return None
+
+    if isinstance(data, dict):
+        return issue_from_api_item(data, source) or IssueRef(project_id, iid, source)
+    return None
+
+
+def merge_request_exists(api: GitLabApi, project_id: int, iid: int) -> bool:
+    try:
+        data = api.get(f"projects/{project_id}/merge_requests/{iid}")
+    except RuntimeError as exc:
+        verbose_log(
+            api.verbose,
+            f"resolve mr project={project_id} iid={iid}: not found: {exc}",
+        )
+        return False
+    return isinstance(data, dict)
+
+
+def issues_from_project_ref(
+    api: GitLabApi,
+    project_id: int,
+    iid: int,
+    source: str,
+    *,
+    merge_request_refs: bool = True,
+) -> list[IssueRef]:
+    issue = issue_from_project_iid(api, project_id, iid, source)
+    if issue is not None:
+        return [issue]
+
+    if not merge_request_refs or not merge_request_exists(api, project_id, iid):
+        return []
+
+    issues: list[IssueRef] = []
+    for issue in resolve_mr(api, project_id, iid):
+        add_issue(issues, issue)
+    return issues
+
+
+def warning_url(api: GitLabApi, event: dict[str, Any]) -> str | None:
+    project_id = int_or_none(event.get("project_id"))
+    if project_id is None:
+        return None
+
+    try:
+        base_url = project_web_url(api, project_id)
+    except RuntimeError:
+        return None
+    if base_url is None:
+        return None
+
+    target_type = event.get("target_type")
+    target_iid = int_or_none(event.get("target_iid"))
+    if target_type == "MergeRequest" and target_iid is not None:
+        return f"{base_url}/-/merge_requests/{target_iid}"
+    if target_type == "Issue" and target_iid is not None:
+        return f"{base_url}/-/issues/{target_iid}"
+    if target_type == "WorkItem" and target_iid is not None:
+        return f"{base_url}/-/work_items/{target_iid}"
+
+    note = event.get("note")
+    if isinstance(note, dict):
+        noteable_type = note.get("noteable_type")
+        noteable_iid = int_or_none(note.get("noteable_iid"))
+        note_id = int_or_none(note.get("id") or event.get("target_id"))
+        anchor = f"#note_{note_id}" if note_id is not None else ""
+        if noteable_type == "MergeRequest" and noteable_iid is not None:
+            return f"{base_url}/-/merge_requests/{noteable_iid}{anchor}"
+        if noteable_type in ("Issue", "WorkItem") and noteable_iid is not None:
+            path = "issues" if noteable_type == "Issue" else "work_items"
+            return f"{base_url}/-/{path}/{noteable_iid}{anchor}"
+
+    push_data = event.get("push_data") or {}
+    if isinstance(push_data, dict):
+        commit_to = str(push_data.get("commit_to") or "")
+        commit_from = str(push_data.get("commit_from") or "")
+        ref = str(push_data.get("ref") or "")
+        ref_type = str(push_data.get("ref_type") or "")
+        action_name = str(event.get("action_name") or "")
+        if ref_type == "branch" and "deleted" in action_name:
+            return base_url
+        if commit_to:
+            return f"{base_url}/-/commit/{commit_to}"
+        if commit_from:
+            return f"{base_url}/-/commit/{commit_from}"
+        if ref and ref_type == "branch":
+            return f"{base_url}/-/tree/{urllib.parse.quote(ref, safe='')}"
+
+    return base_url
+
+
+def parse_args() -> argparse.Namespace:
+    today = date.today()
+    month_start = today.replace(day=1).isoformat()
+    parser = argparse.ArgumentParser(
+        description="Resolve GitLab activity feed JSON items to related issue IDs."
+    )
+    parser.add_argument(
+        "--start",
+        default=month_start,
+        help=f"start date/time, inclusive, default: {month_start}",
+    )
+    parser.add_argument(
+        "--end",
+        default=today.isoformat(),
+        help=f"end date/time, inclusive for date-only values, default: {today.isoformat()}",
+    )
+    parser.add_argument(
+        "--per-page",
+        type=int,
+        default=50,
+        help="events per page, default: 50",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=100,
+        help="maximum event pages to fetch, default: 100",
+    )
+    parser.add_argument(
+        "--json-array",
+        action="store_true",
+        help="print one JSON array instead of JSON lines",
+    )
+    parser.add_argument(
+        "--time-spent",
+        action="store_true",
+        help="add calculated working block start/end fields to each result",
+    )
+    parser.add_argument(
+        "--time-spent-book",
+        action="store_true",
+        help="book calculated working blocks to resolved GitLab issues",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="ask on tty before booking time spent to GitLab",
+    )
+    parser.add_argument(
+        "--time-spent-slot-minutes",
+        type=int,
+        default=60,
+        help="working block size in minutes, must divide 60, default: 60",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print glab API calls to stderr",
+    )
+    return parser.parse_args()
+
+
+def parse_bound(value: str, *, end: bool) -> datetime:
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            day = date.fromisoformat(value)
+            if end:
+                return datetime.combine(day, time.max).astimezone()
+            return datetime.combine(day, time.min).astimezone()
+
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"invalid date/time: {value}") from exc
+
+    if parsed.tzinfo is None:
+        return parsed.astimezone()
+    return parsed
+
+
+def event_created_at(event: dict[str, Any]) -> datetime | None:
+    value = event.get("created_at")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def in_window(event: dict[str, Any], start: datetime, end: datetime) -> bool:
+    created_at = event_created_at(event)
+    if created_at is None:
+        return False
+    return start <= created_at <= end
+
+
+def working_block_for_event(
+    event: dict[str, Any], slot_minutes: int
+) -> dict[str, Any] | None:
+    created_at = event_created_at(event)
+    if created_at is None:
+        return None
+
+    slot_minute = (created_at.minute // slot_minutes) * slot_minutes
+    block_start = created_at.replace(
+        minute=slot_minute,
+        second=0,
+        microsecond=0,
+    )
+    block_end = block_start + timedelta(minutes=slot_minutes)
+    return {
+        "working_block_start": block_start.isoformat(),
+        "working_block_end": block_end.isoformat(),
+        "working_block_minutes": slot_minutes,
+    }
+
+
+def time_spent_duration(slot_minutes: int) -> str:
+    if slot_minutes == 60:
+        return "1h"
+    return f"{slot_minutes}m"
+
+
+def clean_summary_part(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def ellipsize(value: Any, max_length: int) -> str:
+    text = clean_summary_part(value)
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    return f"{text[: max_length - 3]}..."
+
+
+def dedupe_summary_parts(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        part = clean_summary_part(value)
+        if not part:
+            continue
+        key = part.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(part)
+    return result
+
+
+def activity_summary(event: dict[str, Any], *, ellipsized: bool = True) -> str:
+    push_data = event.get("push_data") or {}
+    if not isinstance(push_data, dict):
+        push_data = {}
+    note = event.get("note") or {}
+    if not isinstance(note, dict):
+        note = {}
+
+    text = " ".join(
+        dedupe_summary_parts(
+            [
+                event.get("target_title"),
+                push_data.get("commit_title"),
+                note.get("body"),
+            ]
+        )
+    )
+    if ellipsized:
+        text = ellipsize(text, 100)
+
+    return " ".join(
+        part
+        for part in (
+            clean_summary_part(event.get("target_type")),
+            clean_summary_part(event.get("action_name")),
+            clean_summary_part(push_data.get("ref_type")),
+            clean_summary_part(push_data.get("ref")),
+            text,
+        )
+        if part
+    )
+
+
+def booking_key(
+    issue: dict[str, Any], result: dict[str, Any]
+) -> tuple[int, int, str, str] | None:
+    project_id = int_or_none(issue.get("project_id"))
+    iid = int_or_none(issue.get("iid"))
+    block_start = result.get("working_block_start")
+    block_end = result.get("working_block_end")
+    if (
+        project_id is None
+        or iid is None
+        or not isinstance(block_start, str)
+        or not isinstance(block_end, str)
+    ):
+        return None
+    return (project_id, iid, block_start, block_end)
+
+
+def booking_summary(
+    block_start: str, block_end: str, activity_summaries: list[str]
+) -> str:
+    details = "; ".join(activity_summaries)
+    prefix = f"{local_time_for_summary(block_start)}-{local_time_for_summary(block_end)}"
+    if not details:
+        return prefix
+    return ellipsize(f"{prefix} {details}", 255)
+
+
+def local_time_for_summary(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.astimezone().strftime("%H:%M")
+
+
+def current_username(api: GitLabApi) -> str:
+    if api._current_username is not None:
+        return api._current_username
+    response = api.graphql("query { currentUser { username } }", {})
+    username = None
+    if isinstance(response, dict):
+        data = response.get("data")
+        if isinstance(data, dict):
+            user = data.get("currentUser")
+            if isinstance(user, dict):
+                username = user.get("username")
+    if not isinstance(username, str) or not username:
+        raise RuntimeError("could not resolve currentUser.username")
+    api._current_username = username
+    return username
+
+
+def existing_timelogs(
+    api: GitLabApi,
+    project_id: int,
+    iid: int,
+    block_start: str,
+    block_end: str,
+) -> list[dict[str, Any]]:
+    query = """
+query timelogs(
+  $projectId: ProjectID!
+  $startTime: Time!
+  $endTime: Time!
+  $username: String!
+) {
+  timelogs(
+    projectId: $projectId
+    startTime: $startTime
+    endTime: $endTime
+    username: $username
+  ) {
+    nodes {
+      id
+      spentAt
+      timeSpent
+      summary
+      issue { iid }
+    }
+  }
+}
+""".strip()
+    response = api.graphql(
+        query,
+        {
+            "projectId": f"gid://gitlab/Project/{project_id}",
+            "startTime": block_start,
+            "endTime": block_end,
+            "username": current_username(api),
+        },
+    )
+    if not isinstance(response, dict):
+        return []
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return []
+    timelogs = data.get("timelogs")
+    if not isinstance(timelogs, dict):
+        return []
+    nodes = timelogs.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+    target = str(iid)
+    matches: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        issue = node.get("issue")
+        if not isinstance(issue, dict):
+            continue
+        if str(issue.get("iid")) == target:
+            matches.append(node)
+    return matches
+
+
+def book_time_spent(
+    api: GitLabApi,
+    key: tuple[int, int, str, str],
+    *,
+    duration: str,
+    activity_summaries: list[str],
+) -> dict[str, Any]:
+    project_id, iid, block_start, block_end = key
+    issue = api.get(f"projects/{project_id}/issues/{iid}")
+    if not isinstance(issue, dict):
+        raise RuntimeError(f"could not load issue project={project_id} iid={iid}")
+    issue_id = int_or_none(issue.get("id"))
+    if issue_id is None:
+        raise RuntimeError(f"issue missing global id project={project_id} iid={iid}")
+
+    query = """
+mutation createTimelog(
+  $issuableId: IssuableID!
+  $timeSpent: String!
+  $spentAt: Time!
+  $summary: String!
+) {
+  timelogCreate(input: {
+    issuableId: $issuableId
+    timeSpent: $timeSpent
+    spentAt: $spentAt
+    summary: $summary
+  }) {
+    timelog {
+      id
+      spentAt
+      timeSpent
+      summary
+    }
+    errors
+  }
+}
+""".strip()
+    response = api.graphql(
+        query,
+        {
+            "issuableId": f"gid://gitlab/Issue/{issue_id}",
+            "timeSpent": duration,
+            "spentAt": block_start,
+            "summary": booking_summary(block_start, block_end, activity_summaries),
+        },
+    )
+    mutation = (
+        response.get("data", {}).get("timelogCreate")
+        if isinstance(response, dict)
+        else None
+    )
+    if not isinstance(mutation, dict):
+        raise RuntimeError("GitLab GraphQL response missing timelogCreate")
+    errors = mutation.get("errors")
+    if errors:
+        raise RuntimeError(f"GitLab timelogCreate errors: {errors}")
+    timelog = mutation.get("timelog")
+    result: dict[str, Any] = {
+        "project_id": project_id,
+        "iid": iid,
+        "working_block_start": block_start,
+        "working_block_end": block_end,
+        "duration": duration,
+        "spent_at": block_start,
+        "status": "booked",
+    }
+    if isinstance(timelog, dict):
+        for source_field, output_field in (
+            ("id", "timelog_id"),
+            ("spentAt", "timelog_spent_at"),
+            ("timeSpent", "timelog_time_spent"),
+            ("summary", "timelog_summary"),
+        ):
+            if source_field in timelog:
+                result[output_field] = timelog[source_field]
+    return result
+
+
+def confirm_time_spent_booking(booking_preview: str) -> bool:
+    if not booking_preview:
+        return True
+
+    try:
+        with open("/dev/tty", "w", encoding="utf-8") as tty_out:
+            print(file=tty_out)
+            print(booking_preview, file=tty_out)
+            print(
+                "Book this time-spent entry to GitLab? [y/N] ",
+                end="",
+                file=tty_out,
+                flush=True,
+            )
+        with open("/dev/tty", "r", encoding="utf-8") as tty_in:
+            answer = tty_in.readline().strip().lower()
+        with open("/dev/tty", "w", encoding="utf-8") as tty_out:
+            print(file=tty_out)
+    except OSError as exc:
+        raise RuntimeError("--interactive requires a tty") from exc
+
+    return answer in ("y", "yes")
+
+
+def add_time_spent_bookings(
+    api: GitLabApi,
+    results: list[dict[str, Any]],
+    slot_minutes: int,
+    *,
+    interactive: bool = False,
+) -> bool:
+    duration = time_spent_duration(slot_minutes)
+    first_result_by_key: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    summaries_by_key: dict[tuple[int, int, str, str], list[str]] = {}
+
+    for result in results:
+        if result.get("error"):
+            continue
+        seen_keys: set[tuple[int, int, str, str]] = set()
+        for issue in result.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            key = booking_key(issue, result)
+            if key is None or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            first_result_by_key.setdefault(key, result)
+            summaries = summaries_by_key.setdefault(key, [])
+            summary = clean_summary_part(result.get("activity_summary"))
+            if summary and summary not in summaries:
+                summaries.append(summary)
+
+    booking_by_key: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    had_failure = False
+    for key, activity_summaries in summaries_by_key.items():
+        project_id, iid, block_start, block_end = key
+        try:
+            existing = existing_timelogs(api, project_id, iid, block_start, block_end)
+        except RuntimeError as exc:
+            had_failure = True
+            booking_by_key[key] = {
+                "project_id": project_id,
+                "iid": iid,
+                "working_block_start": block_start,
+                "working_block_end": block_end,
+                "duration": duration,
+                "spent_at": block_start,
+                "status": "failed",
+                "error": f"could not check existing timelogs: {exc}",
+            }
+            print(
+                f"FAILED project={project_id} iid={iid} spent_at={block_start}: "
+                f"{booking_by_key[key]['error']}",
+                file=sys.stderr,
+            )
+            continue
+        if existing:
+            had_failure = True
+            entries = ", ".join(
+                f"{node.get('id', '?')} @ {node.get('spentAt', '?')}"
+                for node in existing
+            )
+            booking_by_key[key] = {
+                "project_id": project_id,
+                "iid": iid,
+                "working_block_start": block_start,
+                "working_block_end": block_end,
+                "duration": duration,
+                "spent_at": block_start,
+                "status": "failed",
+                "error": f"timelog already exists: [{entries}]",
+            }
+            print(
+                f"FAILED project={project_id} iid={iid} spent_at={block_start}: "
+                f"{booking_by_key[key]['error']}",
+                file=sys.stderr,
+            )
+            continue
+        if interactive:
+            issue = api.get(f"projects/{project_id}/issues/{iid}")
+            issue_id = int_or_none(issue.get("id")) if isinstance(issue, dict) else None
+            issue_url = issue.get("web_url") if isinstance(issue, dict) else None
+            issuable_id = (
+                f"gid://gitlab/Issue/{issue_id}"
+                if issue_id is not None
+                else f"project={project_id} issue={iid}"
+            )
+            summary = booking_summary(block_start, block_end, activity_summaries)
+            booking_preview = "\n".join(
+                line
+                for line in (
+                    f"issue={issue_url}" if issue_url else None,
+                    f"issuableId={issuable_id}",
+                    f"timeSpent={duration}",
+                    f"spentAt={block_start}",
+                    f"summary={summary}",
+                )
+                if line
+            )
+            if not confirm_time_spent_booking(booking_preview):
+                continue
+        try:
+            booking_by_key[key] = book_time_spent(
+                api, key, duration=duration, activity_summaries=activity_summaries
+            )
+        except RuntimeError as exc:
+            had_failure = True
+            booking_by_key[key] = {
+                "project_id": project_id,
+                "iid": iid,
+                "working_block_start": block_start,
+                "working_block_end": block_end,
+                "duration": duration,
+                "spent_at": block_start,
+                "status": "failed",
+                "error": str(exc),
+            }
+        booking = booking_by_key[key]
+        if booking.get("status") == "booked":
+            if interactive:
+                print(
+                    f"booked timelog_id={booking.get('timelog_id', '?')} "
+                    f"time_spent={booking.get('timelog_time_spent', duration)} "
+                    f"spent_at={booking.get('timelog_spent_at', block_start)}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"FAILED project={project_id} iid={iid} spent_at={block_start}: "
+                f"{booking.get('error', '?')}",
+                file=sys.stderr,
+            )
+
+    for result in results:
+        row_bookings: list[dict[str, Any]] = []
+        seen_keys: set[tuple[int, int, str, str]] = set()
+        for issue in result.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            key = booking_key(issue, result)
+            if key is None or key in seen_keys or key not in booking_by_key:
+                continue
+            seen_keys.add(key)
+            booking = dict(booking_by_key[key])
+            if booking["status"] == "booked" and first_result_by_key.get(key) is not result:
+                booking["status"] = "already_booked_in_run"
+            row_bookings.append(booking)
+        if row_bookings:
+            result["time_spent_bookings"] = row_bookings
+
+    return had_failure
+
+
+def fetch_events(
+    start: datetime,
+    end: datetime,
+    *,
+    per_page: int,
+    max_pages: int,
+    verbose: bool,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    start_utc = start.astimezone(timezone.utc)
+
+    for page in range(1, max_pages + 1):
+        path = f"events?per_page={per_page}&page={page}"
+        cmd = ["glab", "api", path]
+        verbose_log(verbose, f"fetch events page={page} per_page={per_page}")
+        verbose_log(verbose, " ".join(cmd))
+
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "glab api events failed")
+
+        data = json.loads(proc.stdout or "[]")
+        if not isinstance(data, list):
+            raise RuntimeError("glab api events did not return a JSON array")
+        if not data:
+            verbose_log(verbose, f"page={page} empty; stop")
+            break
+
+        page_events = [
+            item for item in data if isinstance(item, dict) and in_window(item, start, end)
+        ]
+        events.extend(page_events)
+        verbose_log(
+            verbose,
+            f"page={page} fetched={len(data)} in_window={len(page_events)} total={len(events)}",
+        )
+
+        page_times = [
+            created_at
+            for item in data
+            if isinstance(item, dict)
+            for created_at in [event_created_at(item)]
+            if created_at is not None
+        ]
+        if page_times and max(page_times).astimezone(timezone.utc) < start_utc:
+            verbose_log(verbose, f"page={page} older than start; stop")
+            break
+
+    return events
+
+
+def int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def add_issue(issues: list[IssueRef], issue: IssueRef) -> None:
+    if issue.key() not in {existing.key() for existing in issues}:
+        issues.append(issue)
+
+
+def issue_from_api_item(item: dict[str, Any], source: str) -> IssueRef | None:
+    project_id = int_or_none(item.get("project_id"))
+    iid = int_or_none(item.get("iid"))
+    if project_id is None or iid is None:
+        return None
+    return IssueRef(
+        project_id=project_id,
+        iid=iid,
+        source=source,
+        title=item.get("title") or None,
+        web_url=item.get("web_url") or None,
+    )
+
+
+def issue_refs_from_text(
+    project_id: int,
+    text: str,
+    source: str,
+    *,
+    hash_refs: bool = True,
+    api: GitLabApi | None = None,
+    merge_request_refs: bool = True,
+) -> list[IssueRef]:
+    issues: list[IssueRef] = []
+    absolute_url_spans: list[tuple[int, int]] = []
+    if api is not None:
+        for match in ABSOLUTE_ISSUE_URL_RE.finditer(text):
+            absolute_url_spans.append(match.span())
+            for issue in issue_from_project_path(
+                api,
+                match.group(1),
+                int(match.group(2)),
+                source,
+                merge_request_refs=False,
+            ):
+                add_issue(issues, issue)
+        for match in ABSOLUTE_WORK_ITEM_URL_RE.finditer(text):
+            absolute_url_spans.append(match.span())
+            for issue in issue_from_project_path(
+                api,
+                match.group(1),
+                int(match.group(2)),
+                source,
+                merge_request_refs=False,
+            ):
+                add_issue(issues, issue)
+        for match in ISSUE_URL_RE.finditer(text):
+            if inside_any_span(match.start(), absolute_url_spans):
+                continue
+            for issue in issues_from_project_ref(
+                api,
+                project_id,
+                int(match.group(1)),
+                source,
+                merge_request_refs=False,
+            ):
+                add_issue(issues, issue)
+        for match in WORK_ITEM_URL_RE.finditer(text):
+            if inside_any_span(match.start(), absolute_url_spans):
+                continue
+            for issue in issues_from_project_ref(
+                api,
+                project_id,
+                int(match.group(1)),
+                source,
+                merge_request_refs=False,
+            ):
+                add_issue(issues, issue)
+    else:
+        for match in ISSUE_URL_RE.finditer(text):
+            add_issue(issues, IssueRef(project_id, int(match.group(1)), source))
+    if api is not None:
+        for match in FULL_ISSUE_REF_RE.finditer(text):
+            for issue in issue_from_project_path(
+                api,
+                match.group(1),
+                int(match.group(2)),
+                source,
+                merge_request_refs=merge_request_refs,
+            ):
+                add_issue(issues, issue)
+    if not hash_refs:
+        return issues
+    for match in ISSUE_REF_RE.finditer(text):
+        if api is None:
+            add_issue(issues, IssueRef(project_id, int(match.group(1)), source))
+            continue
+        for issue in issues_from_project_ref(
+            api,
+            project_id,
+            int(match.group(1)),
+            source,
+            merge_request_refs=merge_request_refs,
+        ):
+            add_issue(issues, issue)
+    return issues
+
+
+def inside_any_span(position: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def mr_closing_issues(api: GitLabApi, project_id: int, mr_iid: int) -> list[IssueRef]:
+    verbose_log(api.verbose, f"resolve mr project={project_id} iid={mr_iid}: closing issues")
+    path = f"projects/{project_id}/merge_requests/{mr_iid}/closes_issues"
+    data = api.get(path)
+    if not isinstance(data, list):
+        return []
+    return [
+        issue
+        for item in data
+        if isinstance(item, dict)
+        for issue in [issue_from_api_item(item, f"mr:{mr_iid}:closes_issues")]
+        if issue is not None
+    ]
+
+
+def mr_related_issues(api: GitLabApi, project_id: int, mr_iid: int) -> list[IssueRef]:
+    verbose_log(api.verbose, f"resolve mr project={project_id} iid={mr_iid}: related issues")
+    path = f"projects/{project_id}/merge_requests/{mr_iid}/related_issues"
+    data = api.get(path)
+    if not isinstance(data, list):
+        return []
+    return [
+        issue
+        for item in data
+        if isinstance(item, dict)
+        for issue in [issue_from_api_item(item, f"mr:{mr_iid}:related_issues")]
+        if issue is not None
+    ]
+
+
+def mr_text_issue_refs(api: GitLabApi, project_id: int, mr_iid: int) -> list[IssueRef]:
+    verbose_log(api.verbose, f"resolve mr project={project_id} iid={mr_iid}: text refs")
+    path = f"projects/{project_id}/merge_requests/{mr_iid}"
+    data = api.get(path)
+    if not isinstance(data, dict):
+        return []
+    text = "\n".join(
+        str(data.get(name) or "") for name in ("title", "description", "source_branch")
+    )
+    return issue_refs_from_text(
+        project_id,
+        text,
+        f"mr:{mr_iid}:text_ref",
+        api=api,
+        merge_request_refs=False,
+    )
+
+
+def resolve_mr(api: GitLabApi, project_id: int, mr_iid: int) -> list[IssueRef]:
+    issues: list[IssueRef] = []
+    for issue in mr_closing_issues(api, project_id, mr_iid):
+        add_issue(issues, issue)
+    for issue in mr_related_issues(api, project_id, mr_iid):
+        add_issue(issues, issue)
+    for issue in mr_text_issue_refs(api, project_id, mr_iid):
+        add_issue(issues, issue)
+    return issues
+
+
+def source_branch_from_event(event: dict[str, Any]) -> tuple[str | None, bool]:
+    push_data = event.get("push_data") or {}
+    commit_title = str(push_data.get("commit_title") or "")
+    merge_match = MERGE_BRANCH_RE.search(commit_title)
+    if merge_match:
+        return merge_match.group(1), True
+
+    ref = str(push_data.get("ref") or "")
+    if ref:
+        return ref, False
+    return None, False
+
+
+def merge_requests_for_branch(
+    api: GitLabApi, project_id: int, branch: str
+) -> list[dict[str, Any]]:
+    encoded = urllib.parse.quote(branch, safe="")
+    path = (
+        f"projects/{project_id}/merge_requests"
+        f"?state=all&scope=all&source_branch={encoded}&per_page=100"
+    )
+    data = api.get(path)
+    return data if isinstance(data, list) else []
+
+
+def merge_requests_for_commit(
+    api: GitLabApi, project_id: int, sha: str
+) -> list[dict[str, Any]]:
+    path = f"projects/{project_id}/repository/commits/{sha}/merge_requests?per_page=100"
+    data = api.get(path)
+    return data if isinstance(data, list) else []
+
+
+def commit_text_issue_refs(api: GitLabApi, project_id: int, sha: str) -> list[IssueRef]:
+    verbose_log(api.verbose, f"resolve commit project={project_id} sha={sha}: text refs")
+    path = f"projects/{project_id}/repository/commits/{sha}"
+    data = api.get(path)
+    if not isinstance(data, dict):
+        return []
+
+    text = "\n".join(
+        str(data.get(name) or "") for name in ("title", "message", "web_url")
+    )
+    source = f"commit:{sha[:12]}:text_ref"
+    return issue_refs_from_text(project_id, text, source, api=api)
+
+
+def commit_comment_issue_refs(api: GitLabApi, project_id: int, sha: str) -> list[IssueRef]:
+    verbose_log(api.verbose, f"resolve commit project={project_id} sha={sha}: comment refs")
+    path = f"projects/{project_id}/repository/commits/{sha}/comments"
+    data = api.get(path)
+    if not isinstance(data, list):
+        return []
+
+    issues: list[IssueRef] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("note") or "")
+        for issue in issue_refs_from_text(
+            project_id, text, f"commit:{sha[:12]}:comment_ref", api=api
+        ):
+            add_issue(issues, issue)
+    return issues
+
+
+def resolve_project_event(api: GitLabApi, event: dict[str, Any]) -> list[IssueRef]:
+    project_id = int_or_none(event.get("project_id"))
+    if project_id is None:
+        return []
+
+    issues: list[IssueRef] = []
+    branch, _from_merge_title = source_branch_from_event(event)
+    can_search_branch = bool(branch) and branch not in INTEGRATION_BRANCHES
+    if branch and can_search_branch:
+        verbose_log(
+            api.verbose,
+            f"resolve project event activity={event.get('id')}: source branch {branch}",
+        )
+        for mr in merge_requests_for_branch(api, project_id, branch):
+            mr_iid = int_or_none(mr.get("iid"))
+            if mr_iid is None:
+                continue
+            for issue in resolve_mr(api, project_id, mr_iid):
+                add_issue(issues, issue)
+
+    if issues:
+        return issues
+
+    push_data = event.get("push_data") or {}
+    for sha_key in ("commit_to", "commit_from"):
+        sha = str(push_data.get(sha_key) or "")
+        if not sha:
+            continue
+        verbose_log(
+            api.verbose,
+            f"resolve project event activity={event.get('id')}: commit {sha_key}={sha}",
+        )
+        for mr in merge_requests_for_commit(api, project_id, sha):
+            mr_iid = int_or_none(mr.get("iid"))
+            if mr_iid is None:
+                continue
+            for issue in resolve_mr(api, project_id, mr_iid):
+                add_issue(issues, issue)
+        if issues:
+            return issues
+
+        for issue in commit_text_issue_refs(api, project_id, sha):
+            add_issue(issues, issue)
+        if issues:
+            return issues
+
+        for issue in commit_comment_issue_refs(api, project_id, sha):
+            add_issue(issues, issue)
+        if issues:
+            return issues
+
+    text = "\n".join(
+        str(value or "")
+        for value in (
+            push_data.get("ref"),
+            push_data.get("commit_title"),
+            event.get("target_title"),
+            event.get("title"),
+        )
+    )
+    for issue in issue_refs_from_text(
+        project_id, text, "project:text_ref", hash_refs=False, api=api
+    ):
+        add_issue(issues, issue)
+    return issues
+
+
+def direct_issue(api: GitLabApi, event: dict[str, Any]) -> IssueRef | None:
+    project_id = int_or_none(event.get("project_id"))
+    iid = int_or_none(event.get("target_iid"))
+    if project_id is None or iid is None:
+        return None
+    return issue_from_project_iid(api, project_id, iid, "direct")
+
+
+def note_issue(api: GitLabApi, event: dict[str, Any]) -> list[IssueRef]:
+    note = event.get("note") or {}
+    if not isinstance(note, dict):
+        return []
+
+    noteable_type = note.get("noteable_type")
+    project_id = int_or_none(note.get("project_id") or event.get("project_id"))
+    noteable_iid = int_or_none(note.get("noteable_iid"))
+    if project_id is None or noteable_iid is None:
+        return []
+
+    if noteable_type in ("Issue", "WorkItem"):
+        verbose_log(
+            api.verbose,
+            f"resolve note activity={event.get('id')}: direct {noteable_type} #{noteable_iid}",
+        )
+        issue = issue_from_project_iid(api, project_id, noteable_iid, "noteable")
+        return [issue] if issue is not None else []
+    if noteable_type == "MergeRequest":
+        verbose_log(
+            api.verbose,
+            f"resolve note activity={event.get('id')}: merge request !{noteable_iid}",
+        )
+        return resolve_mr(api, project_id, noteable_iid)
+    return issue_refs_from_text(
+        project_id, str(note.get("body") or ""), "note:text_ref", api=api
+    )
+
+
+def resolve_event(api: GitLabApi, event: dict[str, Any]) -> list[IssueRef]:
+    target_type = event.get("target_type")
+    verbose_log(
+        api.verbose,
+        (
+            f"resolve activity={event.get('id')} type={target_type} "
+            f"action={event.get('action_name')!r} project={event.get('project_id')}"
+        ),
+    )
+
+    if target_type in ("Issue", "WorkItem"):
+        issue = direct_issue(api, event)
+        return [issue] if issue else []
+
+    if target_type in ("Note", "DiffNote", "DiscussionNote"):
+        return note_issue(api, event)
+
+    project_id = int_or_none(event.get("project_id"))
+    target_iid = int_or_none(event.get("target_iid"))
+    if target_type == "MergeRequest" and project_id is not None and target_iid is not None:
+        verbose_log(
+            api.verbose,
+            f"resolve activity={event.get('id')}: merge request !{target_iid}",
+        )
+        return resolve_mr(api, project_id, target_iid)
+
+    if target_type == "Project":
+        return resolve_project_event(api, event)
+
+    return []
+
+
+def summarize_event(
+    event: dict[str, Any],
+    issues: list[IssueRef],
+    error: str | None,
+    working_block: dict[str, Any] | None = None,
+    activity_url: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "activity_id": event.get("id"),
+        "created_at": event.get("created_at"),
+        "action_name": event.get("action_name"),
+        "target_type": event.get("target_type"),
+        "project_id": event.get("project_id"),
+        "target_iid": event.get("target_iid"),
+        "target_title": event.get("target_title"),
+        "activity_summary": activity_summary(event, ellipsized=False),
+        "issues": [issue.as_dict() for issue in issues],
+    }
+    if activity_url:
+        result["activity_url"] = activity_url
+    if working_block is not None:
+        result.update(working_block)
+    if error:
+        result["error"] = error
+    return result
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        start = parse_bound(args.start, end=False)
+        end = parse_bound(args.end, end=True)
+        if start > end:
+            raise ValueError("--start must be before --end")
+        if args.per_page < 1:
+            raise ValueError("--per-page must be greater than zero")
+        if args.max_pages < 1:
+            raise ValueError("--max-pages must be greater than zero")
+        if args.time_spent_slot_minutes < 1:
+            raise ValueError("--time-spent-slot-minutes must be greater than zero")
+        if 60 % args.time_spent_slot_minutes != 0:
+            raise ValueError("--time-spent-slot-minutes must divide 60")
+        if args.interactive and not args.time_spent_book:
+            raise ValueError("--interactive requires --time-spent-book")
+
+        events = fetch_events(
+            start,
+            end,
+            per_page=args.per_page,
+            max_pages=args.max_pages,
+            verbose=args.verbose,
+        )
+        events.sort(
+            key=lambda event: event_created_at(event)
+            or datetime.min.replace(tzinfo=timezone.utc)
+        )
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
+
+    api = GitLabApi(verbose=args.verbose)
+    results: list[dict[str, Any]] = []
+
+    try:
+        verbose_log(args.verbose, f"resolving {len(events)} events")
+        for event in events:
+            issues: list[IssueRef] = []
+            error: str | None = None
+            try:
+                issues = resolve_event(api, event)
+            except RuntimeError as exc:
+                error = str(exc)
+                verbose_log(args.verbose, f"activity={event.get('id')} error={error}")
+            else:
+                issue_ids = ", ".join(
+                    f"{issue.project_id}#{issue.iid}" for issue in issues
+                )
+                verbose_log(
+                    args.verbose,
+                    f"activity={event.get('id')} issues=[{issue_ids}]",
+                )
+            url = warning_url(api, event)
+            if not error and not issues:
+                url_suffix = f" ({url})" if url else ""
+                warning(
+                    f"No issue found for {activity_summary(event)}{url_suffix}"
+                )
+            working_block = (
+                working_block_for_event(event, args.time_spent_slot_minutes)
+                if args.time_spent or args.time_spent_book
+                else None
+            )
+            results.append(
+                summarize_event(event, issues, error, working_block, activity_url=url)
+            )
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
+
+    had_booking_failure = False
+    if args.time_spent_book:
+        try:
+            had_booking_failure = add_time_spent_bookings(
+                api,
+                results,
+                args.time_spent_slot_minutes,
+                interactive=args.interactive,
+            )
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print(file=sys.stderr)
+            return 130
+
+    if args.json_array:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        for result in results:
+            print(json.dumps(result, ensure_ascii=False))
+
+    if had_booking_failure:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -22,7 +22,12 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+if [ -z "${URL}" ]; then
+    command -v clip-paste &>/dev/null && URL="$(clip-paste)"
+    command -v prompt-input &>/dev/null && if ! URL="$(prompt-input "URL:" -d "${URL}")"; then exit 1; fi
+fi
 [ -z "${URL}" ] && usage
+
 PARENT_DIR="$(pwd)"
 
 function choose() {

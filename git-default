@@ -40,5 +40,17 @@ while [ ${#} -gt 0 ]; do
 done
 
 git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
-ref="$(git -C "${git_dir}" symbolic-ref --short refs/remotes/origin/HEAD)" || fail "Not a git repo?"
-[ "${fqn}" -eq 0 ] && basename "${ref}" || echo "${ref}"
+
+if ref="$(git -C "${git_dir}" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"; then
+    [ "${fqn}" -eq 0 ] && basename "${ref}" || echo "${ref}"
+    exit 0
+fi
+
+for branch in main master; do
+    if git -C "${git_dir}" show-ref --verify --quiet "refs/heads/${branch}"; then
+        [ "${fqn}" -eq 0 ] && echo "${branch}" || echo "refs/heads/${branch}"
+        exit 0
+    fi
+done
+
+fail "No remote HEAD and no local main/master branch found"

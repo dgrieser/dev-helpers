@@ -1,0 +1,449 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [COMMAND] [OPTIONS]
+
+Create, list, or move mirrored git worktree changes back to WORKSPACE.
+
+Commands:
+  add                   Add mirrored worktree for BRANCH at:
+    WORKSPACE_WORKTREE/<path under WORKSPACE>/BRANCH
+  list                  List worktrees for the resolved workspace repository
+  delete                Delete the resolved mirrored worktree and print its main dir
+  move-to-main          Move uncommitted changes from a mirrored worktree to its main tree
+
+If COMMAND is omitted, add is used.
+
+Options:
+  -b, --branch BRANCH    Branch to add/delete; defaults to current workspace branch
+  -w, --workdir DIR      Workspace repo dir; defaults to current dir
+  -h, --help             Show this help message and exit
+
+Environment:
+  WORKSPACE              Source workspace root
+  WORKSPACE_WORKTREE     Mirrored worktree root
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+set_command() {
+    if [ "${command_seen}" = "1" ]; then
+        error "Unexpected argument: ${1}"
+        usage
+    fi
+
+    case "${1}" in
+        add|list|delete|move-to-main)
+            mode="${1}"
+            command_seen=1
+            ;;
+        *)
+            error "Unknown command: ${1}"
+            usage
+            ;;
+    esac
+}
+
+canonical_dir() {
+    [ -n "${1}" ] || return 1
+    [ -d "${1}" ] || return 1
+    (cd "${1}" 2>/dev/null && pwd -P)
+}
+
+inside_path() {
+    case "${1}" in
+        "${2}"|"${2}"/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+relative_to() {
+    if [ "${1}" = "${2}" ]; then
+        echo ""
+        return 0
+    fi
+    echo "${1#"${2}/"}"
+}
+
+current_branch() {
+    git -C "${1}" symbolic-ref --quiet --short HEAD 2>/dev/null
+}
+
+require_git_repo() {
+    git -C "${1}" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+        fail "Not inside a git repository: ${1}"
+}
+
+git_common_dir() {
+    common_dir="$(git -C "${1}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+        return 1
+    canonical_dir "${common_dir}"
+}
+
+same_git_repo() {
+    left_common="$(git_common_dir "${1}")" || return 1
+    right_common="$(git_common_dir "${2}")" || return 1
+    [ "${left_common}" = "${right_common}" ]
+}
+
+has_uncommitted_changes() {
+    [ -n "$(git -C "${1}" status --porcelain --untracked-files=all)" ]
+}
+
+require_clean_tree() {
+    if has_uncommitted_changes "${1}"; then
+        fail "${2} has uncommitted changes: ${1}"
+    fi
+}
+
+cleanup_move_files() {
+    [ -n "${move_staged_patch:-}" ] && ${RM_CMD} -f "${move_staged_patch}"
+    [ -n "${move_unstaged_patch:-}" ] && ${RM_CMD} -f "${move_unstaged_patch}"
+    [ -n "${move_untracked_list:-}" ] && ${RM_CMD} -f "${move_untracked_list}"
+    [ -n "${move_untracked_tar:-}" ] && ${RM_CMD} -f "${move_untracked_tar}"
+}
+
+move_fail() {
+    cleanup_move_files
+    fail "${1}"
+}
+
+rollback_main_tree() {
+    git -C "${workdir}" reset --hard >/dev/null 2>&1
+    git -C "${workdir}" clean -fd >/dev/null 2>&1
+}
+
+rollback_move_fail() {
+    rollback_main_tree
+    move_fail "${1}"
+}
+
+check_untracked_targets() {
+    move_conflict_path=""
+    while IFS= read -r -d "" untracked_path; do
+        if [ -e "${workdir}/${untracked_path}" ]; then
+            move_conflict_path="${untracked_path}"
+            return 1
+        fi
+    done < "${move_untracked_list}"
+}
+
+copy_untracked_files() {
+    [ -s "${move_untracked_list}" ] || return 0
+    (cd "${source_mirror_worktree}" && tar --null -T "${move_untracked_list}" -cf "${move_untracked_tar}") ||
+        return 1
+    (cd "${workdir}" && tar -xf "${move_untracked_tar}") ||
+        return 1
+}
+
+validate_branch_name() {
+    [ -n "${1}" ] || fail "Branch is required"
+    git -C "${workdir}" check-ref-format --branch "${1}" >/dev/null 2>&1 ||
+        fail "Invalid branch name: ${1}"
+}
+
+resolve_branch() {
+    if [ -n "${branch_arg}" ]; then
+        branch="${branch_arg}"
+    else
+        current="$(current_branch "${workdir}")" || fail "Cannot determine current branch in workspace dir: ${workdir}"
+        branch="$(prompt-input -p "Branch:" -d "${current}")" || fail "Branch is required"
+    fi
+    validate_branch_name "${branch}"
+}
+
+resolve_from_mirror() {
+    mirror_source="$(canonical_dir "${1}")" ||
+        fail "Workdir does not exist: ${1}"
+    require_git_repo "${mirror_source}"
+
+    mirror_repo="$(git -C "${mirror_source}" rev-parse --show-toplevel 2>/dev/null)" ||
+        fail "Cannot resolve mirrored git root: ${mirror_source}"
+    mirror_repo="$(canonical_dir "${mirror_repo}")" ||
+        fail "Cannot resolve mirrored git root: ${mirror_source}"
+
+    inside_path "${mirror_repo}" "${workspace_worktree_root}" ||
+        fail "Git root is not under WORKSPACE_WORKTREE: ${mirror_repo}"
+
+    mirror_branch="$(current_branch "${mirror_repo}")" ||
+        fail "Cannot map detached mirrored worktree: ${mirror_repo}"
+
+    rel_with_branch="$(relative_to "${mirror_repo}" "${workspace_worktree_root}")"
+    if [ "${rel_with_branch}" = "${mirror_branch}" ]; then
+        rel=""
+    else
+        branch_suffix="/${mirror_branch}"
+        case "${rel_with_branch}" in
+            *"${branch_suffix}")
+                rel="${rel_with_branch%"${branch_suffix}"}"
+                ;;
+            *)
+                fail "Mirrored path does not end with current branch: ${mirror_repo}"
+                ;;
+        esac
+    fi
+
+    if [ -n "${rel}" ]; then
+        workdir_candidate="${workspace_root}/${rel}"
+    else
+        workdir_candidate="${workspace_root}"
+    fi
+
+    workdir="$(canonical_dir "${workdir_candidate}")" ||
+        fail "Mapped workspace dir does not exist: ${workdir_candidate}"
+    source_kind="mirror"
+    source_mirror_worktree="${mirror_repo}"
+}
+
+resolve_workdir() {
+    source_path="$(canonical_dir "${1}")" ||
+        fail "Workdir does not exist: ${1}"
+
+    source_kind="workspace"
+    source_mirror_worktree=""
+
+    if inside_path "${source_path}" "${workspace_worktree_root}"; then
+        resolve_from_mirror "${source_path}"
+        return 0
+    fi
+
+    inside_path "${source_path}" "${workspace_root}" ||
+        fail "Workdir must be under WORKSPACE or WORKSPACE_WORKTREE: ${source_path}"
+
+    workdir="${source_path}"
+}
+
+target_path_for() {
+    rel="$(relative_to "${workdir}" "${workspace_root}")"
+    if [ -n "${rel}" ]; then
+        echo "${workspace_worktree_root}/${rel}/${1}"
+    else
+        echo "${workspace_worktree_root}/${1}"
+    fi
+}
+
+add_worktree() {
+    target="$(target_path_for "${branch}")"
+
+    if [ -e "${target}" ]; then
+        if [ -d "${target}" ] &&
+            git -C "${target}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            same_git_repo "${workdir}" "${target}" ||
+                fail "Existing target belongs to a different git repository: ${target}"
+            existing_branch="$(current_branch "${target}")" ||
+                fail "Existing worktree is detached: ${target}"
+            [ "${existing_branch}" = "${branch}" ] ||
+                fail "Existing worktree is on ${existing_branch}, expected ${branch}: ${target}"
+            echo "${target}"
+            return 0
+        fi
+        fail "Target exists and is not a git worktree: ${target}"
+    fi
+
+    mkdir -p "$(dirname "${target}")" ||
+        fail "Cannot create parent dir for target: ${target}"
+    git -C "${workdir}" worktree add --force --quiet "${target}" "${branch}" >/dev/null ||
+        fail "git worktree add failed"
+    echo "${target}"
+}
+
+list_worktrees() {
+    worktree_output="$(git -C "${workdir}" worktree list --porcelain)" ||
+        fail "git worktree list failed"
+    printf "%s\n" "${worktree_output}" |
+        awk -v main="${workdir}" -v mirror_root="${workspace_worktree_root}" '
+            /^worktree / {
+                path = substr($0, 10)
+                show = path != main && (path == mirror_root || index(path, mirror_root "/") == 1)
+                next
+            }
+            show && /^HEAD / {
+                head = substr($0, 6, 7)
+                next
+            }
+            show && /^branch / {
+                branch = substr($0, 8)
+                sub("^refs/heads/", "", branch)
+                printf "%s %s [%s]\n", path, head, branch
+                show = 0
+                next
+            }
+            show && /^detached$/ {
+                printf "%s %s (detached HEAD)\n", path, head
+                show = 0
+                next
+            }
+        '
+}
+
+delete_worktree() {
+    if [ "${source_kind}" = "mirror" ] && [ -z "${branch_arg}" ]; then
+        target="${source_mirror_worktree}"
+    else
+        target="$(target_path_for "${branch}")"
+    fi
+
+    [ -n "${target}" ] || fail "Worktree target is empty"
+    [ -d "${target}" ] || fail "Worktree does not exist: ${target}"
+    git -C "${workdir}" worktree remove "${target}" ||
+        fail "git worktree remove failed"
+    echo "Deleted worktree: ${target}" 1>&2
+    echo "${workdir}"
+}
+
+move_to_main() {
+    [ "${source_kind}" = "mirror" ] ||
+        fail "move-to-main must run from a mirrored worktree or use --workdir"
+    same_git_repo "${source_mirror_worktree}" "${workdir}" ||
+        fail "Mapped main tree belongs to a different git repository: ${workdir}"
+    has_uncommitted_changes "${source_mirror_worktree}" ||
+        fail "No uncommitted changes to move: ${source_mirror_worktree}"
+    require_clean_tree "${workdir}" "Main tree"
+
+    move_staged_patch="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.staged.XXXXXX")" ||
+        fail "Cannot create temp file"
+    move_unstaged_patch="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.unstaged.XXXXXX")" ||
+        move_fail "Cannot create temp file"
+    move_untracked_list="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.untracked.XXXXXX")" ||
+        move_fail "Cannot create temp file"
+    move_untracked_tar="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.untracked.XXXXXX.tar")" ||
+        move_fail "Cannot create temp file"
+
+    git -C "${source_mirror_worktree}" diff --cached --binary > "${move_staged_patch}" ||
+        move_fail "Cannot generate staged diff"
+    git -C "${source_mirror_worktree}" diff --binary > "${move_unstaged_patch}" ||
+        move_fail "Cannot generate unstaged diff"
+    git -C "${source_mirror_worktree}" ls-files --others --exclude-standard -z > "${move_untracked_list}" ||
+        move_fail "Cannot list untracked files"
+
+    if [ -s "${move_staged_patch}" ]; then
+        git -C "${workdir}" apply --check --index "${move_staged_patch}" ||
+            move_fail "Cannot apply staged changes to main tree"
+        git -C "${workdir}" apply --index "${move_staged_patch}" ||
+            move_fail "Cannot apply staged changes to main tree"
+    fi
+
+    if [ -s "${move_unstaged_patch}" ]; then
+        git -C "${workdir}" apply --check "${move_unstaged_patch}" ||
+            rollback_move_fail "Cannot apply unstaged changes to main tree"
+        git -C "${workdir}" apply "${move_unstaged_patch}" ||
+            rollback_move_fail "Cannot apply unstaged changes to main tree"
+    fi
+
+    if [ -s "${move_untracked_list}" ]; then
+        check_untracked_targets ||
+            rollback_move_fail "Untracked target already exists in main tree: ${move_conflict_path}"
+        copy_untracked_files ||
+            rollback_move_fail "Cannot copy untracked files to main tree"
+    fi
+
+    git -C "${source_mirror_worktree}" reset --hard >/dev/null ||
+        move_fail "Changes copied, but source worktree reset failed: ${source_mirror_worktree}"
+    git -C "${source_mirror_worktree}" clean -fd >/dev/null ||
+        move_fail "Changes copied, but source worktree clean failed: ${source_mirror_worktree}"
+
+    cleanup_move_files
+    echo "${workdir}"
+}
+
+RM_CMD="$(command -v trash 2>/dev/null || command -v rm 2>/dev/null)"
+mode="add"
+command_seen=0
+branch_arg=""
+workdir_arg=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -b|--branch)
+            shift
+            [ -z "${1}" ] && usage
+            branch_arg="${1}"
+            ;;
+        -w|--workdir)
+            shift
+            [ -z "${1}" ] && usage
+            workdir_arg="${1}"
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            set_command "${1}"
+            ;;
+    esac
+    shift
+done
+
+[ -n "${WORKSPACE:-}" ] || fail "WORKSPACE is not set"
+[ -n "${WORKSPACE_WORKTREE:-}" ] || fail "WORKSPACE_WORKTREE is not set"
+
+workspace_root="$(canonical_dir "${WORKSPACE}")" ||
+    fail "WORKSPACE does not exist: ${WORKSPACE}"
+mkdir -p "${WORKSPACE_WORKTREE}" ||
+    fail "Cannot create WORKSPACE_WORKTREE: ${WORKSPACE_WORKTREE}"
+workspace_worktree_root="$(canonical_dir "${WORKSPACE_WORKTREE}")" ||
+    fail "WORKSPACE_WORKTREE does not exist: ${WORKSPACE_WORKTREE}"
+
+current_dir="$(pwd -P)"
+if ! inside_path "${current_dir}" "${workspace_worktree_root}" &&
+    ! inside_path "${current_dir}" "${workspace_root}"; then
+    fail "Run from inside WORKSPACE or WORKSPACE_WORKTREE"
+fi
+
+if [ -n "${workdir_arg}" ]; then
+    resolve_workdir "${workdir_arg}"
+else
+    resolve_workdir "${current_dir}"
+fi
+
+require_git_repo "${workdir}"
+
+case "${mode}" in
+    add)
+        resolve_branch
+        add_worktree
+        ;;
+    list)
+        [ -z "${branch_arg}" ] || fail "--branch cannot be used with list"
+        list_worktrees
+        ;;
+    delete)
+        if [ "${source_kind}" != "mirror" ] || [ -n "${branch_arg}" ]; then
+            resolve_branch
+        fi
+        delete_worktree
+        ;;
+    move-to-main)
+        [ -z "${branch_arg}" ] || fail "--branch cannot be used with move-to-main"
+        move_to_main
+        ;;
+esac
