@@ -1,12 +1,72 @@
 #!/bin/bash
 
-git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo."
-git -C "${git_dir}" --no-pager diff HEAD
-readarray -t untracked < <(git ls-files --others --exclude-standard)
-print_header=1
-for f in "${untracked[@]}"; do
-    if [ -e "${f}" ]; then
-        [ ${print_header} -eq 1 ] && echo -e "\n\e[1;31mUNTRACKED\e[0m\n" && print_header=0
-        git -C "${git_dir}" --no-pager diff --no-index /dev/null "${f}"
-    fi
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [BRANCH]
+
+Show the current working-tree diff, or compare the current branch to BRANCH.
+
+When BRANCH is omitted, show the existing diff against HEAD plus untracked files.
+When BRANCH is provided, show the diff from merge-base(BRANCH, HEAD) to HEAD.
+
+Options:
+  -h, --help            Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+print_worktree_diff() {
+    git -C "${git_dir}" --no-pager diff HEAD
+
+    readarray -t untracked < <(git -C "${git_dir}" ls-files --others --exclude-standard)
+    print_header=1
+    for f in "${untracked[@]}"; do
+        if [ -e "${git_dir}/${f}" ]; then
+            [ "${print_header}" -eq 1 ] && echo -e "\n\e[1;31mUNTRACKED\e[0m\n" && print_header=0
+            git -C "${git_dir}" --no-pager diff --no-index /dev/null "${f}"
+        fi
+    done
+}
+
+compare_branch=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            if [ -n "${compare_branch}" ]; then
+                error "Unexpected argument: ${1}"
+                usage
+            fi
+            compare_branch="${1}"
+            ;;
+    esac
+    shift
 done
+
+git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo."
+
+if [ -z "${compare_branch}" ]; then
+    print_worktree_diff
+else
+    git -C "${git_dir}" rev-parse --verify --quiet "${compare_branch}^{commit}" >/dev/null ||
+        fail "Branch not found: ${compare_branch}"
+    git -C "${git_dir}" --no-pager diff "${compare_branch}...HEAD"
+fi

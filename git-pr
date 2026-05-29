@@ -13,7 +13,8 @@ Options:
   -c, --create  Create a new PR from the current branch
       --feedback
                 List PRs, prompt for a PR ID, then print unresolved review
-                content as JSON (current behavior)
+                content as formatted Markdown
+  -r, --raw     With --feedback, print Markdown without terminal rendering
   -h, --help    Show this help message and exit
 EOF
     exit 1
@@ -87,7 +88,9 @@ commit-to-title() {
 }
 
 show_feedback() {
-    local id="${1}"; shift
+    local id="${1}"
+    local raw="${2}"
+    # shellcheck disable=SC2016
     PR_BASE_JSON="$(gh api graphql -f query='
       query($owner: String!, $repo: String!, $pr: Int!) {
         repository(owner: $owner, name: $repo) {
@@ -127,6 +130,7 @@ show_feedback() {
         THREAD_COMMENTS_JSON="$(
             while IFS= read -r THREAD_ID; do
                 [ -z "${THREAD_ID}" ] && continue
+                # shellcheck disable=SC2016
                 gh api graphql -f query='
                   query($id: ID!) {
                     node(id: $id) {
@@ -161,7 +165,7 @@ show_feedback() {
         )" || fail "Failed to fetch unresolved thread comments"
     fi
 
-    jq -n \
+    FEEDBACK_JSON="$(jq -n \
       --argjson pr "${PR_BASE_JSON}" \
       --argjson unresolvedThreads "${THREAD_COMMENTS_JSON}" '
       if ($unresolvedThreads | length) == 0 then
@@ -209,12 +213,58 @@ show_feedback() {
             | map(select(.createdAt[0:10] == $firstDate))
           end
       end
-    '
+    ')" || fail "Failed to build feedback JSON"
+
+    FEEDBACK_MARKDOWN="$(
+        printf '%s\n' "${FEEDBACK_JSON}" | jq -r '
+          def author: (.author.login // "unknown");
+          def created: (.createdAt // "unknown time");
+          def body: (.body // "_No body._");
+          def location:
+            if .path then
+              "**Location:** `" + .path +
+              (if .originalLine then ":" + (.originalLine | tostring) else "" end) +
+              "`\n\n"
+            else
+              ""
+            end;
+          def parent:
+            if .parent then
+              "**Reply to:** `" + .parent + "`\n\n"
+            else
+              ""
+            end;
+
+          if length == 0 then
+            "No unresolved review feedback found."
+          else
+            "# Review Feedback\n\n" +
+            (map(
+              if .kind == "review" then
+                "## Review by " + author +
+                (if .state then " (" + .state + ")" else "" end) +
+                "\n\n**Created:** " + created + "\n\n" + body
+              else
+                "## Thread by " + author +
+                "\n\n**Created:** " + created + "\n\n" +
+                location + parent + body
+              end
+            ) | join("\n\n---\n\n"))
+          end
+        '
+    )" || fail "Failed to format feedback"
+
+    if [ "${raw}" -eq 0 ] && [ -t 1 ] && command -v glow >/dev/null 2>&1; then
+        printf '%s\n' "${FEEDBACK_MARKDOWN}" | glow -
+    else
+        printf '%s\n' "${FEEDBACK_MARKDOWN}"
+    fi
 }
 
 create=0
 branch=""
 feedback=0
+raw=0
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
         -b|--branch)
@@ -224,6 +274,9 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --feedback)
             feedback=1
+            ;;
+        -r|--raw)
+            raw=1
             ;;
         -c|--create)
             create=1
@@ -244,6 +297,7 @@ while [ "${#}" -gt 0 ]; do
 done
 # use current branch if not specified
 [ -z "${branch}" ] && branch="$(git branch --show-current)"
+[ "${raw}" -eq 1 ] && [ "${feedback}" -eq 0 ] && fail "-r/--raw requires --feedback"
 
 if [ "${create}" -eq 1 ]; then
     last_commit_message="$(commit-to-title)"
@@ -264,7 +318,6 @@ else
     if [ "${feedback}" -eq 0 ]; then
         run_approve_merge_flow "${id}"
     else
-        show_feedback "${id}"
+        show_feedback "${id}" "${raw}"
     fi
 fi
-
