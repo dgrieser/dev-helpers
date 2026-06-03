@@ -58,6 +58,7 @@ print_diff() {
         untracked) diff_cmd="${UNTRACKED_DIFF_CMD}" ;;
         unstaged) diff_cmd="${UNSTAGED_DIFF_CMD}" ;;
         staged) diff_cmd="${STAGED_DIFF_CMD}" ;;
+        *) fail "Unknown state: ${current_state}" ;;
     esac
     if [ "${color}" -eq 0 ]; then
         # remove "--color=always" from diff command

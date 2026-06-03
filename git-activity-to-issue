@@ -24,6 +24,9 @@ ISSUE_REF_RE = re.compile(r"(?<![\w/])#(\d+)\b")
 FULL_ISSUE_REF_RE = re.compile(
     r"(?<![\w/])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)#(\d+)\b"
 )
+# A single project name (no slash) before "#iid", e.g. "inbox#17". Resolved
+# relative to the namespace of the project the reference appears in.
+SAME_NAMESPACE_REF_RE = re.compile(r"(?<![\w/])([A-Za-z0-9_][A-Za-z0-9_.-]*)#(\d+)\b")
 MERGE_BRANCH_RE = re.compile(r"Merge branch '([^']+)' into '([^']+)'")
 INTEGRATION_BRANCHES = {"main", "master", "develop", "development", "prod", "production"}
 
@@ -142,6 +145,21 @@ def project_from_path(api: GitLabApi, path_with_namespace: str) -> dict[str, Any
     encoded = urllib.parse.quote(path_with_namespace, safe="")
     data = api.get(f"projects/{encoded}")
     return data if isinstance(data, dict) else None
+
+
+def project_namespace_path(api: GitLabApi, project_id: int) -> str | None:
+    data = api.get(f"projects/{project_id}")
+    if not isinstance(data, dict):
+        return None
+    namespace = data.get("namespace")
+    if isinstance(namespace, dict):
+        full_path = namespace.get("full_path")
+        if isinstance(full_path, str) and full_path:
+            return full_path
+    path_with_namespace = data.get("path_with_namespace")
+    if isinstance(path_with_namespace, str) and "/" in path_with_namespace:
+        return path_with_namespace.rsplit("/", 1)[0]
+    return None
 
 
 def issue_from_project_path(
@@ -271,6 +289,18 @@ def warning_url(api: GitLabApi, event: dict[str, Any]) -> str | None:
     return base_url
 
 
+def url_is_filtered(url: str | None, filters: list[str]) -> bool:
+    if not url or not filters:
+        return False
+    for raw_prefix in filters:
+        prefix = raw_prefix.rstrip("/")
+        if not prefix:
+            continue
+        if url == prefix or url.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
 def parse_args() -> argparse.Namespace:
     today = date.today()
     month_start = today.replace(day=1).isoformat()
@@ -324,6 +354,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=60,
         help="working block size in minutes, must divide 60, default: 60",
+    )
+    parser.add_argument(
+        "--filter",
+        action="append",
+        default=[],
+        metavar="URL",
+        help=(
+            "skip activities whose URL is under this URL prefix; "
+            "repeatable, e.g. --filter https://gitlab.example.com/group/project"
+        ),
     )
     parser.add_argument(
         "-v",
@@ -990,6 +1030,28 @@ def issue_refs_from_text(
             merge_request_refs=merge_request_refs,
         ):
             add_issue(issues, issue)
+    if api is not None:
+        namespace = project_namespace_path(api, project_id)
+        if namespace:
+            for match in SAME_NAMESPACE_REF_RE.finditer(text):
+                ref_path = f"{namespace}/{match.group(1)}"
+                try:
+                    resolved = issue_from_project_path(
+                        api,
+                        ref_path,
+                        int(match.group(2)),
+                        source,
+                        merge_request_refs=merge_request_refs,
+                    )
+                except RuntimeError as exc:
+                    verbose_log(
+                        api.verbose,
+                        f"resolve same-namespace ref {ref_path}#{match.group(2)}: "
+                        f"not found: {exc}",
+                    )
+                    continue
+                for issue in resolved:
+                    add_issue(issues, issue)
     return issues
 
 
@@ -1327,6 +1389,13 @@ def main() -> int:
     try:
         verbose_log(args.verbose, f"resolving {len(events)} events")
         for event in events:
+            url = warning_url(api, event)
+            if url_is_filtered(url, args.filter):
+                verbose_log(
+                    args.verbose,
+                    f"activity={event.get('id')} skipped by --filter url={url}",
+                )
+                continue
             issues: list[IssueRef] = []
             error: str | None = None
             try:
@@ -1342,7 +1411,6 @@ def main() -> int:
                     args.verbose,
                     f"activity={event.get('id')} issues=[{issue_ids}]",
                 )
-            url = warning_url(api, event)
             if not error and not issues:
                 url_suffix = f" ({url})" if url else ""
                 warning(

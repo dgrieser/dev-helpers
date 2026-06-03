@@ -311,9 +311,9 @@ if [ "${create}" -eq 1 ]; then
     gh pr create "${gh_args[@]}" || fail "Failed to create pull request"
 else
     gh pr list --state open --head "${branch}" 1>&2 || fail "Failed to list pull requests"
-    echo
+    echo 1>&2
     id="$(prompt_pr_id)" || abort
-    echo
+    echo 1>&2
 
     if [ "${feedback}" -eq 0 ]; then
         run_approve_merge_flow "${id}"
