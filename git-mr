@@ -1,7 +1,19 @@
 #!/bin/bash
 
 usage() {
-    echo "Usage: $(basename $0) [-c|--create] [-m|--copy-message] [-i|--issue] [-b|--branch <branch>] [-A|--all] <project>" 1>&2
+    cat <<EOF 1>&2
+Usage: $(basename "$0") [-c|--create] [-m|--copy-message] [-i|--issue] [--feedback] [-r|--raw] [-b|--branch <branch>] [-A|--all] <project>
+
+Options:
+  -c, --create        Create a new merge request
+  -m, --copy-message  Copy a channel message for the selected merge request
+  -i, --issue         Create an issue from the selected merge request
+      --feedback      Print unresolved review feedback for the selected merge request
+  -r, --raw           With --feedback, print Markdown without terminal rendering
+  -b, --branch        Filter merge requests by branch
+  -A, --all           Include all merge request states
+  -h, --help          Show this help message and exit
+EOF
     exit 1
 }
 
@@ -66,13 +78,84 @@ copy_message() {
     return 1
 }
 
+show_feedback() {
+    local mr_iid="${1}"
+    local raw="${2}"
+    local discussions_json=""
+    local feedback_markdown=""
+
+    discussions_json="$(glab api "projects/:fullpath/merge_requests/${mr_iid}/discussions" --paginate)" \
+        || fail "Failed to fetch merge request discussions"
+
+    feedback_markdown="$(
+        printf '%s\n' "${discussions_json}" | jq -r '
+          def author:
+            (.author.username // .author.name // "unknown");
+          def created:
+            (.created_at // "unknown time");
+          def body:
+            (.body // "_No body._");
+          def location:
+            if .position and (.position.new_path or .position.old_path) then
+              "**Location:** `" +
+              (.position.new_path // .position.old_path) +
+              (if .position.new_line then
+                ":" + (.position.new_line | tostring)
+              elif .position.old_line then
+                ":" + (.position.old_line | tostring)
+              else
+                ""
+              end) +
+              "`\n\n"
+            else
+              ""
+            end;
+          def parent:
+            if .discussion_id then
+              "**Discussion:** `" + .discussion_id + "`\n\n"
+            else
+              ""
+            end;
+
+          [
+            .[]
+            | .id as $discussion_id
+            | select((.notes // []) | any(.resolvable == true and .resolved == false))
+            | (.notes // [])[]
+            | select((.system // false) == false)
+            | select((.resolvable == false) or (.resolved == false))
+            | . + { discussion_id: $discussion_id }
+          ]
+          | sort_by(.created_at // "")
+          | if length == 0 then
+              "No unresolved review feedback found."
+            else
+              "# Review Feedback\n\n" +
+              (map(
+                "## Comment by " + author +
+                "\n\n**Created:** " + created + "\n\n" +
+                location + parent + body
+              ) | join("\n\n---\n\n"))
+            end
+        '
+    )" || fail "Failed to format feedback"
+
+    if [ "${raw}" -eq 0 ] && [ -t 1 ] && command -v glow >/dev/null 2>&1; then
+        printf '%s\n' "${feedback_markdown}" | glow -
+    else
+        printf '%s\n' "${feedback_markdown}"
+    fi
+}
+
 NL=$'\n'
 all=0
 create=0
 branch=""
 cd_project=1
 copy_message=0
+feedback=0
 issue=0
+raw=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -h|--help)
@@ -92,6 +175,12 @@ while [ "$#" -gt 0 ]; do
         -m|--copy-message)
             copy_message=1
             ;;
+        --feedback)
+            feedback=1
+            ;;
+        -r|--raw)
+            raw=1
+            ;;
         -i|--issue)
             issue=1
             ;;
@@ -105,8 +194,12 @@ done
 
 [ "${all}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-A|--all can not be combined with -c|--create" && usage
 [ "${copy_message}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-m|--copy-message can not be combined with -c|--create" && usage
+[ "${feedback}" -eq 1 ] && [ "${create}" -eq 1 ] && error "--feedback can not be combined with -c|--create" && usage
 [ "${issue}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-i|--issue can not be combined with -c|--create" && usage
 [ "${issue}" -eq 1 ] && [ "${copy_message}" -eq 1 ] && error "-i|--issue can not be combined with -m|--copy-message" && usage
+[ "${issue}" -eq 1 ] && [ "${feedback}" -eq 1 ] && error "-i|--issue can not be combined with --feedback" && usage
+[ "${copy_message}" -eq 1 ] && [ "${feedback}" -eq 1 ] && error "-m|--copy-message can not be combined with --feedback" && usage
+[ "${raw}" -eq 1 ] && [ "${feedback}" -eq 0 ] && error "-r|--raw requires --feedback" && usage
 
 if [ -z "${project}" ]; then
     git_dir="$(git rev-parse --show-toplevel 2>/dev/null)"
@@ -192,7 +285,9 @@ if [ "${create}" -eq 0 ]; then
         glab mr list --order "updated_at" "${glab_mr_list_args[@]}"
         echo
         mr=$(prompt-input "Choose MR:")
-        if [ "${copy_message}" -eq 1 ]; then
+        if [ "${feedback}" -eq 1 ]; then
+            show_feedback "${mr}" "${raw}"
+        elif [ "${copy_message}" -eq 1 ]; then
             copy_message "${mr}"
         else
             glab mr show "${mr}"
