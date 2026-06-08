@@ -245,10 +245,10 @@ else
     fi
 fi
 
-echo
-echo "URL:    ${url}"
-echo "Branch: ${branch}"
-echo
+echo 1>&2
+echo "URL:    ${url}" 1>&2
+echo "Branch: ${branch}" 1>&2
+echo 1>&2
 
 if [ "${create}" -eq 0 ]; then
     glab_mr_list_args=()
@@ -294,8 +294,8 @@ if [ "${create}" -eq 0 ]; then
     else
         glab_mr_list_args+=("-P")
         glab_mr_list_args+=("100")
-        glab mr list --order "updated_at" "${glab_mr_list_args[@]}"
-        echo
+        glab mr list --order "updated_at" "${glab_mr_list_args[@]}" 1>&2
+        echo 1>&2
         mr=$(prompt-input "Choose MR:")
         if [ "${feedback}" -eq 1 ]; then
             show_feedback "${mr}" "${raw}"
