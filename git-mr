@@ -8,7 +8,7 @@ Options:
   -c, --create        Create a new merge request
   -m, --copy-message  Copy a channel message for the selected merge request
   -i, --issue         Create an issue from the selected merge request
-      --feedback      Print unresolved review feedback for the selected merge request
+      --feedback      Print comments and review feedback for the selected merge request
   -r, --raw           With --feedback, print Markdown without terminal rendering
   -b, --branch        Filter merge requests by branch
   -A, --all           Include all merge request states
@@ -116,25 +116,37 @@ show_feedback() {
             else
               ""
             end;
+          def resolved:
+            if (.resolvable // false) then
+              "**Resolved:** " +
+              (if (.resolved // false) then "yes" else "no" end) +
+              "\n\n"
+            else
+              ""
+            end;
+          def heading:
+            if .position and (.position.new_path or .position.old_path) then
+              "## Review Comment by " + author
+            else
+              "## Comment by " + author
+            end;
 
           [
             .[]
             | .id as $discussion_id
-            | select((.notes // []) | any(.resolvable == true and .resolved == false))
             | (.notes // [])[]
             | select((.system // false) == false)
-            | select((.resolvable == false) or (.resolved == false))
             | . + { discussion_id: $discussion_id }
           ]
           | sort_by(.created_at // "")
           | if length == 0 then
-              "No unresolved review feedback found."
+              "No merge request comments found."
             else
-              "# Review Feedback\n\n" +
+              "# Merge Request Comments\n\n" +
               (map(
-                "## Comment by " + author +
+                heading +
                 "\n\n**Created:** " + created + "\n\n" +
-                location + parent + body
+                location + parent + resolved + body
               ) | join("\n\n---\n\n"))
             end
         '
