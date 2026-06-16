@@ -3,7 +3,22 @@
 APP="$(basename "${0}")"
 
 usage() {
-    echo"usage: ${APP} [-h|--help] [-p|--print] [<path ...>] [-s|--stage <path>] [-u|--unstage <path>] [-d|--delete <path>] [-r|--reset <path>] [-i|--ignore <path>] [-q|--query <query>]" 1>&2
+    cat <<EOF 1>&2
+usage: ${APP} [-h|--help] [-p|--print] [-q|--query <query>] [<path ...>]
+       ${APP} [-s|--stage <path>] [-u|--unstage <path>] [-d|--delete <path>] [-r|--reset <path>] [-i|--ignore <path>]
+
+Interactively stage, unstage, delete, reset, or ignore git changes.
+
+Options:
+  -p, --print             Print the change list instead of opening the picker
+  -q, --query <query>     Start the picker with a search query
+  -s, --stage <path>      Stage one path
+  -u, --unstage <path>    Unstage one path
+  -d, --delete <path>     Delete one path
+  -r, --reset <path>      Reset one path
+  -i, --ignore <path>     Ignore one path
+  -h, --help              Show this help message
+EOF
     exit 1
 }
 
@@ -23,30 +38,6 @@ NC='\e[0m'
 
 HEADER="KEY\tTYPE\tPATH"
 KEYS="alt-+,alt--,alt-d,alt-r,alt-i,ctrl-d,ctrl-e,esc,ctrl-c,enter,del,insert,+,-"
- 
-GIT_DIR="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
-
-RM_CMD="$(command -v trash &>/dev/null && echo 'trash' || echo 'rm')"
-
-UNTRACKED_LIST_CMD='git -C '"${GIT_DIR}"' ls-files --others --exclude-standard -z'
-UNTRACKED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --no-index /dev/null -- '
-
-UNSTAGED_LIST_CMD='git -C '"${GIT_DIR}"' diff --name-only -z'
-UNSTAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --'
-
-STAGED_LIST_CMD='git --no-pager -C '"${GIT_DIR}"' diff --cached --name-only -z'
-STAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --cached --'
-
-STAGE_CMD='git -C '"${GIT_DIR}"' add --'
-UNSTAGE_CMD='git -C '"${GIT_DIR}"' restore --staged --'
-RESET_CMD='git -C '"${GIT_DIR}"' restore --'
-IGNORE_CMD='git-ignore'
-
-PREVIEW_COMMAND='case {2} in'
-PREVIEW_COMMAND+=' untracked) '"${UNTRACKED_DIFF_CMD}"' {3} ;;'
-PREVIEW_COMMAND+=' unstaged) '"${UNSTAGED_DIFF_CMD}"' {3} ;;'
-PREVIEW_COMMAND+=' staged) '"${STAGED_DIFF_CMD}"' {3} ;;'
-PREVIEW_COMMAND+='esac'
 
 print_diff() {
     local current_state="${1}"; shift
@@ -136,8 +127,6 @@ key_result=""
 query=""
 id=$$
 
-[ -z "${GIT_DIR}" ] && fail "Not a git repo?"
-
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
         -h|--help)
@@ -196,7 +185,11 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --)
             shift
+            paths+=("${@}")
             break
+            ;;
+        -*)
+            fail "Unknown option: ${1}"
             ;;
         *)
             paths+=("${1}")
@@ -204,6 +197,30 @@ while [ "${#}" -gt 0 ]; do
     esac
     shift
 done
+
+GIT_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not a git repo?"
+
+RM_CMD="$(command -v trash &>/dev/null && echo 'trash' || echo 'rm')"
+
+UNTRACKED_LIST_CMD='git -C '"${GIT_DIR}"' ls-files --others --exclude-standard -z'
+UNTRACKED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --no-index /dev/null -- '
+
+UNSTAGED_LIST_CMD='git -C '"${GIT_DIR}"' diff --name-only -z'
+UNSTAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --'
+
+STAGED_LIST_CMD='git --no-pager -C '"${GIT_DIR}"' diff --cached --name-only -z'
+STAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --cached --'
+
+STAGE_CMD='git -C '"${GIT_DIR}"' add --'
+UNSTAGE_CMD='git -C '"${GIT_DIR}"' restore --staged --'
+RESET_CMD='git -C '"${GIT_DIR}"' restore --'
+IGNORE_CMD='git-ignore'
+
+PREVIEW_COMMAND='case {2} in'
+PREVIEW_COMMAND+=' untracked) '"${UNTRACKED_DIFF_CMD}"' {3} ;;'
+PREVIEW_COMMAND+=' unstaged) '"${UNSTAGED_DIFF_CMD}"' {3} ;;'
+PREVIEW_COMMAND+=' staged) '"${STAGED_DIFF_CMD}"' {3} ;;'
+PREVIEW_COMMAND+='esac'
 
 POST_COMMAND_FILE="/tmp/${APP}-${id}.post_command"
 PREVIOUS_UPDATE_FILE="/tmp/${APP}-${id}.previous_update"

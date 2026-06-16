@@ -108,6 +108,8 @@ elif [ ${include_branch} -eq 1 ]; then
     host_name=$(echo "${git_url}" | sed -E 's|^[a-z]+://||; s|/.*$||')
     repo_path=$(echo "${git_url}" | sed -E 's|^[a-z]+://[^/]+/||')
     current_branch=$(git branch --show-current 2>/dev/null)
+    default_branch=$(git-default 2>/dev/null)
+    [ -n "${current_branch}" ] && [[ "${current_branch}" == "${default_branch}" ]] && current_branch=""
 
     if [ -n "${current_branch}" ]; then
         if [[ "${host_name}" == *github* ]]; then
