@@ -1,13 +1,225 @@
 #!/bin/bash
 
-if [ "$#" -ne 1 ]; then
-	echo "Usage: $(basename $0) <branch-name>"
+APP_NAME="$(basename "${0}")"
+
+usage() {
+	cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [BRANCH_NAME]
+
+Create, delete, or reset a Git branch.
+
+Options:
+  --delete              Delete BRANCH_NAME, or infer the current branch if omitted
+                        Also delete its upstream remote branch if defined
+                        If deleting the current branch, check out the default branch first
+  --reset               Reset hard to the current branch upstream, or BRANCH_NAME upstream
+  -y, --yes             Run without prompting
+  -h, --help            Show this help message and exit
+EOF
 	exit 1
+}
+
+error() {
+	echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+	echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+	error "${1}"
+	exit 1
+}
+
+abort() {
+	echo "Abort." 1>&2
+	exit 1
+}
+
+confirm() {
+	printf '%s [y/N] ' "${1}" 1>&2
+	read -r response
+	echo 1>&2
+
+	case "${response}" in
+		y|Y|yes|YES)
+			return 0
+			;;
+		*)
+			abort
+			;;
+	esac
+}
+
+prompt_yes_no() {
+	printf '%s [y/N] ' "${1}" 1>&2
+	read -r response
+	echo 1>&2
+
+	case "${response}" in
+		y|Y|yes|YES)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+get_upstream_branch() {
+	if [ -n "${branch_name}" ]; then
+		git rev-parse --abbrev-ref --symbolic-full-name "${branch_name}@{upstream}" 2>/dev/null
+	else
+		git rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>/dev/null
+	fi
+}
+
+delete_remote_branch() {
+	remote_branch="${1}"
+	remote_name="${remote_branch%%/*}"
+	remote_branch_name="${remote_branch#*/}"
+
+	if [ -z "${remote_name}" ] || [ -z "${remote_branch_name}" ] || [ "${remote_branch}" = "${remote_branch_name}" ]; then
+		fail "Upstream branch is not a remote branch: ${remote_branch}"
+	fi
+
+	git push "${remote_name}" --delete "${remote_branch_name}"
+}
+
+is_remote_upstream() {
+	remote_branch="${1}"
+	remote_name="${remote_branch%%/*}"
+	remote_branch_name="${remote_branch#*/}"
+
+	if [ -z "${remote_name}" ] || [ -z "${remote_branch_name}" ] || [ "${remote_branch}" = "${remote_branch_name}" ]; then
+		return 1
+	fi
+
+	git remote get-url "${remote_name}" >/dev/null 2>&1
+}
+
+checkout_default_branch() {
+	default_branch="$(git-default)" || return "${?}"
+	if [ -z "${default_branch}" ]; then
+		fail "No default branch found"
+	fi
+
+	git checkout "${default_branch}"
+}
+
+branch_name=""
+assume_yes=0
+delete_mode=0
+reset_mode=0
+
+while [ "${#}" -gt 0 ]; do
+	case "${1}" in
+		-h|--help)
+			usage
+			;;
+		--delete)
+			delete_mode=1
+			;;
+		--reset)
+			reset_mode=1
+			;;
+		-y|--yes)
+			assume_yes=1
+			;;
+		-*)
+			error "Unknown option: ${1}"
+			usage
+			;;
+		*)
+			if [ -n "${branch_name}" ]; then
+				error "Unexpected argument: ${1}"
+				usage
+			fi
+			branch_name="${1}"
+			;;
+	esac
+	shift
+done
+
+if [ "${delete_mode}" -eq 1 ] && [ "${reset_mode}" -eq 1 ]; then
+	error "Cannot use --delete and --reset together"
+	usage
 fi
 
-echo
-echo -n "Create branch \"${1}\"?"
-read
-echo
+if [ "${delete_mode}" -eq 0 ] && [ "${reset_mode}" -eq 0 ] && [ -z "${branch_name}" ]; then
+	usage
+fi
 
-git checkout -b $1
+if [ "${delete_mode}" -eq 1 ] && [ -z "${branch_name}" ]; then
+	branch_name="$(git branch --show-current 2>/dev/null)"
+	if [ -z "${branch_name}" ]; then
+		fail "No current branch found"
+	fi
+fi
+
+if [ "${reset_mode}" -eq 1 ]; then
+	remote_branch="$(get_upstream_branch)"
+	if [ -z "${remote_branch}" ]; then
+		if [ -n "${branch_name}" ]; then
+			fail "No upstream branch found for branch: ${branch_name}"
+		fi
+		fail "No upstream branch found for the current branch"
+	fi
+
+	if [ "${assume_yes}" -eq 0 ]; then
+		confirm "Reset hard to \"${remote_branch}\"?"
+	fi
+
+	git reset --hard "${remote_branch}"
+	exit "${?}"
+fi
+
+if [ "${delete_mode}" -eq 1 ]; then
+	if ! git show-ref --verify --quiet "refs/heads/${branch_name}"; then
+		fail "No local branch found: ${branch_name}"
+	fi
+
+	current_branch="$(git branch --show-current)"
+	delete_current_branch=0
+	if [ "${branch_name}" = "${current_branch}" ]; then
+		delete_current_branch=1
+	fi
+
+	upstream_branch="$(get_upstream_branch)"
+
+	delete_local=0
+	delete_remote=0
+	if [ "${assume_yes}" -eq 1 ]; then
+		delete_local=1
+		if [ -n "${upstream_branch}" ] && is_remote_upstream "${upstream_branch}"; then
+			delete_remote=1
+		fi
+	else
+		if prompt_yes_no "Delete local branch \"${branch_name}\"?"; then
+			delete_local=1
+		fi
+		if [ -n "${upstream_branch}" ] && is_remote_upstream "${upstream_branch}" && prompt_yes_no "Delete remote branch \"${upstream_branch}\"?"; then
+			delete_remote=1
+		fi
+	fi
+
+	if [ "${delete_local}" -eq 1 ]; then
+		if [ "${delete_current_branch}" -eq 1 ]; then
+			checkout_default_branch || exit "${?}"
+		fi
+		git branch -D "${branch_name}" || exit "${?}"
+	fi
+
+	if [ "${delete_remote}" -eq 1 ]; then
+		delete_remote_branch "${upstream_branch}"
+	fi
+
+	exit "${?}"
+fi
+
+if [ "${assume_yes}" -eq 0 ]; then
+	confirm "Create branch \"${branch_name}\"?"
+fi
+
+git checkout -b "${branch_name}"

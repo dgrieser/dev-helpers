@@ -113,12 +113,12 @@ case "${mode}" in
 esac
 
 
-result="$(echo "${HEADER}${NL}$(git log --color=always --pretty=format:"%h  %C(6)%cI%Creset  %C(33)%cl%Creset  %s" "${paths[@]}")" | k-format)"
+result="$(echo "${HEADER}${NL}$(git log --color=always --pretty=format:"%h  %p  %C(6)%cI%Creset  %C(33)%cl%Creset  %s" "${paths[@]}")" | k-format)"
 
 case "${mode}" in
     list)
         echo "${result}" | fzf-with-header --key-command "${APP} --key" \
-                                           --columns 2,3,4,5 \
+                                           --columns 3,4,5,6 \
                                            --command "${APP} --print ${paths[@]}" \
                                            "${query}" \
                                            --preview='git show --color=always {1}' \
