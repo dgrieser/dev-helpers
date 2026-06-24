@@ -125,4 +125,4 @@ fi
 
 [ ${print_only} -eq 1 ] && echo "${open_target}" && exit 0
 
-gio open "${open_target}"
+gio open "${open_target}" &>/dev/null
