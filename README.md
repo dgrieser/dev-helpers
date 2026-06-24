@@ -129,9 +129,12 @@ git-package <check|list|delete> [ID] [-n <name>] [-v <version>] [-o txt|json]
 ```
 
 ### git-pipe
-Inspect GitLab pipelines for current or named project.
+Show CI pipeline status for a ref, or search pipelines by trigger variable, log content, or status.
 ```bash
-git-pipe [<project>]
+git-pipe status [-r <project>] [--ref <ref>]
+git-pipe search [-r <project>] [--ref <ref>] [--var <NAME[=VALUE]>] [--grep <pattern>] \
+                [--source <source>] [-s <status>|--failed|--succeeded|--aborted|...] \
+                [-n <limit>] [-a] [-o txt|json]
 ```
 
 ### git-pr

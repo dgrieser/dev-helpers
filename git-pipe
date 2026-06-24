@@ -1,43 +1,318 @@
 #!/bin/bash
 
+APP_NAME="$(basename "${0}")"
+
+PER_PAGE_DEFAULT=20
+
 usage() {
-    echo "Usage: $(basename $0) [<project>]" 1>&2
+    cat <<EOF 1>&2
+usage: ${APP_NAME} COMMAND [OPTIONS]
+
+Show and search GitLab CI pipeline information for a repository.
+
+COMMAND
+    status                  show CI pipeline status for a ref
+    search                  list pipelines matching variable, log, or status filters
+
+Options:
+    -h|--help               show this help
+    -r|--repo <PROJECT>     project to operate on (default: current directory)
+        --ref <REF>         ref to filter by (status: prompts if omitted)
+
+search options:
+        --var <NAME[=VALUE]>  pipeline has variable NAME (optionally equal to VALUE);
+                              repeatable, all must match
+        --grep <PATTERN>      keep pipelines whose job logs match PATTERN (extended regex, case-insensitive)
+        --source <SOURCE>     filter by pipeline source (push, trigger, schedule, web, api, ...)
+    -s|--status <STATUS>      filter by raw status (repeatable)
+        --failed              shorthand for --status failed
+        --succeeded           shorthand for --status success
+        --aborted             shorthand for --status canceled
+        --running             shorthand for --status running
+        --pending             shorthand for --status pending
+        --manual              shorthand for --status manual
+        --skipped             shorthand for --status skipped
+    -n|--limit <N>            results per page (1-100, default ${PER_PAGE_DEFAULT})
+    -a|--all                  fetch all pages (overrides --limit window)
+    -o|--output <txt|json>    output format: txt or json (default txt)
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
     exit 1
 }
 
 abort() {
     echo "Abort." 1>&2
-    exit 1
+    exit 130
 }
 
-while [ "$#" -gt 0 ]; do
-    case "$1" in
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "missing required command: ${1}"
+}
+
+urlenc() {
+    jq -rn --arg v "${1}" '$v|@uri'
+}
+
+build_qs() {
+    [ "${#}" -eq 0 ] && return 0
+    local IFS='&'
+    printf '?%s' "$*"
+}
+
+project_id() {
+    if [ -z "${PROJECT_ID:-}" ]; then
+        PROJECT_ID="$(glab repo view -F json | jq -r '.id')"
+        [ -z "${PROJECT_ID}" ] && fail "failed to determine GitLab project id"
+        [ "${PROJECT_ID}" = "null" ] && fail "failed to determine GitLab project id"
+    fi
+    printf '%s\n' "${PROJECT_ID}"
+}
+
+cmd_status() {
+    local current tags branches
+
+    current="$(git rev-parse --abbrev-ref HEAD)"
+
+    if [ -z "${ref}" ]; then
+        need_cmd prompt-input
+        tags="$(git ls-remote --tags -q | sort -k2 -V | tail -n 5 | sed -E 's|^.+/tags/||')"
+        branches="$(git ls-remote --heads -q | sed -E 's|^.+/heads/||')"
+        echo "${branches}"
+        echo "${tags}"
+        echo
+        ref="$(prompt-input "Choose ref" --default "${current}")"
+    fi
+
+    glab ci status --branch "${ref}"
+}
+
+list_pipelines_json() {
+    local base="projects/$(project_id)/pipelines"
+    local common=("per_page=${per_page}" "order_by=id" "sort=desc")
+    [ -n "${ref}" ] && common+=("ref=$(urlenc "${ref}")")
+    [ -n "${source}" ] && common+=("source=$(urlenc "${source}")")
+
+    local page_flag=()
+    [ "${paginate}" -eq 1 ] && page_flag+=("--paginate")
+
+    local out="[]" part qs s
+    TRUNCATED=0
+    if [ "${#statuses[@]}" -eq 0 ]; then
+        qs="$(build_qs "${common[@]}")"
+        out="$(glab api "${page_flag[@]}" "${base}${qs}")" || return 1
+        [ "${paginate}" -eq 0 ] && [ "$(jq 'length' <<< "${out}")" -ge "${per_page}" ] && TRUNCATED=1
+    else
+        for s in "${statuses[@]}"; do
+            qs="$(build_qs "${common[@]}" "status=${s}")"
+            part="$(glab api "${page_flag[@]}" "${base}${qs}")" || return 1
+            [ "${paginate}" -eq 0 ] && [ "$(jq 'length' <<< "${part}")" -ge "${per_page}" ] && TRUNCATED=1
+            out="$(jq -s 'add' <(echo "${out}") <(echo "${part}"))"
+        done
+    fi
+    jq 'unique_by(.id) | sort_by(.id) | reverse' <<< "${out}"
+}
+
+match_vars() {
+    local pid="${1}"
+    local vars_json spec key val
+
+    vars_json="$(glab api "projects/$(project_id)/pipelines/${pid}/variables" 2>/dev/null)"
+    [ -z "${vars_json}" ] && vars_json="[]"
+
+    for spec in "${var_specs[@]}"; do
+        if [[ "${spec}" == *"="* ]]; then
+            key="${spec%%=*}"; val="${spec#*=}"
+            jq -e --arg k "${key}" --arg v "${val}" 'any(.[]; .key==$k and .value==$v)' <<< "${vars_json}" >/dev/null || return 1
+        else
+            jq -e --arg k "${spec}" 'any(.[]; .key==$k)' <<< "${vars_json}" >/dev/null || return 1
+        fi
+    done
+    return 0
+}
+
+match_grep() {
+    local pid="${1}"
+    local jobs_json job_id trace
+
+    jobs_json="$(glab api "projects/$(project_id)/pipelines/${pid}/jobs" --paginate 2>/dev/null)"
+    [ -z "${jobs_json}" ] && return 1
+
+    while IFS= read -r job_id; do
+        [ -z "${job_id}" ] && continue
+        trace="$(glab api "projects/$(project_id)/jobs/${job_id}/trace" 2>/dev/null)"
+        grep -qiE -- "${grep_pattern}" <<< "${trace}" && return 0
+    done < <(jq -r '.[].id' <<< "${jobs_json}")
+    return 1
+}
+
+print_pipelines() {
+    local json="${1}"
+
+    if [ "${output}" = "json" ]; then
+        echo "${json}"
+        return 0
+    fi
+    jq -r '
+        (["ID", "STATUS", "SOURCE", "REF", "CREATED", "URL"] | @tsv),
+        (.[] | [(.id | tostring), .status, .source, .ref, .created_at, .web_url] | @tsv)
+    ' <<< "${json}" | column -t -s "$(printf '\t')"
+}
+
+cmd_search() {
+    need_cmd jq
+    need_cmd column
+
+    local pipelines pid
+    local matched_ids=()
+
+    pipelines="$(list_pipelines_json)" || fail "failed to list pipelines"
+
+    [ "${TRUNCATED}" -eq 1 ] \
+        && warning "Hit the ${per_page}-result page limit; more pipelines may match. Use -a/--all or raise -n/--limit."
+
+    [ -n "${grep_pattern}" ] && echo "Searching job logs (this may take a while)..." 1>&2
+
+    while IFS= read -r pid; do
+        [ -z "${pid}" ] && continue
+        [ "${#var_specs[@]}" -gt 0 ] && { match_vars "${pid}" || continue; }
+        [ -n "${grep_pattern}" ] && { match_grep "${pid}" || continue; }
+        matched_ids+=("${pid}")
+    done < <(jq -r '.[].id' <<< "${pipelines}")
+
+    local ids_json
+    ids_json="$(printf '%s\n' "${matched_ids[@]}" | jq -R 'select(length>0) | tonumber' | jq -s '.')"
+
+    print_pipelines "$(jq --argjson ids "${ids_json}" '[ .[] | select(.id as $i | $ids | index($i)) ]' <<< "${pipelines}")"
+}
+
+need_cmd git
+need_cmd glab
+
+action=""
+repo=""
+ref=""
+source=""
+grep_pattern=""
+output="txt"
+per_page="${PER_PAGE_DEFAULT}"
+paginate=0
+statuses=()
+var_specs=()
+TRUNCATED=0
+
+add_status() {
+    statuses+=("${1}")
+}
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
         -h|--help)
             usage
             ;;
+        -r|--repo)
+            shift
+            [ -z "${1:-}" ] && error "Missing repo argument" && usage
+            repo="${1}"
+            ;;
+        --ref)
+            shift
+            [ -z "${1:-}" ] && error "Missing ref argument" && usage
+            ref="${1}"
+            ;;
+        --var)
+            shift
+            [ -z "${1:-}" ] && error "Missing var argument" && usage
+            var_specs+=("${1}")
+            ;;
+        --grep)
+            shift
+            [ -z "${1:-}" ] && error "Missing grep argument" && usage
+            grep_pattern="${1}"
+            ;;
+        --source)
+            shift
+            [ -z "${1:-}" ] && error "Missing source argument" && usage
+            source="${1}"
+            ;;
+        -s|--status)
+            shift
+            [ -z "${1:-}" ] && error "Missing status argument" && usage
+            add_status "${1}"
+            ;;
+        --failed)    add_status "failed" ;;
+        --succeeded) add_status "success" ;;
+        --aborted)   add_status "canceled" ;;
+        --running)   add_status "running" ;;
+        --pending)   add_status "pending" ;;
+        --manual)    add_status "manual" ;;
+        --skipped)   add_status "skipped" ;;
+        -n|--limit)
+            shift
+            [ -z "${1:-}" ] && error "Missing limit argument" && usage
+            ! [[ "${1}" =~ ^[0-9]+$ ]] && error "Invalid limit: ${1}" && usage
+            { [ "${1}" -lt 1 ] || [ "${1}" -gt 100 ]; } && error "Limit must be between 1 and 100" && usage
+            per_page="${1}"
+            ;;
+        -a|--all)
+            paginate=1
+            ;;
+        -o|--output)
+            shift
+            [ -z "${1:-}" ] && error "Missing output argument" && usage
+            [ "${1}" != "txt" ] && [ "${1}" != "json" ] && error "Invalid output argument: ${1}" && usage
+            output="${1}"
+            ;;
+        status|search)
+            [ -n "${action}" ] && error "Unknown command: ${1}" && usage
+            action="${1}"
+            ;;
         *)
-            [ -z "${project}" ] || usage
-            project="${1}"
+            error "Unknown argument: ${1}"
+            usage
             ;;
     esac
     shift
 done
 
+[ -z "${action}" ] && error "Missing command" && usage
+
+if [ "${action}" = "status" ]; then
+    { [ "${#statuses[@]}" -gt 0 ] || [ "${#var_specs[@]}" -gt 0 ] || [ -n "${grep_pattern}" ] || [ -n "${source}" ] \
+        || [ "${output}" != "txt" ] || [ "${paginate}" -eq 1 ] || [ "${per_page}" != "${PER_PAGE_DEFAULT}" ]; } \
+        && error "Those options are only valid for 'search'" && usage
+fi
+
 cded=0
-if [ -n "$project" ]; then
-    cd "$(dev-find-project "${project}")" || abort
+if [ -n "${repo}" ]; then
+    need_cmd dev-find-project
+    cd "$(dev-find-project "${repo}")" || abort
     cded=1
 fi
 
-current="$(git rev-parse --abbrev-ref HEAD)"
-tags="$(git ls-remote --tags -q | sort -k2 -V | tail -n 5 | sed -E 's|^.+/tags/||')"
-branches="$(git ls-remote --heads -q | sed -E 's|^.+/heads/||')"
-
-echo "${branches}"
-echo "${tags}"
-
-echo
-ref=$(prompt-input "Choose ref" --default "${current}")
-glab ci status --branch "${ref}"
+case "${action}" in
+    status)
+        cmd_status
+        ;;
+    search)
+        cmd_search
+        ;;
+    *)
+        usage
+        ;;
+esac
+exit_code=$?
 
 [ "${cded}" -eq 1 ] && cd - &> /dev/null
+exit "${exit_code}"
