@@ -1,0 +1,237 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} COMMAND [ID] [OPTIONS]
+
+List, inspect, filter, and delete GitLab container registry tags for the current repository.
+
+COMMAND
+    check                   check if the repository has container images
+    list                    list container image tags
+    delete                  delete container image tags
+
+ID                          container repository id
+
+Options:
+    -h|--help               show this help
+    -n|--name <NAME>        filter repositories by name (substring match)
+    -t|--tag <TAG>          filter tags by name
+    -o|--output <txt|json>  output format: txt or json
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 130
+}
+
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "missing required command: ${1}"
+}
+
+project_id() {
+    if [ -z "${PROJECT_ID:-}" ]; then
+        PROJECT_ID="$(glab repo view -F json | jq -r '.id')"
+        [ -z "${PROJECT_ID}" ] && fail "failed to determine GitLab project id"
+        [ "${PROJECT_ID}" = "null" ] && fail "failed to determine GitLab project id"
+    fi
+    printf '%s\n' "${PROJECT_ID}"
+}
+
+list_repositories_json() {
+    glab api "projects/$(project_id)/registry/repositories" --paginate && return 0 || return 1
+}
+
+list_repository_tags_json() {
+    local repository_id="${1}"
+    glab api "projects/$(project_id)/registry/repositories/${repository_id}/tags" --paginate 2>/dev/null
+}
+
+filter_tags_json() {
+    local id="${1}"; shift
+    local name="${1}"; shift
+    local tag="${1}"; shift
+    local repos=""
+    local out="[]"
+    local repository_id=""
+    local repository=""
+    local tags=""
+
+    repos="$(list_repositories_json)" || return 1
+    repos="$(jq \
+        --arg id "${id}" \
+        --arg name "${name}" \
+        '
+        [
+            .[]
+            | select(($id == "" or (.id | tostring) == $id) and ($name == "" or (.path | contains($name)) or (.name | contains($name))))
+        ]
+        ' <<< "${repos}")"
+
+    while IFS=$'\t' read -r repository_id repository; do
+        [ -z "${repository_id}" ] && continue
+        tags="$(list_repository_tags_json "${repository_id}")"
+        [ -z "${tags}" ] && continue
+        out="$(jq \
+            --argjson acc "${out}" \
+            --argjson repository_id "${repository_id}" \
+            --arg repository "${repository}" \
+            --arg tag "${tag}" \
+            '
+            $acc + [
+                .[]
+                | select($tag == "" or .name == $tag)
+                | {repository_id: $repository_id, repository: $repository, tag: .name}
+            ]
+            ' <<< "${tags}")"
+    done < <(jq -r '.[] | [(.id | tostring), .path] | @tsv' <<< "${repos}")
+
+    echo "${out}"
+}
+
+print_tags_table() {
+    jq -r '
+        (["REPOSITORY_ID", "REPOSITORY", "TAG"] | @tsv),
+        (.[] | [(.repository_id | tostring), .repository, .tag] | @tsv)
+    ' | column -t -s "$(printf '\t')"
+}
+
+show_selection() {
+    local id="${1}"; shift
+    local name="${1}"; shift
+    local tag="${1}"; shift
+    local output="${1}"; shift
+    local result=""
+
+    result="$(filter_tags_json "${id}" "${name}" "${tag}")"
+    [ "${output}" = "txt" ] && result="$(print_tags_table <<< "${result}")"
+    echo "${result}"
+}
+
+delete_selection() {
+    local id="${1}"; shift
+    local name="${1}"; shift
+    local tag="${1}"; shift
+    local json=""
+    local rows=()
+    local row=""
+    local current_repository_id=""
+    local current_repository=""
+    local current_tag=""
+
+    json="$(filter_tags_json "${id}" "${name}" "${tag}")"
+    readarray -t rows < <(jq -r '.[] | [(.repository_id | tostring), .tag] | @tsv' <<< "${json}")
+    [ "${#rows[@]}" -eq 0 ] && fail "No matching container tags found"
+
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r current_repository_id current_tag <<< "${row}"
+        current_repository="$(jq -r ".[] | select(.repository_id == ${current_repository_id} and .tag == \"${current_tag}\") | .repository" <<< "${json}")"
+        echo 1>&2
+        warning "Deleting container tag ${current_repository}:${current_tag}"
+        prompt-yes-no "Are you sure?"; exit_code=$?
+        [ "${exit_code}" -eq 0 ] && glab api --method DELETE "projects/$(project_id)/registry/repositories/${current_repository_id}/tags/${current_tag}" && echo "Deleted container tag ${current_repository}:${current_tag}."
+        [ "${exit_code}" -eq 1 ] && echo "Skipping container tag."
+        [ "${exit_code}" -eq 130 ] && abort
+    done
+}
+
+need_cmd glab
+need_cmd jq
+need_cmd column
+
+action=""
+id=""
+name_arg=""
+tag_arg=""
+output="txt"
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -n|--name)
+            shift
+            [ -z "${1:-}" ] && error "Missing name argument" && usage
+            name_arg="${1}"
+            ;;
+        -t|--tag)
+            shift
+            [ -z "${1:-}" ] && error "Missing tag argument" && usage
+            tag_arg="${1}"
+            ;;
+        -o|--output)
+            shift
+            [ -z "${1:-}" ] && error "Missing output argument" && usage
+            [ "${1}" != "txt" ] && [ "${1}" != "json" ] && error "Invalid output argument: ${1}" && usage
+            output="${1}"
+            ;;
+        list|delete|check)
+            [ -n "${action}" ] && error "Unknown command: ${action}" && usage
+            action="${1}"
+            ;;
+        *)
+            if [ -z "${id}" ]; then
+                ! [[ "${1:-}" =~ ^[0-9]+$ ]] && error "Invalid container repository id: ${1}" && usage
+                id="${1}"
+            else
+                error "Unknown argument: ${1}"
+                usage
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -z "${action}" ] && action="get"
+
+if [ "${action}" == "delete" ] || [ "${action}" == "get" ]; then
+    # argument checks
+    [ -z "${id}" ] && [ -z "${name_arg}" ] && [ -z "${tag_arg}" ] && error "Either ID, --name, or --tag must be specified" && usage
+    [ -n "${id}" ] && { [ -n "${name_arg}" ] || [ -n "${tag_arg}" ]; } && error "Either ID or --name/--tag must be specified" && usage
+elif [ -n "${id}" ] || [ -n "${name_arg}" ] || [ -n "${tag_arg}" ]; then
+    error "Unexpected arguments for command ${action}" && usage
+fi
+
+case "${action}" in
+    check)
+        result="$(list_repositories_json 2>/dev/null)"; exit_code=$?
+        count="$(jq -r '. | length' <<< "${result}")"
+        if [ "${exit_code}" -eq 0 ]; then
+            [ "${count}" -gt 0 ] && echo "${count} container repositories found" && exit 0
+            fail "No container repositories found"
+        else
+            fail "Failed to list container repositories"
+        fi
+        ;;
+    list)
+        show_selection "${id}" "${name_arg}" "${tag_arg}" "${output}"
+        ;;
+    delete)
+        delete_selection "${id}" "${name_arg}" "${tag_arg}"
+        ;;
+    get)
+        show_selection "${id}" "${name_arg}" "${tag_arg}" "${output}"
+        ;;
+    *)
+        usage
+        ;;
+esac
+exit 0

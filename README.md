@@ -62,6 +62,12 @@ Clone a repo; reads URL from arg, clipboard, or prompt.
 git-clone <git url>
 ```
 
+### git-container
+List, inspect, filter, delete GitLab container registry tags for current repo.
+```bash
+git-container <check|list|delete> [ID] [-n <name>] [-t <tag>] [-o txt|json]
+```
+
 ### git-create
 Create a new GitLab repo under `$WORKSPACE` via `glab`.
 ```bash

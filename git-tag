@@ -111,6 +111,13 @@ if [ "${delete}" -eq 1 ]; then
         else
             echo -e "No matching packages found for \e[1m${tag}\e[0m"
         fi
+        echo; echo -e "Checking for matching containers for \e[1m${tag}\e[0m..."
+        if git-container check &>/dev/null; then
+            git-container delete --tag "${tag}"; exit_code=$?
+            [ "${exit_code}" -eq 130 ] && exit 130
+        else
+            echo -e "No matching containers found for \e[1m${tag}\e[0m"
+        fi
         echo
     fi
     echo -e "\e[1m${tag}\e[0m -> \e[1m✗\e[0m" && echo
