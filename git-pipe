@@ -111,12 +111,16 @@ list_pipelines_json() {
     TRUNCATED=0
     if [ "${#statuses[@]}" -eq 0 ]; then
         qs="$(build_qs "${common[@]}")"
-        out="$(glab api "${page_flag[@]}" "${base}${qs}")" || return 1
-        [ "${paginate}" -eq 0 ] && [ "$(jq 'length' <<< "${out}")" -ge "${per_page}" ] && TRUNCATED=1
+        part="$(glab api "${page_flag[@]}" "${base}${qs}")" || return 1
+        # --paginate emits one array per page; slurp them into a single array
+        part="$(jq -s 'add // []' <<< "${part}")"
+        [ "${paginate}" -eq 0 ] && [ "$(jq 'length' <<< "${part}")" -ge "${per_page}" ] && TRUNCATED=1
+        out="${part}"
     else
         for s in "${statuses[@]}"; do
             qs="$(build_qs "${common[@]}" "status=${s}")"
             part="$(glab api "${page_flag[@]}" "${base}${qs}")" || return 1
+            part="$(jq -s 'add // []' <<< "${part}")"
             [ "${paginate}" -eq 0 ] && [ "$(jq 'length' <<< "${part}")" -ge "${per_page}" ] && TRUNCATED=1
             out="$(jq -s 'add' <(echo "${out}") <(echo "${part}"))"
         done
