@@ -84,6 +84,21 @@ if [ -z "${tag}" ]; then
     [ -z "${tag}" ] && abort
 fi
 
+default_commit="HEAD"
+commit="${default_commit}"
+recreate=0
+if [ "${delete}" -eq 1 ] && [ "${create}" -eq 1 ]; then
+    recreate=1
+    tag_commit="$(git rev-list -n 1 "${tag}" 2>/dev/null)"
+    if [ -n "${tag_commit}" ]; then
+        echo && echo -e "Tag \e[1m${tag}\e[0m is based on commit \e[1m${tag_commit}\e[0m"
+    fi
+    if [ "${yes}" -eq 0 ]; then
+        commit="$(prompt --single-line --default "${default_commit}" --prompt "$(echo -e "\e[1mCommit to tag\e[0m:")")"
+        [ -z "${commit}" ] && commit="${default_commit}"
+    fi
+fi
+
 if [ "${delete}" -eq 1 ]; then
     if [ "${yes}" -eq 0 ]; then
         echo && warning "This will delete \e[1m${tag}\e[0m"
@@ -111,14 +126,16 @@ fi
 
 if [ "${create}" -eq 1 ]; then
     [ "${delete}" -eq 1 ] && echo
+    target="$(git branch --show-current)"
+    [ "${recreate}" -eq 1 ] && target="$(git rev-parse --short "${commit}" 2>/dev/null || echo "${commit}")"
     if [ "${yes}" -eq 0 ]; then
-        echo -e "This will tag \e[1m$(git branch --show-current)\e[0m -> \e[1m${tag}\e[0m"
+        echo -e "This will tag \e[1m${target}\e[0m -> \e[1m${tag}\e[0m"
         echo
-        prompt-continue-yes || abort 
+        prompt-continue-yes || abort
     fi
-    echo -e "\e[1m$(git branch --show-current)\e[0m -> \e[1m${tag}\e[0m" && echo
+    echo -e "\e[1m${target}\e[0m -> \e[1m${tag}\e[0m" && echo
     fq_tag="$(get_fq_tag "${tag}")"
-    git tag -f "${tag}" && git push origin "${fq_tag}"
+    git tag -f "${tag}" "${commit}" && git push origin "${fq_tag}"
     [ $? -ne 0 ] && abort
 
     url=$(git config --get remote.origin.url)
