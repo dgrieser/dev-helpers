@@ -39,6 +39,7 @@ NC='\e[0m'
 
 HEADER="KEY\tTYPE\tPATH"
 KEYS="alt-+,alt--,alt-d,alt-r,alt-i,ctrl-d,ctrl-e,esc,ctrl-c,enter,del,insert,+,-"
+KEY_DESCS="+:stage,-:unstage,alt-d:delete,alt-r:reset,alt-i:ignore,ctrl-d:diff,ctrl-e:edit,del:unstage,insert:stage"
 
 print_diff() {
     local current_state="${1}"; shift
@@ -388,6 +389,7 @@ case "${mode}" in
     list)
         rm -f "${POST_COMMAND_FILE}"
         echo "${result}" | fzf-with-header --key-command "${APP} --id "${id}" --key" \
+                                           --key-descriptions "${KEY_DESCS}" \
                                            --columns "${columns}" \
                                            --command "${APP} --id "${id}" --print ${paths[@]}" \
                                            "${query}" \

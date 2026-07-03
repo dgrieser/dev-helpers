@@ -16,8 +16,8 @@ Options:
                         May be repeated to include multiple paths.
   -v, --vim             Open each changed file in vimdiff instead of printing.
                         The working-tree file is editable, the other version
-                        is readonly. Quit vim (:qa) to open the next file,
-                        or exit with an error (:cq) to stop.
+                        is readonly. Quit vim (:q, :qa or ZZ) to open the
+                        next file, or exit with an error (:cq) to stop.
   -h, --help            Show this help message and exit
 EOF
     exit 1
@@ -53,8 +53,15 @@ print_worktree_diff() {
 open_vimdiff() {
     # ${1}: repo-relative path of the editable working-tree file
     # ${2}: readonly counterpart file
+    # WinClosed autocmd: closing either window (:q, ZZ, :qa) quits vim so the
+    #   loop advances without leaving a lone single-file window behind. :cq
+    #   still exits non-zero (abort) because it bypasses autocmds.
+    # redraw!: clear the stacked startup messages so vim does not show the
+    #   "Press ENTER or type command to continue" prompt before the diff.
     vim -d "${git_dir}/${1}" "${2}" \
-        -c 'wincmd l' -c 'setlocal readonly nomodifiable' -c 'wincmd h'
+        -c 'wincmd l' -c 'setlocal readonly nomodifiable' -c 'wincmd h' \
+        -c 'autocmd WinClosed * ++nested qall' \
+        -c 'redraw!'
 }
 
 vimdiff_files() {
