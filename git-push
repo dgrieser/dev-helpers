@@ -1,7 +1,7 @@
 #!/bin/bash
 
 usage() {
-    echo "usage: $(basename "${0}") [-p|--push-only] [<branch>]" 1>&2
+    echo "usage: $(basename "${0}") [-p|--push-only] [-F|--force-with-lease] [<branch>]" 1>&2
     exit 1
 }
 
@@ -23,11 +23,15 @@ fail() {
 
 BRANCH=""
 PUSH_ONLY=0
+PUSH_FORCE_WITH_LEASE=0
 
 while [ "$#" -gt 0 ]; do
     case "${1}" in
         -p|--push-only)
             PUSH_ONLY=1
+            ;;
+        -F|--force-with-lease)
+            PUSH_FORCE_WITH_LEASE=1
             ;;
         *)
             if [ -z "${BRANCH}" ]; then
@@ -41,6 +45,10 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
+if [ "${PUSH_ONLY}" -eq 1 ] && [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ]; then
+    fail "Cannot use -F with -p."
+fi
+
 git_dir="$(git rev-parse --show-toplevel)" || fail
 [ -z "${BRANCH}" ] && BRANCH=$(git -C "${git_dir}" branch --show-current)
 
@@ -53,6 +61,7 @@ fi
 
 message="Commit and push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_ONLY}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\"?"
+[ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\" (force with lease)?"
 echo -n "${message}"
 read
 echo
@@ -71,4 +80,8 @@ if [ "${PUSH_ONLY}" -eq 0 ]; then
     fi
 fi
 [ "${ok}" -ne 1 ] && abort
-git -C "${git_dir}" push -u origin "${BRANCH}"
+if [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ]; then
+    git -C "${git_dir}" push --force-with-lease origin "${BRANCH}"
+else
+    git -C "${git_dir}" push -u origin "${BRANCH}"
+fi

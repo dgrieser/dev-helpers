@@ -13,6 +13,7 @@ Options:
                         Also delete its upstream remote branch if defined
                         If deleting the current branch, check out the default branch first
   --reset               Reset hard to the current branch upstream, or BRANCH_NAME upstream
+  --backup              Backup the current branch into a new backup branch
   -y, --yes             Run without prompting
   -h, --help            Show this help message and exit
 EOF
@@ -112,6 +113,7 @@ branch_name=""
 assume_yes=0
 delete_mode=0
 reset_mode=0
+backup_mode=0
 
 while [ "${#}" -gt 0 ]; do
 	case "${1}" in
@@ -124,6 +126,9 @@ while [ "${#}" -gt 0 ]; do
 		--reset)
 			reset_mode=1
 			;;
+        --backup)
+            backup_mode=1
+            ;;
 		-y|--yes)
 			assume_yes=1
 			;;
@@ -147,7 +152,17 @@ if [ "${delete_mode}" -eq 1 ] && [ "${reset_mode}" -eq 1 ]; then
 	usage
 fi
 
-if [ "${delete_mode}" -eq 0 ] && [ "${reset_mode}" -eq 0 ] && [ -z "${branch_name}" ]; then
+if [ "${delete_mode}" -eq 1 ] && [ "${backup_mode}" -eq 1 ]; then
+    error "Cannot use --delete and --backup together"
+    usage
+fi
+
+if [ "${reset_mode}" -eq 1 ] && [ "${backup_mode}" -eq 1 ]; then
+    error "Cannot use --reset and --backup together"
+    usage
+fi
+
+if [ "${delete_mode}" -eq 0 ] && [ "${reset_mode}" -eq 0 ] && [ "${backup_mode}" -eq 0 ] && [ -z "${branch_name}" ]; then
 	usage
 fi
 
@@ -156,6 +171,19 @@ if [ "${delete_mode}" -eq 1 ] && [ -z "${branch_name}" ]; then
 	if [ -z "${branch_name}" ]; then
 		fail "No current branch found"
 	fi
+fi
+
+if [ "${backup_mode}" -eq 1 ] && [ -z "${branch_name}" ]; then
+    branch_name="$(git branch --show-current 2>/dev/null)"
+    if [ -z "${branch_name}" ]; then
+        fail "No current branch found"
+    fi
+fi
+
+if [ "${backup_mode}" -eq 1 ]; then
+    git branch "backup/${branch_name}" "${branch_name}"; exit_code="${?}"
+    [ "${exit_code}" -ne 0 ] && fail "Failed to create backup branch" || echo "Created backup branch: backup/${branch_name}"
+    exit "${exit_code}"
 fi
 
 if [ "${reset_mode}" -eq 1 ]; then

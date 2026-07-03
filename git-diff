@@ -12,6 +12,12 @@ When BRANCH is omitted, show the existing diff against HEAD plus untracked files
 When BRANCH is provided, show the diff from merge-base(BRANCH, HEAD) to HEAD.
 
 Options:
+  -p, --path PATH       Limit the diff to PATH (a file or subfolder).
+                        May be repeated to include multiple paths.
+  -v, --vim             Open each changed file in vimdiff instead of printing.
+                        The working-tree file is editable, the other version
+                        is readonly. Quit vim (:qa) to open the next file,
+                        or exit with an error (:cq) to stop.
   -h, --help            Show this help message and exit
 EOF
     exit 1
@@ -26,10 +32,15 @@ fail() {
     exit 1
 }
 
-print_worktree_diff() {
-    git -C "${git_dir}" --no-pager diff HEAD
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
 
-    readarray -t untracked < <(git -C "${git_dir}" ls-files --others --exclude-standard)
+print_worktree_diff() {
+    git -C "${git_dir}" --no-pager diff HEAD -- "${paths[@]}"
+
+    readarray -t untracked < <(git -C "${git_dir}" ls-files --others --exclude-standard -- "${paths[@]}")
     print_header=1
     for f in "${untracked[@]}"; do
         if [ -e "${git_dir}/${f}" ]; then
@@ -39,12 +50,56 @@ print_worktree_diff() {
     done
 }
 
+open_vimdiff() {
+    # ${1}: repo-relative path of the editable working-tree file
+    # ${2}: readonly counterpart file
+    vim -d "${git_dir}/${1}" "${2}" \
+        -c 'wincmd l' -c 'setlocal readonly nomodifiable' -c 'wincmd h'
+}
+
+vimdiff_files() {
+    # ${1}: ref providing the readonly side; remaining args: repo-relative files
+    local base_ref="${1}"
+    shift
+
+    if [ "${#}" -eq 0 ]; then
+        echo "No changed files." 1>&2
+        return
+    fi
+
+    # Not local: the EXIT trap runs after this function has returned.
+    tmp_root="$(mktemp -d)" || fail "Cannot create temp directory."
+    trap 'rm -rf "${tmp_root}"' EXIT
+
+    local f other
+    for f in "${@}"; do
+        other="${tmp_root}/${f}"
+        mkdir -p "$(dirname "${other}")"
+        # Files absent in base_ref (added or untracked) diff against an empty file.
+        git -C "${git_dir}" show "${base_ref}:${f}" > "${other}" 2>/dev/null || : > "${other}"
+        open_vimdiff "${f}" "${other}" || abort
+    done
+}
+
 compare_branch=""
+paths=()
+vim_diff=0
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
         -h|--help)
             usage
+            ;;
+        -p|--path)
+            if [ -z "${2}" ]; then
+                error "Missing argument for ${1}"
+                usage
+            fi
+            paths+=("${2}")
+            shift
+            ;;
+        -v|--vim)
+            vim_diff=1
             ;;
         -*)
             error "Unknown option: ${1}"
@@ -63,10 +118,25 @@ done
 
 git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo."
 
+[ "${vim_diff}" -eq 1 ] && ! command -v vim >/dev/null && fail "vim not found."
+
 if [ -z "${compare_branch}" ]; then
-    print_worktree_diff
+    if [ "${vim_diff}" -eq 1 ]; then
+        readarray -t changed < <(git -C "${git_dir}" diff --name-only HEAD -- "${paths[@]}")
+        readarray -t untracked < <(git -C "${git_dir}" ls-files --others --exclude-standard -- "${paths[@]}")
+        vimdiff_files HEAD "${changed[@]}" "${untracked[@]}"
+    else
+        print_worktree_diff
+    fi
 else
     git -C "${git_dir}" rev-parse --verify --quiet "${compare_branch}^{commit}" >/dev/null ||
         fail "Branch not found: ${compare_branch}"
-    git -C "${git_dir}" --no-pager diff "${compare_branch}...HEAD"
+    if [ "${vim_diff}" -eq 1 ]; then
+        merge_base="$(git -C "${git_dir}" merge-base "${compare_branch}" HEAD)" ||
+            fail "No merge base between ${compare_branch} and HEAD."
+        readarray -t changed < <(git -C "${git_dir}" diff --name-only "${merge_base}" HEAD -- "${paths[@]}")
+        vimdiff_files "${merge_base}" "${changed[@]}"
+    else
+        git -C "${git_dir}" --no-pager diff "${compare_branch}...HEAD" -- "${paths[@]}"
+    fi
 fi

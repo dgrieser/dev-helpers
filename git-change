@@ -70,7 +70,7 @@ if [ -z "${branch}" ]; then
         else
             cmai_args+=( "--unstaged" )
         fi
-        suggestion="$(cmai "${cmai_args[@]}" 2>/dev/null)"; exit_code=$?
+        suggestion="$(timeout 5 cmai "${cmai_args[@]}" 2>/dev/null)"; exit_code=$?
         [ ${exit_code} -eq 0 ] && [ -n "${suggestion}" ] && prompt_args+=( "--default" "${suggestion}" )
     fi
     branch="$(prompt "${prompt_args[@]}")" || abort

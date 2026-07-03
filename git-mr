@@ -11,6 +11,7 @@ Options:
       --feedback      Print comments and review feedback for the selected merge request
   -r, --raw           With --feedback, print Markdown without terminal rendering
   -b, --branch        Filter merge requests by branch
+      --prod-branch   Name of the production branch (default: prod)
   -A, --all           Include all merge request states
   -h, --help          Show this help message and exit
 EOF
@@ -168,6 +169,7 @@ copy_message=0
 feedback=0
 issue=0
 raw=0
+prod_branch="prod"
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -h|--help)
@@ -183,6 +185,11 @@ while [ "$#" -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             branch="${1}"
+            ;;
+        --prod-branch)
+            shift
+            [ -z "${1}" ] && usage
+            prod_branch="${1}"
             ;;
         -m|--copy-message)
             copy_message=1
@@ -252,7 +259,7 @@ echo 1>&2
 
 if [ "${create}" -eq 0 ]; then
     glab_mr_list_args=()
-    if [ "${branch}" == "$(git-default)" ]; then
+    if [ "${branch}" == "$(git-default)" ] || { [ -n "${prod_branch}" ] && [ "${branch}" == "${prod_branch}" ]; }; then
         glab_mr_list_args+=("--target-branch")
     else
         glab_mr_list_args+=("--source-branch")

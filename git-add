@@ -34,6 +34,7 @@ fail() {
 RED='\e[31m'
 GREEN='\e[32m'
 YELLOW='\e[33m'
+MAGENTA='\e[35m'
 NC='\e[0m'
 
 HEADER="KEY\tTYPE\tPATH"
@@ -49,6 +50,7 @@ print_diff() {
         untracked) diff_cmd="${UNTRACKED_DIFF_CMD}" ;;
         unstaged) diff_cmd="${UNSTAGED_DIFF_CMD}" ;;
         staged) diff_cmd="${STAGED_DIFF_CMD}" ;;
+        conflict) diff_cmd="${CONFLICT_DIFF_CMD}" ;;
         *) fail "Unknown state: ${current_state}" ;;
     esac
     if [ "${color}" -eq 0 ]; then
@@ -114,6 +116,21 @@ is_staged() {
     local path="${1}"; shift
     contains_path "${path}" "${STAGED_LIST_CMD}"; exit_code=$?
     return ${exit_code}
+}
+
+list_conflict() {
+    ${CONFLICT_LIST_CMD}
+}
+
+is_conflict() {
+    local path="${1}"; shift
+    contains_path "${path}" "${CONFLICT_LIST_CMD}"; exit_code=$?
+    return ${exit_code}
+}
+
+has_conflict_markers() {
+    local path="${1}"; shift
+    LC_ALL=C git -C "${GIT_DIR}" diff --check -- "${path}" | grep -q 'leftover conflict marker'
 }
 
 paths=()
@@ -211,6 +228,9 @@ UNSTAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --'
 STAGED_LIST_CMD='git --no-pager -C '"${GIT_DIR}"' diff --cached --name-only -z'
 STAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --cached --'
 
+CONFLICT_LIST_CMD='git -C '"${GIT_DIR}"' diff --name-only --diff-filter=U -z'
+CONFLICT_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --'
+
 STAGE_CMD='git -C '"${GIT_DIR}"' add --'
 UNSTAGE_CMD='git -C '"${GIT_DIR}"' restore --staged --'
 RESET_CMD='git -C '"${GIT_DIR}"' restore --'
@@ -220,6 +240,7 @@ PREVIEW_COMMAND='case {2} in'
 PREVIEW_COMMAND+=' untracked) '"${UNTRACKED_DIFF_CMD}"' {3} ;;'
 PREVIEW_COMMAND+=' unstaged) '"${UNSTAGED_DIFF_CMD}"' {3} ;;'
 PREVIEW_COMMAND+=' staged) '"${STAGED_DIFF_CMD}"' {3} ;;'
+PREVIEW_COMMAND+=' conflict) '"${CONFLICT_DIFF_CMD}"' {3} ;;'
 PREVIEW_COMMAND+='esac'
 
 POST_COMMAND_FILE="/tmp/${APP}-${id}.post_command"
@@ -268,8 +289,10 @@ if [ -n "${key_result}" ]; then
 fi
 
 if [ -n "${stage_path}" ]; then
+    if is_conflict "${stage_path}" && has_conflict_markers "${stage_path}"; then
+        error "Not staging '${stage_path}': conflict markers still present"
     # check if already staged, then do nothing
-    if is_unstaged "${stage_path}" || is_untracked "${stage_path}"; then
+    elif is_unstaged "${stage_path}" || is_untracked "${stage_path}"; then
         ${STAGE_CMD} "${stage_path}"
         [ -n "${key_result}" ] && echo -e "stage\n${stage_path}" > "${PREVIOUS_UPDATE_FILE}"
     fi
@@ -317,14 +340,18 @@ if [ -f "${PREVIOUS_UPDATE_FILE}" ]; then
     rm -f "${PREVIOUS_UPDATE_FILE}"
 fi
 
+mapfile -d '' -t CONFLICT  < <(list_conflict)
 mapfile -d '' -t UNTRACKED < <(list_untracked)
 mapfile -d '' -t UNSTAGED  < <(list_unstaged)
 mapfile -d '' -t STAGED    < <(list_staged)
 
 declare -A STATUS
 
+for f in "${CONFLICT[@]}"; do
+  STATUS["${f}"]="conflict"
+done
 for f in "${UNTRACKED[@]}"; do
-  STATUS["${f}"]="untracked"
+  [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="untracked"
 done
 for f in "${UNSTAGED[@]}"; do
   [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="unstaged"
@@ -344,6 +371,7 @@ sort_args+=("-k3,3")
 content=$(
   for f in "${!STATUS[@]}"; do
     case "${STATUS[${f}]}" in
+      conflict)  key=4; color="${MAGENTA}";;
       unstaged)  key=3; color="${YELLOW}";;
       untracked) key=2; color="${RED}";;
       staged)    key=1; color="${GREEN}";;
