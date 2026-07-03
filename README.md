@@ -21,15 +21,15 @@ git-activity-to-issue
 ```
 
 ### git-add
-Interactive fuzzy stager: stage/unstage/delete/reset/ignore files via picker.
+Interactive fuzzy stager: stage/unstage/delete/reset/ignore files and resolve conflicts via picker.
 ```bash
 git-add [-p] [<path>...] [-s <path>] [-u <path>] [-d <path>] [-r <path>] [-i <path>] [-q <query>]
 ```
 
 ### git-branch
-Create and check out a new branch (with confirmation).
+Create/checkout a branch, or delete/reset/backup it (with confirmation).
 ```bash
-git-branch <branch-name>
+git-branch [--delete] [--reset] [--backup] [-y|--yes] [BRANCH_NAME]
 ```
 
 ### git-branch-from-tag
@@ -81,9 +81,9 @@ git-default [--fqn]
 ```
 
 ### git-diff
-Show diff of HEAD plus untracked files.
+Show diff of HEAD plus untracked files, or against a branch; optional vimdiff.
 ```bash
-git-diff
+git-diff [-p|--path PATH] [-v|--vim] [BRANCH]
 ```
 
 ### git-fix-goimports
@@ -117,9 +117,10 @@ git-log [--print] [-d <commit>] [-p <commit>] [-r <commit>] [-q <query>] [<path>
 ```
 
 ### git-mr
-Create or work with GitLab merge requests for a project.
+Create or work with GitLab merge requests: copy message, create issue, or fetch review feedback.
 ```bash
-git-mr [-c] [-m] [-i] [-b <branch>] [-A] <project>
+git-mr [-c|--create] [-m|--copy-message] [-i|--issue] [--feedback] [-r|--raw] \
+       [-b|--branch <branch>] [--prod-branch <branch>] [-A|--all] <project>
 ```
 
 ### git-package
@@ -144,9 +145,9 @@ git-pr [-b|--branch] [-c|--create] [--feedback]
 ```
 
 ### git-push
-Push current or named branch; optional push-only mode.
+Push current or named branch; optional push-only or force-with-lease.
 ```bash
-git-push [-p|--push-only] [<branch>]
+git-push [-p|--push-only] [-F|--force-with-lease] [<branch>]
 ```
 
 ### git-reset-all
