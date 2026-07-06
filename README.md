@@ -87,10 +87,10 @@ git-diff [-p|--path PATH] [-v|--vim] [BRANCH]
 ```
 
 ### git-find-repo
-Print the path of a repo under `$WORKSPACE` by name, `name#parent` qualifier, relative path, or git URL; `-` jumps to the previous repo from history. Clones missing repos unless disabled. Keeps a cached repo listing and a jump history.
+Print the path of a repo under `$WORKSPACE` by name, `name#parent` qualifier, relative path, or git URL; `-` jumps to the previous repo from history. Clones missing repos unless disabled. GitLab MR (`/-/merge_requests/<id>`) and branch (`/-/tree/<branch>`) URLs also check out and pull the referenced branch unless disabled; a bare or `!`-prefixed MR number does the same for the current repo. Keeps a cached repo listing and a jump history.
 ```bash
 git-find-repo [--workspace|-W <path>] [--vc-folder|-F <folder>] [--update-listing|-U] \
-              [--list|-L] [--history|-H] [--no-git-clone] [--no-history] <project|->
+              [--list|-L] [--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-id|->
 ```
 
 ### git-fix-goimports
@@ -161,12 +161,6 @@ git-push [-p|--push-only] [-F|--force-with-lease] [<branch>]
 Reset and clean all tracked and untracked changes (with confirm).
 ```bash
 git-reset-all
-```
-
-### git-review
-Open a GitLab MR by URL or ID for review.
-```bash
-git-review <URL|ID>
 ```
 
 ### git-rm-branches

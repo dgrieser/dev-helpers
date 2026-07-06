@@ -2,7 +2,7 @@
 
 usage() {
     cat <<EOF 1>&2
-usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--list|-L] [--print-history|--history|-H] [--no-git-clone] [--no-history] <project>
+usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--list|-L] [--print-history|--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-id|->
 EOF
     exit 1
 }
@@ -365,6 +365,30 @@ update_listing() {
     }
 }
 
+checkout_requested_ref() {
+    local repo_path
+    local branch
+
+    repo_path="${1}"
+    [ "${no_checkout}" -eq 1 ] && return 0
+    [ -z "${checkout_mr_id}" ] && [ -z "${checkout_source_branch}" ] && return 0
+
+    (
+        cd "${repo_path}" || fail "Unable to change directory to: ${repo_path}"
+        git-checkout 1>&2 || fail "Unable to checkout default branch"
+        git pull 1>&2 || fail "Unable to pull default branch"
+        branch="${checkout_source_branch}"
+        if [ -n "${checkout_mr_id}" ]; then
+            branch="$(glab mr view "${checkout_mr_id}" -F json | jq -r '.source_branch')"
+            { [ -n "${branch}" ] && [ "${branch}" != "null" ]; } || fail "Unable to get source branch for MR: ${checkout_mr_id}"
+        else
+            note "Switching to source branch: ${branch}"
+        fi
+        git-checkout "${branch}" 1>&2 || fail "Unable to switch to source branch: ${branch}"
+        git pull 1>&2 || fail "Unable to pull source branch: ${branch}"
+    ) || exit 1
+}
+
 project=""
 workspace="${WORKSPACE}"
 vc_folder="${VC_FOLDER}"
@@ -373,6 +397,7 @@ list_only=0
 print_history_only=0
 no_git_clone=0
 no_history=0
+no_checkout=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -h|--help)
@@ -383,6 +408,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-history)
             no_history=1
+            ;;
+        --no-checkout)
+            no_checkout=1
             ;;
         --update-listing|-U)
             update_listing_only=1
@@ -458,12 +486,36 @@ if [ "${project}" = "-" ]; then
     [ -n "${project}" ] || fail "No project history found"
 fi
 
+checkout_mr_id=""
+checkout_source_branch=""
+
+# a bare or !-prefixed MR number refers to the current repo, not a project name
+if [[ "${project}" =~ ^!?[0-9]+$ ]]; then
+    checkout_mr_id="${project#!}"
+    git_root_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not inside a Git repository"
+    checkout_requested_ref "${git_root_dir}"
+    record_history "${git_root_dir}"
+    echo "${git_root_dir}"
+    exit 0
+fi
+
 url=""
 
 if [[ "${project}" == *":/"* ]]; then
     url="${project}"
-    [[ "${project}" == *"gitlab"* ]] && [[ "${project}" == *"/-/"* ]] && project="${project%%/-/*}"
-    project="$(echo "${project}" | sed -E 's|^[^:/]+:/{1,2}[^/]*||; s|[?#].*$||; s|\.git$||')"
+    if [[ "${url}" == *"/-/"* ]]; then
+        url_ref="${url#*/-/}"
+        case "${url_ref}" in
+            merge_requests/*)
+                checkout_mr_id="$(echo "${url_ref}" | grep -oE '^merge_requests/[0-9]+' | grep -oE '[0-9]+$')"
+                ;;
+            tree/*)
+                checkout_source_branch="$(echo "${url_ref}" | sed -E 's|^tree/([^?#]+).*$|\1|')"
+                ;;
+        esac
+        url="${url%%/-/*}"
+    fi
+    project="$(echo "${url}" | sed -E 's|^[^:/]+:/{1,2}[^/]*||; s|[?#].*$||; s|\.git$||')"
 elif [[ "${project}" == *":"* ]]; then
     [[ "${project}" == "git@"* ]] && url="${project}"
     project="$(echo "${project}" | sed -E 's|^[^:]+:||; s|[?#].*$||; s|\.git$||')"
@@ -494,6 +546,7 @@ if [[ "${project}" == *"/"* ]]; then
     if [ -n "${prj_candidate}" ]; then
         folder="${workspace}/${prj_candidate}"
         if cd "${folder}"; then
+            checkout_requested_ref "${folder}"
             record_history "${folder}"
             echo "${folder}"
             exit 0
@@ -537,11 +590,13 @@ if [ -z "${match}" ] && [ "${no_git_clone}" -eq 0 ]; then
     note "Attempting to clone ${clone_url} ..."
     echo 1>&2
     folder="$(git-clone "${clone_url}")" || fail "Could not clone ${clone_url}"
+    checkout_requested_ref "${folder}"
     record_history "${folder}"
     echo "${folder}"
     exit 0
 fi
 
 [ -z "${match}" ] && fail "${project} was not found locally."
+checkout_requested_ref "${match}"
 record_history "${match}"
 echo "${match}"
