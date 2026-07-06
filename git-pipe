@@ -300,8 +300,8 @@ fi
 
 cded=0
 if [ -n "${repo}" ]; then
-    need_cmd dev-find-project
-    cd "$(dev-find-project "${repo}")" || abort
+    need_cmd git-find-repo
+    cd "$(git-find-repo "${repo}")" || abort
     cded=1
 fi
 

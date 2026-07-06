@@ -86,6 +86,13 @@ Show diff of HEAD plus untracked files, or against a branch; optional vimdiff.
 git-diff [-p|--path PATH] [-v|--vim] [BRANCH]
 ```
 
+### git-find-repo
+Print the path of a repo under `$WORKSPACE` by name, `name#parent` qualifier, relative path, or git URL; `-` jumps to the previous repo from history. Clones missing repos unless disabled. Keeps a cached repo listing and a jump history.
+```bash
+git-find-repo [--workspace|-W <path>] [--vc-folder|-F <folder>] [--update-listing|-U] \
+              [--list|-L] [--history|-H] [--no-git-clone] [--no-history] <project|->
+```
+
 ### git-fix-goimports
 Run `make imports` and `goimports -w` on a chosen recent branch.
 ```bash

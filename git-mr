@@ -231,7 +231,7 @@ if [ -z "${project}" ]; then
 fi
 
 if [ ${cd_project} -eq 1 ]; then
-    folder="$(dev-find-project "${project}")" || fail "Failed to find project: ${project}"
+    folder="$(git-find-repo "${project}")" || fail "Failed to find project: ${project}"
     cd "${folder}" 1> /dev/null || fail "Failed to change to: ${folder}"
 fi
 url="$(git remote get-url origin)" || fail "Failed to determine origin"

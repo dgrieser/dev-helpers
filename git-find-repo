@@ -1,0 +1,547 @@
+#!/bin/bash
+
+usage() {
+    cat <<EOF 1>&2
+usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--list|-L] [--print-history|--history|-H] [--no-git-clone] [--no-history] <project>
+EOF
+    exit 1
+}
+
+error() {
+    print-text-error "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    print-text-warning "WARNING: ${1}" 1>&2
+}
+
+note() {
+    print-text-muted "${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+listing_cache_file() {
+    local workspace_key
+
+    workspace_key="${workspace}"
+    if [ -n "${HOME}" ]; then
+        workspace_key="${workspace_key#${HOME}/}"
+        [ "${workspace_key}" = "${workspace}" ] && workspace_key="${workspace_key#${HOME}}"
+    fi
+    workspace_key="${workspace_key#/}"
+
+    echo "${HOME}/.cache/git-find-repo/${workspace_key}/${vc_folder}-listing"
+}
+
+history_cache_file() {
+    local workspace_key
+
+    workspace_key="${workspace}"
+    if [ -n "${HOME}" ]; then
+        workspace_key="${workspace_key#${HOME}/}"
+        [ "${workspace_key}" = "${workspace}" ] && workspace_key="${workspace_key#${HOME}}"
+    fi
+    workspace_key="${workspace_key#/}"
+
+    echo "${HOME}/.cache/git-find-repo/${workspace_key}/${vc_folder}-history"
+}
+
+record_history() {
+    [ "${no_history}" -eq 1 ] && return 0
+    local history_file
+    local history_dir
+    local history_entry
+    local history_path
+    local timestamp
+
+    history_entry="${1}"
+    [ -z "${history_entry}" ] && return 0
+
+    history_file="$(history_cache_file)"
+    history_dir="$(dirname "${history_file}")"
+    mkdir -p "${history_dir}" || fail "Could not create cache dir ${history_dir}"
+    history_path="${history_entry}"
+
+    timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    history_entry="${timestamp}"$'\t'"${history_path}"
+    printf '%s\n' "${history_entry}" >> "${history_file}" || fail "Could not update history cache ${history_file}"
+}
+
+print_history() {
+    local history_file
+
+    history_file="$(history_cache_file)"
+    [ -f "${history_file}" ] && cat "${history_file}"
+}
+
+current_project_dir() {
+    local dir
+    local parent
+
+    dir="${PWD}"
+    case "${dir}" in
+        "${workspace}"|"${workspace}"/*)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    while :; do
+        [ -d "${dir}/${vc_folder}" ] && {
+            printf '%s\n' "${dir}"
+            return 0
+        }
+
+        [ "${dir}" = "${workspace}" ] && break
+        parent="$(dirname "${dir}")"
+        [ "${parent}" = "${dir}" ] && break
+        dir="${parent}"
+    done
+}
+
+last_history_entry() {
+    local history_file
+    local excluded_path
+
+    history_file="$(history_cache_file)"
+    excluded_path="${1}"
+    [ -f "${history_file}" ] || return 0
+
+    awk -F '\t' -v excluded_path="${excluded_path}" '
+        NF >= 2 && $2 != excluded_path { last = $2 }
+        END { if (last != "") print last }
+    ' "${history_file}"
+}
+
+generate_listing() {
+    local repo_paths
+    local repo_path
+
+    repo_paths="$(
+        find "${workspace}" -type d -name "${vc_folder}" -prune -print 2>/dev/null \
+        | sed "s:/${vc_folder}\$::" \
+        | LC_ALL=C sort -u \
+        | awk 'NR==1{keep=$0; print; next} { if (index($0, keep"/")!=1) {keep=$0; print} }'
+    )"
+
+    while IFS= read -r repo_path; do
+        [ -z "${repo_path}" ] && continue
+        printf '%s\t%s\n' "$(format_repo_name "${repo_path}" "${repo_paths}")" "${repo_path}"
+    done <<< "${repo_paths}"
+}
+
+relative_repo_path() {
+    local repo_path
+
+    repo_path="${1#${workspace}/}"
+    repo_path="${repo_path#${workspace}}"
+    repo_path="${repo_path#/}"
+    printf '%s\n' "${repo_path}"
+}
+
+repo_parent_path() {
+    local relative_path
+
+    relative_path="$(relative_repo_path "${1}")"
+    dirname "${relative_path}"
+}
+
+repo_disambiguator() {
+    local repo_path
+    local listing
+
+    repo_path="${1}"
+    listing="${2}"
+
+    awk -v target="${repo_path}" -v workspace="${workspace}" -v workspace_name="$(basename -- "${workspace}")" '
+        function rel(path) {
+            sub("^" workspace "/?", "", path)
+            sub("^/", "", path)
+            return path
+        }
+        function dirname_of(path,   copy) {
+            copy = path
+            if (copy !~ /\//) {
+                return "."
+            }
+            sub("/[^/]+$", "", copy)
+            return copy == "" ? "." : copy
+        }
+        function basename_of(path,   copy) {
+            copy = path
+            sub("^.*/", "", copy)
+            return copy
+        }
+        function count_parts(path,   n, copy) {
+            copy = path
+            if (copy == "." || copy == "") {
+                return 0
+            }
+            n = split(copy, _, "/")
+            return n
+        }
+        function suffix_parts(path, count,   n, parts, start, out, i) {
+            if (count <= 0 || path == "." || path == "") {
+                return ""
+            }
+            n = split(path, parts, "/")
+            start = n - count + 1
+            if (start < 1) {
+                start = 1
+            }
+            out = parts[start]
+            for (i = start + 1; i <= n; i++) {
+                out = out "/" parts[i]
+            }
+            return out
+        }
+        BEGIN {
+            target_rel = rel(target)
+            target_name = basename_of(target_rel)
+            target_parent = dirname_of(target_rel)
+        }
+        {
+            current_rel = rel($0)
+            current_name = basename_of(current_rel)
+            if (current_name != target_name) {
+                next
+            }
+            current_parent = dirname_of(current_rel)
+            parents[++count] = current_parent
+            if (current_rel == target_rel) {
+                target_index = count
+            }
+        }
+        END {
+            if (count <= 1 || target_index == 0) {
+                exit
+            }
+
+            max_parts = count_parts(target_parent)
+            for (parts = 1; parts <= max_parts; parts++) {
+                target_suffix = suffix_parts(target_parent, parts)
+                unique = 1
+                for (i = 1; i <= count; i++) {
+                    if (i == target_index) {
+                        continue
+                    }
+                    if (suffix_parts(parents[i], parts) == target_suffix) {
+                        unique = 0
+                        break
+                    }
+                }
+                if (unique) {
+                    if (target_suffix == ".") {
+                        print "#" workspace_name
+                    } else {
+                        print "#" target_suffix
+                    }
+                    exit
+                }
+            }
+
+            if (target_parent == ".") {
+                print "#" workspace_name
+            } else {
+                print "#" target_parent
+            }
+        }
+    ' <<< "${listing}"
+}
+
+format_repo_name() {
+    local repo_path
+    local listing
+    local repo_name
+    local disambiguator
+
+    repo_path="${1}"
+    listing="${2}"
+    repo_name="$(basename -- "${repo_path}")"
+    disambiguator="$(repo_disambiguator "${repo_path}" "${listing}")"
+    printf '%s%s\n' "${repo_name}" "${disambiguator}"
+}
+
+listing_repo_path() {
+    local listing_entry
+
+    listing_entry="${1}"
+    case "${listing_entry}" in
+        *$'\t'*)
+            printf '%s\n' "${listing_entry#*$'\t'}"
+            ;;
+        *)
+            printf '%s\n' "${listing_entry}"
+            ;;
+    esac
+}
+
+project_matches_repo() {
+    local requested_project
+    local listing_entry
+    local repo_path
+    local repo_name
+    local repo_parent
+    local requested_name
+    local qualifier
+
+    requested_project="${1}"
+    listing_entry="${2}"
+    repo_path="$(listing_repo_path "${listing_entry}")"
+    repo_name="$(basename -- "${repo_path}")"
+    repo_parent="$(repo_parent_path "${repo_path}")"
+
+    case "${requested_project}" in
+        *"#"*)
+            requested_name="${requested_project%%#*}"
+            qualifier="${requested_project#*#}"
+            [ "${requested_name}" = "${repo_name}" ] || return 1
+            case "${repo_parent}" in
+                "${qualifier}"|*/"${qualifier}")
+                    return 0
+                    ;;
+                ".")
+                    [ "${qualifier}" = "$(basename -- "${workspace}")" ] && return 0
+                    ;;
+            esac
+            return 1
+            ;;
+        *)
+            case "${repo_path}" in
+                */"${requested_project}")
+                    return 0
+                    ;;
+            esac
+            return 1
+            ;;
+    esac
+}
+
+find_matching_repos() {
+    local requested_project
+    local listing
+    local listing_entry
+    local matched_paths
+
+    requested_project="${1}"
+    listing="${2}"
+    matched_paths=""
+
+    while IFS= read -r listing_entry; do
+        [ -z "${listing_entry}" ] && continue
+        if project_matches_repo "${requested_project}" "${listing_entry}"; then
+            matched_paths="${matched_paths}$(listing_repo_path "${listing_entry}")"$'\n'
+        fi
+    done <<< "${listing}"
+
+    printf '%s' "${matched_paths}"
+}
+
+update_listing() {
+    local cache_file
+    local cache_dir
+    local temp_file
+
+    cache_file="$(listing_cache_file)"
+    cache_dir="$(dirname "${cache_file}")"
+    mkdir -p "${cache_dir}" || fail "Could not create cache dir ${cache_dir}"
+    temp_file="$(mktemp "${cache_file}.tmp.XXXXXX")" || fail "Could not create temp listing cache ${cache_file}.tmp.XXXXXX"
+    generate_listing > "${temp_file}" || {
+        rm -f "${temp_file}"
+        fail "Could not write listing cache ${cache_file}"
+    }
+    if [ ! -s "${temp_file}" ]; then
+        rm -f "${temp_file}"
+        fail "Refusing to replace listing cache ${cache_file} with an empty listing"
+    fi
+    mv "${temp_file}" "${cache_file}" || {
+        rm -f "${temp_file}"
+        fail "Could not replace listing cache ${cache_file}"
+    }
+}
+
+project=""
+workspace="${WORKSPACE}"
+vc_folder="${VC_FOLDER}"
+update_listing_only=0
+list_only=0
+print_history_only=0
+no_git_clone=0
+no_history=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        --no-git-clone)
+            no_git_clone=1
+            ;;
+        --no-history)
+            no_history=1
+            ;;
+        --update-listing|-U)
+            update_listing_only=1
+            ;;
+        --list|-L)
+            list_only=1
+            ;;
+        --print-history|--history|-H)
+            print_history_only=1
+            ;;
+        --workspace|-W)
+            shift
+            [ -z "${1}" ] && usage
+            workspace="${1}"
+            ;;
+        --vc-folder|-F)
+            shift
+            [ -z "${1}" ] && usage
+            vc_folder="${1}"
+            ;;
+        *)
+            [ -z "${project}" ] || usage
+            project="${1}"
+            ;;
+    esac
+    shift
+done
+
+[ -z "${workspace}" ] && fail "WORKSPACE is not set"
+[ -z "${vc_folder}" ] && fail "VC_FOLDER is not set"
+# a trailing slash breaks prefix stripping and the traverse-up workspace check
+workspace="${workspace%/}"
+[ -z "${workspace}" ] && fail "WORKSPACE must not be /"
+
+# migrate cache from the old script name (dev-find-project)
+if [ -d "${HOME}/.cache/dev-find-project" ] && [ ! -e "${HOME}/.cache/git-find-repo" ]; then
+    mv "${HOME}/.cache/dev-find-project" "${HOME}/.cache/git-find-repo" \
+        || warning "Could not migrate cache from ${HOME}/.cache/dev-find-project"
+fi
+[ "${update_listing_only}" -eq 1 ] && [ -n "${project}" ] && usage
+[ "${list_only}" -eq 1 ] && [ -n "${project}" ] && usage
+[ "${print_history_only}" -eq 1 ] && [ -n "${project}" ] && usage
+[ "${update_listing_only}" -eq 1 ] && [ "${list_only}" -eq 1 ] && usage
+[ "${update_listing_only}" -eq 1 ] && [ "${print_history_only}" -eq 1 ] && usage
+[ "${list_only}" -eq 1 ] && [ "${print_history_only}" -eq 1 ] && usage
+[ "${update_listing_only}" -eq 0 ] && [ "${list_only}" -eq 0 ] && [ "${print_history_only}" -eq 0 ] && [ -z "${project}" ] && usage
+
+if [ "${update_listing_only}" -eq 1 ]; then
+    update_listing
+    exit 0
+fi
+
+if [ "${list_only}" -eq 1 ]; then
+    cache_file="$(listing_cache_file)"
+    if [ -f "${cache_file}" ] && [ -s "${cache_file}" ]; then
+        listing="$(cat "${cache_file}")"
+    else
+        update_listing
+        listing="$(cat "${cache_file}")"
+    fi
+
+    printf '%s\n' "${listing}"
+    exit 0
+fi
+
+if [ "${print_history_only}" -eq 1 ]; then
+    print_history
+    exit 0
+fi
+
+if [ "${project}" = "-" ]; then
+    project="$(last_history_entry "$(current_project_dir)")"
+    [ -n "${project}" ] || fail "No project history found"
+fi
+
+url=""
+
+if [[ "${project}" == *":/"* ]]; then
+    url="${project}"
+    [[ "${project}" == *"gitlab"* ]] && [[ "${project}" == *"/-/"* ]] && project="${project%%/-/*}"
+    project="$(echo "${project}" | sed -E 's|^[^:/]+:/{1,2}[^/]*||; s|[?#].*$||; s|\.git$||')"
+elif [[ "${project}" == *":"* ]]; then
+    [[ "${project}" == "git@"* ]] && url="${project}"
+    project="$(echo "${project}" | sed -E 's|^[^:]+:||; s|[?#].*$||; s|\.git$||')"
+fi
+
+# remove leading slash
+project="${project#/}"
+
+if [[ "${project}" == *"/"* ]]; then
+    # traverse up to find a git folder
+    prj_git=""
+    prj_candidate=""
+    folder="${workspace}/${project}"
+    while [ -z "${prj_git}" ]; do
+        prj_git=$(find "${folder}" -maxdepth 1 -type d -name "${vc_folder}" 2> /dev/null | head -n 1)
+        if [ -n "${prj_git}" ]; then
+            prj_candidate=$(dirname "${prj_git}")
+            prj_candidate="${prj_candidate#*${workspace}}"
+            prj_candidate="${prj_candidate#/}"
+            break
+        fi
+        parent=$(dirname "${folder}")
+        if [ "${workspace}" == "${parent}" ] || [ "${parent}" == "${folder}" ]; then
+            break
+        fi
+        folder="${parent}"
+    done
+    if [ -n "${prj_candidate}" ]; then
+        folder="${workspace}/${prj_candidate}"
+        if cd "${folder}"; then
+            record_history "${folder}"
+            echo "${folder}"
+            exit 0
+        fi
+    fi
+fi
+
+# list all repos, trim .git, de-duplicate,
+# match the project name or relative path
+cache_file="$(listing_cache_file)"
+listing_refreshed=0
+if [ -f "${cache_file}" ]; then
+    listing="$(cat "${cache_file}")"
+    matches="$(find_matching_repos "${project}" "${listing}")"
+else
+    update_listing
+    listing_refreshed=1
+    listing="$(cat "${cache_file}")"
+    matches="$(find_matching_repos "${project}" "${listing}")"
+fi
+
+if [ -z "${matches}" ] && [ "${listing_refreshed}" -eq 0 ]; then
+    update_listing
+    listing="$(cat "${cache_file}")"
+    matches="$(find_matching_repos "${project}" "${listing}")"
+fi
+
+match="$(printf '%s\n' "${matches}" | sed -n '1p')"
+match_count="$(printf '%s\n' "${matches}" | sed '/^$/d' | wc -l)"
+
+if [ "${match_count}" -gt 1 ]; then
+    warning "${project} is ambiguous:"
+    note "$(printf '%s\n' "${matches}" | sed '/^$/d' | sed 's/^/  • /')"
+    note
+    note "cd ${match}"
+fi
+
+if [ -z "${match}" ] && [ "${no_git_clone}" -eq 0 ]; then
+    warning "${project} was not found locally."
+    clone_url="${url:-${project}}"
+    note "Attempting to clone ${clone_url} ..."
+    echo 1>&2
+    folder="$(git-clone "${clone_url}")" || fail "Could not clone ${clone_url}"
+    record_history "${folder}"
+    echo "${folder}"
+    exit 0
+fi
+
+[ -z "${match}" ] && fail "${project} was not found locally."
+record_history "${match}"
+echo "${match}"

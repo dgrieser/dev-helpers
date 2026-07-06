@@ -97,5 +97,5 @@ if [ -d "${DIR_NAME}" ]; then
 fi
 
 git clone "${URL}" 1>&2
-dev-find-project --update-listing
+git-find-repo --update-listing
 echo "${PARENT_DIR}/${DIR_NAME}"

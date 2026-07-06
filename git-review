@@ -53,7 +53,7 @@ if [[ "${id}" =~ ^https?:// ]]; then
     else
         id="${mr_id}"
     fi
-    cd "$(dev-find-project "${base_url}")" 2> /dev/null || fail "Unable to find project for URL: ${id}"
+    cd "$(git-find-repo "${base_url}")" 2> /dev/null || fail "Unable to find project for URL: ${id}"
 elif [[ "${id}" =~ ^!?[0-9]+$ ]]; then
     id="$(echo "${id}" | grep -oE '[0-9]+')"
     git_root_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not inside a Git repository"
