@@ -1,5 +1,35 @@
 # bash completion for dev-helpers commands
 # Installed once per completed command name so bash-completion can lazy-load it.
+#
+# Aliases and wrapper functions don't trigger lazy loading (bash looks up the
+# typed name, not the expansion). To complete them, source this file from your
+# shell rc after defining the aliases and map them:
+#
+#   source /usr/local/share/bash-completion/completions/dev-helpers
+#   __dh_register_aliases                    # auto-map aliases to git-* commands
+#   __dh_complete_alias g git-find-repo      # map wrapper functions explicitly
+
+# Map NAME to the completion of a dev-helpers command: __dh_complete_alias <name> <command>
+__dh_complete_alias()
+{
+    declare -F "_${2}" >/dev/null || return 1
+    complete -F "_${2}" "${1}"
+}
+
+# Register completions for all defined aliases whose expansion starts with a
+# git-* command completed in this file, e.g. alias gco='git-checkout'.
+__dh_register_aliases()
+{
+    local line name target
+    while IFS= read -r line; do
+        name="${line#alias }"
+        name="${name%%=*}"
+        target="${line#*=\'}"
+        target="${target%%[\'; ]*}"
+        [[ "${target}" == git-* ]] && __dh_complete_alias "${name}" "${target}"
+    done < <(alias -p)
+    return 0
+}
 
 __dh_local_branches()
 {

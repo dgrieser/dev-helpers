@@ -9,6 +9,8 @@ LINKS := $(shell find . -maxdepth 1 -type l -printf '%f\n' | sort)
 
 COMPLETIONS_FILE := completions/dev-helpers
 COMPLETION_CMDS := $(shell awk '/^complete /{print $$NF}' $(COMPLETIONS_FILE) | sort -u)
+# also install under the stable name so shell rc files can source it for alias completion
+COMPLETION_NAMES := $(COMPLETION_CMDS) dev-helpers
 
 REPO_DIR := $(CURDIR)
 
@@ -34,7 +36,7 @@ install:
 		ln -sfn "$$target" "$(DESTDIR)$(BINDIR)/$$link"; \
 	done
 	[ -d "$(DESTDIR)$(COMPLETIONSDIR)" ] || mkdir -p "$(DESTDIR)$(COMPLETIONSDIR)"
-	for cmd in $(COMPLETION_CMDS); do \
+	for cmd in $(COMPLETION_NAMES); do \
 		install -m 0644 "$(COMPLETIONS_FILE)" "$(DESTDIR)$(COMPLETIONSDIR)/$$cmd"; \
 	done
 
@@ -47,7 +49,7 @@ install-links:
 		ln -sfn "$(REPO_DIR)/$$link" "$(DESTDIR)$(BINDIR)/$$link"; \
 	done
 	[ -d "$(DESTDIR)$(COMPLETIONSDIR)" ] || mkdir -p "$(DESTDIR)$(COMPLETIONSDIR)"
-	for cmd in $(COMPLETION_CMDS); do \
+	for cmd in $(COMPLETION_NAMES); do \
 		ln -sfn "$(REPO_DIR)/$(COMPLETIONS_FILE)" "$(DESTDIR)$(COMPLETIONSDIR)/$$cmd"; \
 	done
 
@@ -55,7 +57,7 @@ uninstall:
 	for script in $(SCRIPTS) $(LINKS); do \
 		rm -f "$(DESTDIR)$(BINDIR)/$$script"; \
 	done
-	for cmd in $(COMPLETION_CMDS); do \
+	for cmd in $(COMPLETION_NAMES); do \
 		rm -f "$(DESTDIR)$(COMPLETIONSDIR)/$$cmd"; \
 	done
 
@@ -63,4 +65,4 @@ list-install:
 	@printf 'Scripts -> %s\n' "$(DESTDIR)$(BINDIR)"
 	@printf '%s\n' $(SCRIPTS) $(LINKS) | sed 's/^/  /'
 	@printf 'Completions -> %s\n' "$(DESTDIR)$(COMPLETIONSDIR)"
-	@printf '%s\n' $(COMPLETION_CMDS) | sed 's/^/  /'
+	@printf '%s\n' $(COMPLETION_NAMES) | sed 's/^/  /'

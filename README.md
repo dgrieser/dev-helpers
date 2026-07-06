@@ -17,6 +17,15 @@ Bash completions (`completions/dev-helpers`) are installed to
 bash-completion lazy-loads them on first tab. Flags, subcommands, and
 contextual values (branches, tags, projects, changed files) are completed.
 
+Aliases and wrapper functions don't trigger lazy loading, so to complete them
+source the stable-named copy from your shell rc after defining the aliases:
+
+```bash
+source /usr/local/share/bash-completion/completions/dev-helpers
+__dh_register_aliases                    # auto-map aliases to git-* commands
+__dh_complete_alias g git-find-repo      # map wrapper functions explicitly
+```
+
 ## Tools
 
 ### git-activity-to-issue
