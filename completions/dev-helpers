@@ -1,0 +1,404 @@
+# bash completion for dev-helpers commands
+# Installed once per completed command name so bash-completion can lazy-load it.
+
+__dh_local_branches()
+{
+    git branch --list --format='%(refname:short)' 2>/dev/null
+}
+
+__dh_all_branches()
+{
+    {
+        git branch --list --format='%(refname:short)'
+        git branch --list --remotes --format='%(refname:lstrip=2)' | grep -v 'HEAD' | sed 's|^origin/||'
+    } 2>/dev/null | sort -u
+}
+
+__dh_tags()
+{
+    git tag --sort=-v:refname 2>/dev/null
+}
+
+__dh_projects()
+{
+    git-find-repo --list 2>/dev/null
+}
+
+__dh_changed_files()
+{
+    git status --porcelain 2>/dev/null | cut -c4-
+}
+
+__dh_compgen()
+{
+    COMPREPLY=( $(compgen -W "${1}" -- "${cur}") )
+}
+
+__dh_files()
+{
+    COMPREPLY=( $(compgen -f -- "${cur}") )
+    compopt -o filenames 2>/dev/null
+}
+
+__dh_dirs()
+{
+    COMPREPLY=( $(compgen -d -- "${cur}") )
+    compopt -o filenames 2>/dev/null
+}
+
+__dh_init()
+{
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+}
+
+_git-activity-to-issue()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        --start|--end|--per-page|--max-pages|--time-spent-slot-minutes|--filter) return 0 ;;
+    esac
+    __dh_compgen "--start --end --per-page --max-pages --json-array --time-spent --time-spent-book --interactive --time-spent-slot-minutes --filter -v --verbose -h --help"
+    return 0
+}
+complete -F _git-activity-to-issue git-activity-to-issue
+
+_git-add()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -q|--query) return 0 ;;
+        -s|--stage|-u|--unstage|-d|--delete|-r|--reset|-i|--ignore)
+            __dh_compgen "$(__dh_changed_files)"
+            return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-h --help -p --print -q --query -s --stage -u --unstage -d --delete -r --reset -i --ignore"
+    else
+        __dh_files
+    fi
+    return 0
+}
+complete -F _git-add git-add
+
+_git-branch()
+{
+    local cur prev
+    __dh_init
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "--delete --reset --backup -y --yes -h --help"
+    else
+        __dh_compgen "$(__dh_local_branches)"
+    fi
+    return 0
+}
+complete -F _git-branch git-branch
+
+_git-branch-from-tag()
+{
+    local cur prev
+    __dh_init
+    __dh_compgen "$(__dh_tags)"
+    return 0
+}
+complete -F _git-branch-from-tag git-branch-from-tag
+
+_git-browse()
+{
+    local cur prev
+    __dh_init
+    __dh_compgen "-p --print --host-only --include-branch -h --help"
+    return 0
+}
+complete -F _git-browse git-browse
+
+_git-change()
+{
+    local cur prev
+    __dh_init
+    __dh_compgen "$(__dh_all_branches)"
+    return 0
+}
+complete -F _git-change git-change
+
+_git-checkout()
+{
+    local cur prev
+    __dh_init
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-h --help"
+    else
+        __dh_compgen "$(__dh_all_branches)"
+    fi
+    return 0
+}
+complete -F _git-checkout git-checkout
+
+_git-container()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -n|--name|-t|--tag) return 0 ;;
+        -o|--output)
+            __dh_compgen "txt json"
+            return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-h --help -n --name -t --tag -o --output"
+    elif [ "${COMP_CWORD}" -eq 1 ]; then
+        __dh_compgen "check list delete"
+    fi
+    return 0
+}
+complete -F _git-container git-container
+
+_git-default()
+{
+    local cur prev
+    __dh_init
+    __dh_compgen "-h --help --fqn --fully-qualified"
+    return 0
+}
+complete -F _git-default git-default
+
+_git-diff()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -p|--path)
+            __dh_files
+            return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-p --path -v --vim -h --help"
+    else
+        __dh_compgen "$(__dh_all_branches)"
+    fi
+    return 0
+}
+complete -F _git-diff git-diff
+
+_git-find-repo()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -W|--workspace|-F|--vc-folder)
+            __dh_dirs
+            return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-W --workspace -F --vc-folder -U --update-listing -L --list -H --history --print-history --no-git-clone --no-history --no-checkout -h --help"
+    else
+        __dh_compgen "$(__dh_projects)"
+    fi
+    return 0
+}
+complete -F _git-find-repo git-find-repo
+
+_git-fork()
+{
+    local cur prev
+    __dh_init
+    __dh_compgen "-h --help"
+    return 0
+}
+complete -F _git-fork git-fork
+
+_git-ignore()
+{
+    local cur prev
+    __dh_init
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-r --root -h --help"
+    else
+        __dh_files
+    fi
+    return 0
+}
+complete -F _git-ignore git-ignore
+
+_git-log()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -d|--diff|-p|--create-patch|-r|--revert|-q|--query) return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-h --help --print -d --diff -p --create-patch -r --revert -q --query"
+    else
+        __dh_files
+    fi
+    return 0
+}
+complete -F _git-log git-log
+
+_git-mr()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -b|--branch)
+            __dh_compgen "$(__dh_all_branches)"
+            return 0 ;;
+        --prod-branch) return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-c --create -m --copy-message -i --issue --feedback -r --raw -b --branch --prod-branch -A --all -h --help"
+    else
+        __dh_compgen "$(__dh_projects)"
+    fi
+    return 0
+}
+complete -F _git-mr git-mr
+
+_git-package()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -n|--name|-v|--version) return 0 ;;
+        -o|--output)
+            __dh_compgen "txt json"
+            return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-h --help -n --name -v --version -o --output"
+    elif [ "${COMP_CWORD}" -eq 1 ]; then
+        __dh_compgen "check list delete"
+    fi
+    return 0
+}
+complete -F _git-package git-package
+
+_git-pipe()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -r|--repo)
+            __dh_compgen "$(__dh_projects)"
+            return 0 ;;
+        --ref)
+            __dh_compgen "$(__dh_all_branches) $(__dh_tags)"
+            return 0 ;;
+        --source)
+            __dh_compgen "push trigger schedule web api merge_request_event pipeline parent_pipeline external"
+            return 0 ;;
+        -s|--status)
+            __dh_compgen "created waiting_for_resource preparing pending running success failed canceled skipped manual scheduled"
+            return 0 ;;
+        -o|--output)
+            __dh_compgen "txt json"
+            return 0 ;;
+        --var|--grep|-n|--limit) return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-h --help -r --repo --ref --var --grep --source -s --status --failed --succeeded --aborted --running --pending --manual --skipped -n --limit -a --all -o --output"
+    elif [ "${COMP_CWORD}" -eq 1 ]; then
+        __dh_compgen "status search"
+    fi
+    return 0
+}
+complete -F _git-pipe git-pipe
+
+_git-pr()
+{
+    local cur prev
+    __dh_init
+    __dh_compgen "-b --branch -c --create --feedback -r --raw -h --help"
+    return 0
+}
+complete -F _git-pr git-pr
+
+_git-push()
+{
+    local cur prev
+    __dh_init
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-p --push-only -F --force-with-lease -h --help"
+    else
+        __dh_compgen "$(__dh_local_branches)"
+    fi
+    return 0
+}
+complete -F _git-push git-push
+
+_git-rm-branches()
+{
+    local cur prev
+    __dh_init
+    __dh_compgen "-h --help -f --force"
+    return 0
+}
+complete -F _git-rm-branches git-rm-branches
+
+_git-search()
+{
+    local cur prev
+    __dh_init
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "--gitlab --github"
+    fi
+    return 0
+}
+complete -F _git-search git-search
+
+_git-tag()
+{
+    local cur prev
+    __dh_init
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-d --delete -r --recreate -y --yes -h --help"
+    else
+        __dh_compgen "$(git fetch --all &>/dev/null; __dh_tags)"
+    fi
+    return 0
+}
+complete -F _git-tag git-tag
+
+_git-track-branches()
+{
+    local cur prev
+    __dh_init
+    __dh_compgen "-h --help -C --clear"
+    return 0
+}
+complete -F _git-track-branches git-track-branches
+
+__dh_no_args()
+{
+    COMPREPLY=()
+    return 0
+}
+complete -F __dh_no_args git-create
+complete -F __dh_no_args git-fix-goimports
+complete -F __dh_no_args git-last-change
+complete -F __dh_no_args git-reset-all
+
+_git-worktree()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -b|--branch)
+            __dh_compgen "$(__dh_local_branches)"
+            return 0 ;;
+        -w|--workdir)
+            __dh_dirs
+            return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-b --branch -w --workdir -h --help"
+    elif [ "${COMP_CWORD}" -eq 1 ]; then
+        __dh_compgen "add list delete move-to-main"
+    fi
+    return 0
+}
+complete -F _git-worktree git-worktree

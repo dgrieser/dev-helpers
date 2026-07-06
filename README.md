@@ -5,12 +5,17 @@ Collection of git helper scripts for everyday workflows across GitHub and GitLab
 ## Install
 
 ```bash
-sudo make install            # copy scripts to /usr/local/bin
-sudo make install-links      # symlink scripts back to this repo
+sudo make install            # copy scripts to /usr/local/bin and bash completions
+sudo make install-links      # symlink scripts and completions back to this repo
 sudo make uninstall          # remove installed files
 make list                    # show targets and available commands
 make list-install            # show install destination
 ```
+
+Bash completions (`completions/dev-helpers`) are installed to
+`/usr/local/share/bash-completion/completions`, one entry per command, so
+bash-completion lazy-loads them on first tab. Flags, subcommands, and
+contextual values (branches, tags, projects, changed files) are completed.
 
 ## Tools
 
