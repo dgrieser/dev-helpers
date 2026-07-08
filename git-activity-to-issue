@@ -691,6 +691,33 @@ mutation createTimelog(
     return result
 
 
+def confirm_retry_missing_issue(summary: str, url: str | None) -> bool:
+    """Prompt on the tty to retry resolving a missing issue. True = retry."""
+    location = f" ({url})" if url else ""
+    try:
+        with open("/dev/tty", "w", encoding="utf-8") as tty_out, open(
+            "/dev/tty", "r", encoding="utf-8"
+        ) as tty_in:
+            print(file=tty_out)
+            print(f"No issue found for {summary}{location}", file=tty_out)
+            while True:
+                print(
+                    "Fix the reference in GitLab, then answer. [r]etry / [s]kip: ",
+                    end="",
+                    file=tty_out,
+                    flush=True,
+                )
+                answer = tty_in.readline().strip().lower()
+                if answer in ("r", "retry"):
+                    return True
+                if answer in ("s", "skip", ""):
+                    return False
+                print("Please answer 'r' (retry) or 's' (skip).", file=tty_out)
+    except OSError:
+        warning("--interactive requires a tty; skipping retry prompt")
+        return False
+
+
 def confirm_time_spent_booking(booking_preview: str) -> bool:
     if not booking_preview:
         return True
@@ -1320,6 +1347,18 @@ def resolve_event(api: GitLabApi, event: dict[str, Any]) -> list[IssueRef]:
     return []
 
 
+def is_ignorable_event(event: dict[str, Any]) -> bool:
+    """True for project meta events (created, joined, ...) with no linkable data.
+
+    Push events carry push_data (branch/commit) and stay; bare project-level
+    events like "created project" have nothing an issue can be resolved from.
+    """
+    if event.get("target_type") != "Project":
+        return False
+    push_data = event.get("push_data")
+    return not (isinstance(push_data, dict) and push_data)
+
+
 def summarize_event(
     event: dict[str, Any],
     issues: list[IssueRef],
@@ -1389,6 +1428,12 @@ def main() -> int:
     try:
         verbose_log(args.verbose, f"resolving {len(events)} events")
         for event in events:
+            if is_ignorable_event(event):
+                verbose_log(
+                    args.verbose,
+                    f"activity={event.get('id')} skipped: no linkable project data",
+                )
+                continue
             url = warning_url(api, event)
             if url_is_filtered(url, args.filter):
                 verbose_log(
@@ -1398,23 +1443,37 @@ def main() -> int:
                 continue
             issues: list[IssueRef] = []
             error: str | None = None
-            try:
-                issues = resolve_event(api, event)
-            except RuntimeError as exc:
-                error = str(exc)
-                verbose_log(args.verbose, f"activity={event.get('id')} error={error}")
-            else:
-                issue_ids = ", ".join(
-                    f"{issue.project_id}#{issue.iid}" for issue in issues
-                )
+            while True:
+                issues = []
+                error = None
+                try:
+                    issues = resolve_event(api, event)
+                except RuntimeError as exc:
+                    error = str(exc)
+                    verbose_log(
+                        args.verbose, f"activity={event.get('id')} error={error}"
+                    )
+                else:
+                    issue_ids = ", ".join(
+                        f"{issue.project_id}#{issue.iid}" for issue in issues
+                    )
+                    verbose_log(
+                        args.verbose,
+                        f"activity={event.get('id')} issues=[{issue_ids}]",
+                    )
+                if error or issues:
+                    break
+                summary = activity_summary(event)
+                if not args.interactive:
+                    url_suffix = f" ({url})" if url else ""
+                    warning(f"No issue found for {summary}{url_suffix}")
+                    break
+                if not confirm_retry_missing_issue(summary, url):
+                    break
+                api.cache.clear()
                 verbose_log(
                     args.verbose,
-                    f"activity={event.get('id')} issues=[{issue_ids}]",
-                )
-            if not error and not issues:
-                url_suffix = f" ({url})" if url else ""
-                warning(
-                    f"No issue found for {activity_summary(event)}{url_suffix}"
+                    f"activity={event.get('id')} retrying after cache clear",
                 )
             working_block = (
                 working_block_for_event(event, args.time_spent_slot_minutes)
