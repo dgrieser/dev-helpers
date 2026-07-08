@@ -1353,12 +1353,12 @@ def is_ignorable_event(event: dict[str, Any]) -> bool:
     Branch pushes carry push_data and stay. Dropped: bare project-level events
     like "created project" (no push_data), tag pushes (release tags are not
     per-issue work), branch deletions (nothing left to resolve), and merge
-    request "accepted" events (the merge itself, work already booked elsewhere).
+    request "accepted"/"approved" events (work already booked elsewhere).
     """
     target_type = event.get("target_type")
     action_name = str(event.get("action_name") or "")
     if target_type == "MergeRequest":
-        return "accepted" in action_name
+        return "accepted" in action_name or "approved" in action_name
     if target_type != "Project":
         return False
     push_data = event.get("push_data")
