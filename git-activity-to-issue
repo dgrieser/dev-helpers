@@ -1348,15 +1348,26 @@ def resolve_event(api: GitLabApi, event: dict[str, Any]) -> list[IssueRef]:
 
 
 def is_ignorable_event(event: dict[str, Any]) -> bool:
-    """True for project meta events (created, joined, ...) with no linkable data.
+    """True for events with no useful issue link.
 
-    Push events carry push_data (branch/commit) and stay; bare project-level
-    events like "created project" have nothing an issue can be resolved from.
+    Branch pushes carry push_data and stay. Dropped: bare project-level events
+    like "created project" (no push_data), tag pushes (release tags are not
+    per-issue work), branch deletions (nothing left to resolve), and merge
+    request "accepted" events (the merge itself, work already booked elsewhere).
     """
-    if event.get("target_type") != "Project":
+    target_type = event.get("target_type")
+    action_name = str(event.get("action_name") or "")
+    if target_type == "MergeRequest":
+        return "accepted" in action_name
+    if target_type != "Project":
         return False
     push_data = event.get("push_data")
-    return not (isinstance(push_data, dict) and push_data)
+    if not (isinstance(push_data, dict) and push_data):
+        return True
+    ref_type = str(push_data.get("ref_type") or "")
+    if ref_type == "tag":
+        return True
+    return ref_type == "branch" and "deleted" in action_name
 
 
 def summarize_event(
