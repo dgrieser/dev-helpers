@@ -11,6 +11,7 @@ Create, list, or move mirrored git worktree changes back to WORKSPACE.
 Commands:
   add                   Add mirrored worktree for BRANCH at:
     WORKSPACE_WORKTREE/<path under WORKSPACE>/BRANCH
+    If BRANCH does not exist, ask before creating it.
   list                  List worktrees for the resolved workspace repository
   delete                Delete the resolved mirrored worktree and print its main dir
   move-to-main          Move uncommitted changes from a mirrored worktree to its main tree
@@ -167,6 +168,10 @@ validate_branch_name() {
         fail "Invalid branch name: ${1}"
 }
 
+branch_exists() {
+    git -C "${workdir}" show-ref --verify --quiet "refs/heads/${1}"
+}
+
 resolve_branch() {
     if [ -n "${branch_arg}" ]; then
         branch="${branch_arg}"
@@ -249,6 +254,7 @@ target_path_for() {
 
 add_worktree() {
     target="$(target_path_for "${branch}")"
+    create_branch=0
 
     if [ -e "${target}" ]; then
         if [ -d "${target}" ] &&
@@ -265,10 +271,20 @@ add_worktree() {
         fail "Target exists and is not a git worktree: ${target}"
     fi
 
+    if ! branch_exists "${branch}"; then
+        prompt-yes-no "Branch ${branch} does not exist. Create it?" || abort
+        create_branch=1
+    fi
+
     mkdir -p "$(dirname "${target}")" ||
         fail "Cannot create parent dir for target: ${target}"
-    git -C "${workdir}" worktree add --force --quiet "${target}" "${branch}" >/dev/null ||
-        fail "git worktree add failed"
+    if [ "${create_branch}" = "1" ]; then
+        git -C "${workdir}" worktree add --force --quiet -b "${branch}" "${target}" >/dev/null ||
+            fail "git worktree add failed"
+    else
+        git -C "${workdir}" worktree add --force --quiet "${target}" "${branch}" >/dev/null ||
+            fail "git worktree add failed"
+    fi
     echo "${target}"
 }
 
