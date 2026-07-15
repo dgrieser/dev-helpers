@@ -34,6 +34,72 @@ abort() {
     exit 1
 }
 
+repository_from_url() {
+    local url="${1}"
+    local repository
+
+    url="${url%/}"
+    url="${url%.git}"
+    case "${url}" in
+        *://*)
+            repository="${url#*://}"
+            repository="${repository#*@}"
+            ;;
+        *@*:*)
+            repository="${url#*@}"
+            repository="${repository/:/\/}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    [ "${repository}" = "${repository#*/}" ] && return 1
+    echo "${repository}"
+}
+
+select_repository() {
+    local default_repository
+    local remote
+    local repository
+    local choice
+    local existing
+    local duplicate
+    local repositories=()
+
+    while IFS= read -r remote; do
+        repository="$(repository_from_url "$(git remote get-url "${remote}")")" || continue
+        if [ -n "$(git config --get "remote.${remote}.gh-resolved")" ]; then
+            default_repository="${repository}"
+        fi
+        duplicate=0
+        for existing in "${repositories[@]}"; do
+            [ "${existing}" = "${repository}" ] && duplicate=1 && break
+        done
+        [ "${duplicate}" -eq 0 ] && repositories+=("${repository}")
+    done < <(git remote)
+
+    [ "${#repositories[@]}" -eq 0 ] && fail "Failed to determine GitHub repository"
+    if [ -n "${default_repository}" ]; then
+        echo "${default_repository}"
+        return 0
+    fi
+    if [ "${#repositories[@]}" -eq 1 ]; then
+        echo "${repositories[0]}"
+        return 0
+    fi
+
+    echo "Select repository:" 1>&2
+    for choice in "${!repositories[@]}"; do
+        printf '  %d) %s\n' "$((choice + 1))" "${repositories[choice]}" 1>&2
+    done
+    choice="$(prompt-input "Choice [1-${#repositories[@]}]: ")" || return 1
+    [[ "${choice}" =~ ^[0-9]+$ ]] || fail "Invalid repository choice: ${choice}"
+    [ "${choice}" -ge 1 ] && [ "${choice}" -le "${#repositories[@]}" ] \
+        || fail "Invalid repository choice: ${choice}"
+    echo "${repositories[choice - 1]}"
+}
+
 prompt_pr_id() {
     local pr
     pr="$(prompt-input "Choose PR:")"
@@ -45,6 +111,7 @@ prompt_pr_id() {
 
 run_approve_merge_flow() {
     local pr_id="${1}"
+    local repository="${2}"
     local action
 
     cat <<EOF
@@ -58,14 +125,14 @@ EOF
     echo
     case "${action}" in
         1)
-            gh pr review "${pr_id}" --approve || fail "Failed to approve PR #${pr_id}"
-            gh pr merge "${pr_id}" || fail "Failed to merge PR #${pr_id}"
+            gh pr review "${pr_id}" --repo "${repository}" --approve || fail "Failed to approve PR #${pr_id}"
+            gh pr merge "${pr_id}" --repo "${repository}" || fail "Failed to merge PR #${pr_id}"
             ;;
         2)
-            gh pr review "${pr_id}" --approve || fail "Failed to approve PR #${pr_id}"
+            gh pr review "${pr_id}" --repo "${repository}" --approve || fail "Failed to approve PR #${pr_id}"
             ;;
         3)
-            gh pr merge "${pr_id}" || fail "Failed to merge PR #${pr_id}"
+            gh pr merge "${pr_id}" --repo "${repository}" || fail "Failed to merge PR #${pr_id}"
             ;;
         4)
             ;;
@@ -90,8 +157,23 @@ commit-to-title() {
 show_feedback() {
     local id="${1}"
     local raw="${2}"
+    local repository="${3}"
+    local repository_path="${repository}"
+    local hostname="github.com"
+    local owner
+    local name
+    local api_args=()
+
+    if [[ "${repository_path}" == */*/* ]]; then
+        hostname="${repository_path%%/*}"
+        repository_path="${repository_path#*/}"
+    fi
+    owner="${repository_path%%/*}"
+    name="${repository_path#*/}"
+    [ "${hostname}" != "github.com" ] && api_args+=("--hostname" "${hostname}")
+
     # shellcheck disable=SC2016
-    PR_BASE_JSON="$(gh api graphql -f query='
+    PR_BASE_JSON="$(gh api graphql "${api_args[@]}" -f query='
       query($owner: String!, $repo: String!, $pr: Int!) {
         repository(owner: $owner, name: $repo) {
           pullRequest(number: $pr) {
@@ -116,7 +198,7 @@ show_feedback() {
           }
         }
       }
-    ' -F owner=':owner' -F repo=':repo' -F pr="${id}")" \
+    ' -F owner="${owner}" -F repo="${name}" -F pr="${id}")" \
     || fail "Failed to fetch pull request metadata"
 
     UNRESOLVED_THREAD_IDS="$(echo "${PR_BASE_JSON}" | jq -r '
@@ -131,7 +213,7 @@ show_feedback() {
             while IFS= read -r THREAD_ID; do
                 [ -z "${THREAD_ID}" ] && continue
                 # shellcheck disable=SC2016
-                gh api graphql -f query='
+                gh api graphql "${api_args[@]}" -f query='
                   query($id: ID!) {
                     node(id: $id) {
                       ... on PullRequestReviewThread {
@@ -298,6 +380,7 @@ done
 # use current branch if not specified
 [ -z "${branch}" ] && branch="$(git branch --show-current)"
 [ "${raw}" -eq 1 ] && [ "${feedback}" -eq 0 ] && fail "-r/--raw requires --feedback"
+repository="$(select_repository)" || abort
 
 if [ "${create}" -eq 1 ]; then
     last_commit_message="$(commit-to-title)"
@@ -306,18 +389,18 @@ if [ "${create}" -eq 1 ]; then
     title="$(prompt-input "Title:" "${prompt_args[@]}")" || abort
     [ -z "${title}" ] && abort
     draft="$(prompt-no-yes "Draft?" && echo 1 || echo 0)"
-    gh_args=( "--head" "${branch}" "--title" "${title}" )
+    gh_args=( "--repo" "${repository}" "--head" "${branch}" "--title" "${title}" )
     [ "${draft}" -eq 1 ] && gh_args+=( "--draft" )
     gh pr create "${gh_args[@]}" || fail "Failed to create pull request"
 else
-    gh pr list --state open --head "${branch}" 1>&2 || fail "Failed to list pull requests"
+    gh pr list --repo "${repository}" --state open --head "${branch}" 1>&2 || fail "Failed to list pull requests"
     echo 1>&2
     id="$(prompt_pr_id)" || abort
     echo 1>&2
 
     if [ "${feedback}" -eq 0 ]; then
-        run_approve_merge_flow "${id}"
+        run_approve_merge_flow "${id}" "${repository}"
     else
-        show_feedback "${id}" "${raw}"
+        show_feedback "${id}" "${raw}" "${repository}"
     fi
 fi
