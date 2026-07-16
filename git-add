@@ -403,7 +403,11 @@ case "${mode}" in
             cmd="$(echo "${post_command}" | head -n 1)"
             # read line by line into an array
             readarray -t args < <(echo "${post_command}" | tail -n +2)
-            exec ${cmd} "${args[@]}"
+            "${cmd}" "${args[@]}"
+
+            restart_args=()
+            [ -n "${query}" ] && restart_args+=(--query "${query}")
+            exec "${0}" "${restart_args[@]}" -- "${paths[@]}"
         fi
         ;;
     print)
