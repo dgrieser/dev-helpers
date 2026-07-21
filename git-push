@@ -55,7 +55,7 @@ git_dir="$(git rev-parse --show-toplevel)" || fail
 BRANCH_SHORT="${BRANCH}"
 BRANCH_FQ="$(git -C "${git_dir}" show-ref --heads "${BRANCH}" | awk '{print $2}')"
 if [ -n "${BRANCH_FQ}" ]; then
-    BRANCH_SHORT="${BRANCH_FQ##*/}"
+    BRANCH_SHORT="${BRANCH_FQ#refs/heads/}"
     BRANCH="${BRANCH_FQ}"
 fi
 
@@ -82,6 +82,7 @@ fi
 [ "${ok}" -ne 1 ] && abort
 if [ "${PUSH_FORCE_WITH_LEASE}" -eq 0 ]; then
     remote_ref="refs/remotes/origin/${BRANCH_SHORT}"
+    git -C "${git_dir}" fetch -q origin "${BRANCH_SHORT}" 2>/dev/null
     if git -C "${git_dir}" rev-parse -q --verify "${BRANCH}" >/dev/null && \
        git -C "${git_dir}" rev-parse -q --verify "${remote_ref}" >/dev/null && \
        ! git -C "${git_dir}" merge-base --is-ancestor "${remote_ref}" "${BRANCH}"; then
