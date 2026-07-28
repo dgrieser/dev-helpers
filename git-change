@@ -79,8 +79,8 @@ fi
 
 echo "Branch: ${branch}" 1>&2
 
-git-diff
-echo
+#git-diff
+#echo
 
 
 prompt-continue-yes "Create branch \"${branch}\"?" || abort
