@@ -319,10 +319,10 @@ _git-pipe()
             __dh_compgen "$(__dh_all_branches) $(__dh_tags)"
             return 0 ;;
         --source)
-            __dh_compgen "push trigger schedule web api merge_request_event pipeline parent_pipeline external"
+            __dh_compgen "push trigger schedule web api merge_request_event pipeline parent_pipeline external pull_request workflow_dispatch repository_dispatch workflow_run"
             return 0 ;;
         -s|--status)
-            __dh_compgen "created waiting_for_resource preparing pending running success failed canceled skipped manual scheduled"
+            __dh_compgen "created waiting_for_resource preparing pending queued requested waiting running in_progress completed success failed failure canceled cancelled skipped manual action_required neutral timed_out scheduled"
             return 0 ;;
         -o|--output)
             __dh_compgen "txt json"

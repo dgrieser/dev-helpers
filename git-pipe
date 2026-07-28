@@ -8,7 +8,7 @@ usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} COMMAND [OPTIONS]
 
-Show and search GitLab CI pipeline information for a repository.
+Show and search GitLab CI or GitHub Actions pipeline information for a repository.
 
 COMMAND
     status                  show CI pipeline status for a ref
@@ -20,8 +20,8 @@ Options:
         --ref <REF>         ref to filter by (status: prompts if omitted)
 
 search options:
-        --var <NAME[=VALUE]>  pipeline has variable NAME (optionally equal to VALUE);
-                              repeatable, all must match
+        --var <NAME[=VALUE]>  GitLab pipeline has variable NAME (optionally equal to VALUE);
+                              repeatable, all must match (unsupported on GitHub)
         --grep <PATTERN>      keep pipelines whose job logs match PATTERN (extended regex, case-insensitive)
         --source <SOURCE>     filter by pipeline source (push, trigger, schedule, web, api, ...)
     -s|--status <STATUS>      filter by raw status (repeatable)
@@ -80,6 +80,72 @@ project_id() {
     printf '%s\n' "${PROJECT_ID}"
 }
 
+repository_from_url() {
+    local url="${1}"
+    local repository
+
+    url="${url%/}"
+    url="${url%.git}"
+    case "${url}" in
+        *://*)
+            repository="${url#*://}"
+            repository="${repository#*@}"
+            repository="${repository#*/}"
+            ;;
+        *@*:*)
+            repository="${url#*:}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    [ "${repository}" = "${repository#*/}" ] && return 1
+    printf '%s\n' "${repository}"
+}
+
+host_from_url() {
+    local url="${1}"
+    local host
+
+    case "${url}" in
+        *://*)
+            host="${url#*://}"
+            host="${host%%/*}"
+            host="${host#*@}"
+            ;;
+        *@*:*)
+            host="${url#*@}"
+            host="${host%%:*}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    printf '%s\n' "${host}"
+}
+
+detect_provider() {
+    local remote_url="${1}"
+    local host
+
+    host="$(host_from_url "${remote_url}")" || fail "failed to determine remote host"
+    if [[ "${host}" == *github* ]] \
+        || [ -n "$(git config --get remote.origin.gh-resolved 2>/dev/null)" ]; then
+        provider="github"
+        github_repository="$(repository_from_url "${remote_url}")" \
+            || fail "failed to determine GitHub repository"
+        github_repo_selector="${github_repository}"
+        github_api_args=()
+        if [ "${host}" != "github.com" ]; then
+            github_api_args+=("--hostname" "${host}")
+            github_repo_selector="${host}/${github_repository}"
+        fi
+    else
+        provider="gitlab"
+    fi
+}
+
 cmd_status() {
     local current tags branches
 
@@ -95,11 +161,16 @@ cmd_status() {
         ref="$(prompt-input "Choose ref" --default "${current}")"
     fi
 
-    glab ci status --branch "${ref}"
+    if [ "${provider}" = "github" ]; then
+        gh run list --repo "${github_repo_selector}" --branch "${ref}"
+    else
+        glab ci status --branch "${ref}"
+    fi
 }
 
-list_pipelines_json() {
-    local base="projects/$(project_id)/pipelines"
+list_gitlab_pipelines_json() {
+    local base
+    base="projects/$(project_id)/pipelines"
     local common=("per_page=${per_page}" "order_by=id" "sort=desc")
     [ -n "${ref}" ] && common+=("ref=$(urlenc "${ref}")")
     [ -n "${source}" ] && common+=("source=$(urlenc "${source}")")
@@ -128,7 +199,67 @@ list_pipelines_json() {
     jq 'unique_by(.id) | sort_by(.id) | reverse' <<< "${out}"
 }
 
-match_vars() {
+github_status() {
+    case "${1}" in
+        failed)    echo "failure" ;;
+        canceled)  echo "cancelled" ;;
+        running)   echo "in_progress" ;;
+        manual)    echo "action_required" ;;
+        *)         echo "${1}" ;;
+    esac
+}
+
+list_github_pipelines_json() {
+    local base="repos/${github_repository}/actions/runs"
+    local common=("per_page=${per_page}")
+    [ -n "${ref}" ] && common+=("branch=$(urlenc "${ref}")")
+    [ -n "${source}" ] && common+=("event=$(urlenc "${source}")")
+
+    local page_flag=()
+    [ "${paginate}" -eq 1 ] && page_flag+=("--paginate")
+
+    local out="[]" part qs s mapped_status
+    TRUNCATED=0
+    if [ "${#statuses[@]}" -eq 0 ]; then
+        qs="$(build_qs "${common[@]}")"
+        part="$(gh api "${github_api_args[@]}" "${page_flag[@]}" "${base}${qs}")" || return 1
+        part="$(jq -s '[.[].workflow_runs[]]' <<< "${part}")"
+        [ "${paginate}" -eq 0 ] && [ "$(jq 'length' <<< "${part}")" -ge "${per_page}" ] && TRUNCATED=1
+        out="${part}"
+    else
+        for s in "${statuses[@]}"; do
+            mapped_status="$(github_status "${s}")"
+            qs="$(build_qs "${common[@]}" "status=$(urlenc "${mapped_status}")")"
+            part="$(gh api "${github_api_args[@]}" "${page_flag[@]}" "${base}${qs}")" || return 1
+            part="$(jq -s '[.[].workflow_runs[]]' <<< "${part}")"
+            [ "${paginate}" -eq 0 ] && [ "$(jq 'length' <<< "${part}")" -ge "${per_page}" ] && TRUNCATED=1
+            out="$(jq -s 'add' <(echo "${out}") <(echo "${part}"))"
+        done
+    fi
+    jq '
+        unique_by(.id)
+        | sort_by(.id)
+        | reverse
+        | map({
+            id,
+            status: (if .status == "completed" then (.conclusion // .status) else .status end),
+            source: .event,
+            ref: .head_branch,
+            created_at,
+            web_url: .html_url
+        })
+    ' <<< "${out}"
+}
+
+list_pipelines_json() {
+    if [ "${provider}" = "github" ]; then
+        list_github_pipelines_json
+    else
+        list_gitlab_pipelines_json
+    fi
+}
+
+match_gitlab_vars() {
     local pid="${1}"
     local vars_json spec key val
 
@@ -146,7 +277,7 @@ match_vars() {
     return 0
 }
 
-match_grep() {
+match_gitlab_grep() {
     local pid="${1}"
     local jobs_json job_id trace
 
@@ -159,6 +290,14 @@ match_grep() {
         grep -qiE -- "${grep_pattern}" <<< "${trace}" && return 0
     done < <(jq -r '.[].id' <<< "${jobs_json}")
     return 1
+}
+
+match_github_grep() {
+    local run_id="${1}"
+    local logs
+
+    logs="$(gh run view "${run_id}" --repo "${github_repo_selector}" --log 2>/dev/null)" || return 1
+    grep -qiE -- "${grep_pattern}" <<< "${logs}"
 }
 
 print_pipelines() {
@@ -181,6 +320,9 @@ cmd_search() {
     local pipelines pid
     local matched_ids=()
 
+    [ "${provider}" = "github" ] && [ "${#var_specs[@]}" -gt 0 ] \
+        && fail "--var is not supported for GitHub Actions"
+
     pipelines="$(list_pipelines_json)" || fail "failed to list pipelines"
 
     [ "${TRUNCATED}" -eq 1 ] \
@@ -190,8 +332,14 @@ cmd_search() {
 
     while IFS= read -r pid; do
         [ -z "${pid}" ] && continue
-        [ "${#var_specs[@]}" -gt 0 ] && { match_vars "${pid}" || continue; }
-        [ -n "${grep_pattern}" ] && { match_grep "${pid}" || continue; }
+        [ "${#var_specs[@]}" -gt 0 ] && { match_gitlab_vars "${pid}" || continue; }
+        if [ -n "${grep_pattern}" ]; then
+            if [ "${provider}" = "github" ]; then
+                match_github_grep "${pid}" || continue
+            else
+                match_gitlab_grep "${pid}" || continue
+            fi
+        fi
         matched_ids+=("${pid}")
     done < <(jq -r '.[].id' <<< "${pipelines}")
 
@@ -202,10 +350,13 @@ cmd_search() {
 }
 
 need_cmd git
-need_cmd glab
 
 action=""
 repo=""
+provider=""
+github_repository=""
+github_repo_selector=""
+github_api_args=()
 ref=""
 source=""
 grep_pattern=""
@@ -305,6 +456,14 @@ if [ -n "${repo}" ]; then
     cded=1
 fi
 
+remote_url="$(git remote get-url origin)" || fail "failed to determine origin remote"
+detect_provider "${remote_url}"
+if [ "${provider}" = "github" ]; then
+    need_cmd gh
+else
+    need_cmd glab
+fi
+
 case "${action}" in
     status)
         cmd_status
@@ -318,5 +477,7 @@ case "${action}" in
 esac
 exit_code=$?
 
-[ "${cded}" -eq 1 ] && cd - &> /dev/null
+if [ "${cded}" -eq 1 ]; then
+    cd - &> /dev/null || fail "failed to return to previous directory"
+fi
 exit "${exit_code}"

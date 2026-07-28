@@ -151,7 +151,7 @@ git-package <check|list|delete> [ID] [-n <name>] [-v <version>] [-o txt|json]
 ```
 
 ### git-pipe
-Show CI pipeline status for a ref, or search pipelines by trigger variable, log content, or status.
+Show GitLab CI or GitHub Actions pipeline status for a ref, or search pipelines by log content, source, or status. Variable search is GitLab-only.
 ```bash
 git-pipe status [-r <project>] [--ref <ref>]
 git-pipe search [-r <project>] [--ref <ref>] [--var <NAME[=VALUE]>] [--grep <pattern>] \
