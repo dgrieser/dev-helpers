@@ -103,3 +103,5 @@ if [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ]; then
 else
     git -C "${git_dir}" push -u origin "${BRANCH}"
 fi
+
+git-pipe status
