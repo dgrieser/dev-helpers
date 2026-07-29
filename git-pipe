@@ -4,11 +4,19 @@ APP_NAME="$(basename "${0}")"
 
 PER_PAGE_DEFAULT=20
 
+NL=$'\n'
+HEADER="ID  STATUS  SOURCE  REF  CREATED  URL"
+KEYS="ctrl-o,ctrl-j,ctrl-l,esc,ctrl-c,ctrl-d,enter"
+KEY_DESCS="enter:copy url,ctrl-o:open in browser,ctrl-j:jobs,ctrl-l:logs"
+KEY_DESCS_HELP="enter copy url, ctrl-o open in browser, ctrl-j jobs, ctrl-l logs"
+
 usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} COMMAND [OPTIONS]
 
 Show and search GitLab CI or GitHub Actions pipeline information for a repository.
+
+Results are shown in an interactive picker (keys: ${KEY_DESCS_HELP}).
 
 COMMAND
     status                  show CI pipeline status for a ref
@@ -17,9 +25,12 @@ COMMAND
 Options:
     -h|--help               show this help
     -r|--repo <PROJECT>     project to operate on (default: current directory)
-        --ref <REF>         ref to filter by (status: prompts if omitted)
+        --ref <REF>         ref to filter by (default: current branch)
+    -q|--query <QUERY>      start the picker with a search query
+    -p|--print              print the result table instead of opening the picker
 
 search options:
+        --all-refs            do not filter by ref (search all refs)
         --var <NAME[=VALUE]>  GitLab pipeline has variable NAME (optionally equal to VALUE);
                               repeatable, all must match (unsupported on GitHub)
         --grep <PATTERN>      keep pipelines whose job logs match PATTERN (extended regex, case-insensitive)
@@ -147,25 +158,7 @@ detect_provider() {
 }
 
 cmd_status() {
-    local current tags branches
-
-    current="$(git rev-parse --abbrev-ref HEAD)"
-
-    if [ -z "${ref}" ]; then
-        need_cmd prompt-input
-        tags="$(git ls-remote --tags -q | sort -k2 -V | tail -n 5 | sed -E 's|^.+/tags/||')"
-        branches="$(git ls-remote --heads -q | sed -E 's|^.+/heads/||')"
-        echo "${branches}"
-        echo "${tags}"
-        echo
-        ref="$(prompt-input "Choose ref" --default "${current}")"
-    fi
-
-    if [ "${provider}" = "github" ]; then
-        gh run list --repo "${github_repo_selector}" --branch "${ref}"
-    else
-        glab ci status --branch "${ref}"
-    fi
+    list_pipelines_json || fail "failed to list pipelines"
 }
 
 list_gitlab_pipelines_json() {
@@ -300,23 +293,196 @@ match_github_grep() {
     grep -qiE -- "${grep_pattern}" <<< "${logs}"
 }
 
+JQ_STATUS_COLOR='
+    def statuscolor:
+        if . == "success" or . == "passed" then "\u001b[32m"
+        elif . == "failed" or . == "failure" or . == "timed_out" then "\u001b[31m"
+        elif . == "running" or . == "in_progress" or . == "pending" or . == "queued"
+            or . == "waiting" or . == "created" or . == "preparing" then "\u001b[33m"
+        elif . == "manual" or . == "action_required" then "\u001b[35m"
+        elif . == "canceled" or . == "cancelled" or . == "skipped" or . == "neutral" then "\u001b[90m"
+        else "" end;
+    def colored: (. // "-") as $s | ($s | statuscolor) + $s + "\u001b[0m";
+    # k-format only turns timestamps without fractional seconds into an age
+    def ts: (. // "-") | sub("\\.[0-9]+(?=(Z|[+-]))"; "");
+'
+
+print_table() {
+    local header="${1}"
+    local rows="${2}"
+
+    if [ -z "${rows}" ]; then
+        printf '%s\n' "${header}" | k-format
+        return 0
+    fi
+    printf '%s\n' "${header}${NL}${rows}" | k-format
+}
+
 print_pipelines() {
     local json="${1}"
+    local rows
 
     if [ "${output}" = "json" ]; then
         echo "${json}"
         return 0
     fi
-    jq -r '
-        (["ID", "STATUS", "SOURCE", "REF", "CREATED", "URL"] | @tsv),
-        (.[] | [(.id | tostring), .status, .source, .ref, .created_at, .web_url] | @tsv)
-    ' <<< "${json}" | column -t -s "$(printf '\t')"
+    rows="$(jq -r "${JQ_STATUS_COLOR}"'
+        .[] | [
+            (.id | tostring),
+            (.status | colored),
+            (.source // "-"),
+            (.ref // "-"),
+            (.created_at | ts),
+            (.web_url // "-")
+        ] | join("  ")
+    ' <<< "${json}")"
+    print_table "${HEADER}" "${rows}"
+}
+
+list_gitlab_jobs_json() {
+    local pid="${1}"
+    local jobs
+
+    jobs="$(glab api "projects/$(project_id)/pipelines/${pid}/jobs" --paginate 2>/dev/null)" || return 1
+    jq -s '
+        add // []
+        | sort_by(.id)
+        | map({name, stage, status, created_at: (.started_at // .created_at), web_url})
+    ' <<< "${jobs}"
+}
+
+list_github_jobs_json() {
+    local rid="${1}"
+    local jobs
+
+    jobs="$(gh api "${github_api_args[@]}" --paginate \
+        "repos/${github_repository}/actions/runs/${rid}/jobs?per_page=100" 2>/dev/null)" || return 1
+    jq -s '
+        [.[].jobs[]]
+        | sort_by(.id)
+        | map({
+            name,
+            stage: (.workflow_name // "-"),
+            status: (if .status == "completed" then (.conclusion // .status) else .status end),
+            created_at: (.started_at // .created_at),
+            web_url: .html_url
+        })
+    ' <<< "${jobs}"
+}
+
+show_jobs() {
+    local pid="${1}"
+    local json rows
+
+    if [ "${provider}" = "github" ]; then
+        json="$(list_github_jobs_json "${pid}")" || { echo "failed to list jobs for ${pid}"; return 1; }
+    else
+        json="$(list_gitlab_jobs_json "${pid}")" || { echo "failed to list jobs for ${pid}"; return 1; }
+    fi
+
+    rows="$(jq -r "${JQ_STATUS_COLOR}"'
+        .[] | [
+            (.status | colored),
+            (.stage // "-"),
+            (.name // "-"),
+            (.created_at | ts)
+        ] | join("  ")
+    ' <<< "${json}")"
+    local stage_header="STAGE"
+    [ "${provider}" = "github" ] && stage_header="WORKFLOW"
+    print_table "STATUS  ${stage_header}  NAME  STARTED" "${rows}"
+}
+
+show_logs() {
+    local pid="${1}"
+    local jobs_json job_id job_name
+
+    if [ "${provider}" = "github" ]; then
+        gh run view "${pid}" --repo "${github_repo_selector}" --log 2>&1 | less -R
+        return 0
+    fi
+
+    jobs_json="$(glab api "projects/$(project_id)/pipelines/${pid}/jobs" --paginate 2>/dev/null)" \
+        || fail "failed to list jobs for ${pid}"
+    {
+        while IFS=$'\t' read -r job_id job_name; do
+            [ -z "${job_id}" ] && continue
+            printf '\n\033[1m===== %s (job %s) =====\033[0m\n' "${job_name}" "${job_id}"
+            glab api "projects/$(project_id)/jobs/${job_id}/trace" 2>/dev/null
+        done < <(jq -rs 'add // [] | sort_by(.id) | .[] | [(.id | tostring), .name] | @tsv' <<< "${jobs_json}")
+    } | less -R
+}
+
+open_url() {
+    local url="${1}"
+
+    [ -z "${url}" ] && fail "no URL for the selected pipeline"
+    need_cmd gio
+    gio open "${url}" &>/dev/null
+}
+
+handle_key() {
+    local key line pid url
+
+    key="$(head -n 1 <<< "${key_result}")"
+    line="$(tail -n 1 <<< "${key_result}")"
+    pid="$(awk '{print $1}' <<< "${line}")"
+    url="$(awk '{print $NF}' <<< "${line}")"
+
+    case "${key}" in
+        enter)
+            echo "${line}"
+            need_cmd clip
+            printf '%s' "${url}" | clip
+            exit 1
+            ;;
+        ctrl-o)
+            open_url "${url}"
+            exit 0
+            ;;
+        ctrl-j)
+            show_jobs "${pid}" | less -R
+            exit 0
+            ;;
+        ctrl-l)
+            show_logs "${pid}"
+            exit 0
+            ;;
+        esc|ctrl-c|ctrl-d)
+            exit 255
+            ;;
+        *)
+            fail "Unknown key: ${key}"
+            ;;
+    esac
+}
+
+write_state() {
+    {
+        printf 'provider=%q\n' "${provider}"
+        printf 'github_repository=%q\n' "${github_repository}"
+        printf 'github_repo_selector=%q\n' "${github_repo_selector}"
+        declare -p github_api_args
+        printf 'PROJECT_ID=%q\n' "${PROJECT_ID:-}"
+        printf 'repo_dir=%q\n' "${PWD}"
+    } > "${STATE_FILE}"
+}
+
+pick_pipelines() {
+    local json="${1}"
+
+    print_pipelines "${json}" | fzf-with-header --key-command "${APP_NAME} --id ${id} --key" \
+                                                --key-descriptions "${KEY_DESCS}" \
+                                                --columns 1,2,3,4,5 \
+                                                --command "${APP_NAME} --id ${id} --print" \
+                                                "${query}" \
+                                                --preview="${APP_NAME} --id ${id} --preview {1}" \
+                                                --preview-window=right:50%,wrap \
+                                                --expect="${KEYS}" \
+                                                --no-sort
 }
 
 cmd_search() {
-    need_cmd jq
-    need_cmd column
-
     local pipelines pid
     local matched_ids=()
 
@@ -346,7 +512,7 @@ cmd_search() {
     local ids_json
     ids_json="$(printf '%s\n' "${matched_ids[@]}" | jq -R 'select(length>0) | tonumber' | jq -s '.')"
 
-    print_pipelines "$(jq --argjson ids "${ids_json}" '[ .[] | select(.id as $i | $ids | index($i)) ]' <<< "${pipelines}")"
+    jq --argjson ids "${ids_json}" '[ .[] | select(.id as $i | $ids | index($i)) ]' <<< "${pipelines}"
 }
 
 need_cmd git
@@ -358,6 +524,7 @@ github_repository=""
 github_repo_selector=""
 github_api_args=()
 ref=""
+all_refs=0
 source=""
 grep_pattern=""
 output="txt"
@@ -366,6 +533,12 @@ paginate=0
 statuses=()
 var_specs=()
 TRUNCATED=0
+mode="list"
+id=$$
+id_given=0
+query=""
+key_result=""
+preview_id=""
 
 add_status() {
     statuses+=("${1}")
@@ -385,6 +558,35 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ -z "${1:-}" ] && error "Missing ref argument" && usage
             ref="${1}"
+            ;;
+        --all-refs)
+            all_refs=1
+            ;;
+        -q|--query)
+            shift
+            [ -z "${1:-}" ] && error "Missing query argument" && usage
+            query="${1}"
+            ;;
+        -p|--print)
+            mode="print"
+            ;;
+        --id)
+            shift
+            [ -z "${1:-}" ] && error "Missing id argument" && usage
+            id="${1}"
+            id_given=1
+            ;;
+        --key)
+            shift
+            [ -z "${1:-}" ] && error "Missing key argument" && usage
+            mode="key"
+            key_result="${1}"
+            ;;
+        --preview)
+            shift
+            [ -z "${1:-}" ] && error "Missing preview argument" && usage
+            mode="preview"
+            preview_id="${1}"
             ;;
         --var)
             shift
@@ -441,19 +643,65 @@ while [ "${#}" -gt 0 ]; do
     shift
 done
 
+need_cmd jq
+
+STATE_FILE="/tmp/${APP_NAME}-${id}.state"
+JSON_FILE="/tmp/${APP_NAME}-${id}.json"
+
+# --key, --preview and --print are called by the picker with the id of the run
+# that produced the result set; reuse its state and cached pipelines
+if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; then
+    # shellcheck source=/dev/null
+    . "${STATE_FILE}"
+    cd "${repo_dir}" || fail "failed to enter ${repo_dir}"
+    if [ "${provider}" = "github" ]; then
+        need_cmd gh
+    else
+        need_cmd glab
+    fi
+    case "${mode}" in
+        key)
+            handle_key
+            ;;
+        preview)
+            show_jobs "${preview_id}"
+            exit 0
+            ;;
+        print)
+            need_cmd k-format
+            print_pipelines "$(cat "${JSON_FILE}")"
+            exit 0
+            ;;
+    esac
+fi
+
+case "${mode}" in
+    key|preview)
+        fail "no cached pipeline result for id ${id}"
+        ;;
+esac
+
 [ -z "${action}" ] && error "Missing command" && usage
 
 if [ "${action}" = "status" ]; then
     { [ "${#statuses[@]}" -gt 0 ] || [ "${#var_specs[@]}" -gt 0 ] || [ -n "${grep_pattern}" ] || [ -n "${source}" ] \
-        || [ "${output}" != "txt" ] || [ "${paginate}" -eq 1 ] || [ "${per_page}" != "${PER_PAGE_DEFAULT}" ]; } \
+        || [ "${paginate}" -eq 1 ] || [ "${per_page}" != "${PER_PAGE_DEFAULT}" ] \
+        || [ "${all_refs}" -eq 1 ]; } \
         && error "Those options are only valid for 'search'" && usage
 fi
+
+[ "${all_refs}" -eq 1 ] && [ -n "${ref}" ] && error "--ref and --all-refs are mutually exclusive" && usage
 
 cded=0
 if [ -n "${repo}" ]; then
     need_cmd git-find-repo
     cd "$(git-find-repo "${repo}")" || abort
     cded=1
+fi
+
+if [ -z "${ref}" ] && [ "${all_refs}" -eq 0 ]; then
+    ref="$(git branch --show-current)"
+    [ -z "${ref}" ] && fail "failed to determine current branch (detached HEAD?); use --ref$([ "${action}" = "search" ] && echo " or --all-refs")"
 fi
 
 remote_url="$(git remote get-url origin)" || fail "failed to determine origin remote"
@@ -464,18 +712,39 @@ else
     need_cmd glab
 fi
 
+[ "${provider}" = "gitlab" ] && project_id >/dev/null
+
+pipelines=""
 case "${action}" in
     status)
-        cmd_status
+        pipelines="$(cmd_status)" || exit 1
         ;;
     search)
-        cmd_search
+        pipelines="$(cmd_search)" || exit 1
         ;;
     *)
         usage
         ;;
 esac
-exit_code=$?
+
+pipeline_count="$(jq 'length' <<< "${pipelines}")"
+
+exit_code=0
+if [ "${output}" = "json" ]; then
+    echo "${pipelines}"
+elif [ "${mode}" = "print" ] || [ ! -t 1 ] || [ "${pipeline_count}" -eq 0 ]; then
+    need_cmd k-format
+    [ "${pipeline_count}" -eq 0 ] && warning "no pipelines found"
+    print_pipelines "${pipelines}"
+else
+    need_cmd k-format
+    need_cmd fzf-with-header
+    trap 'rm -f "${STATE_FILE}" "${JSON_FILE}"' EXIT
+    printf '%s\n' "${pipelines}" > "${JSON_FILE}"
+    write_state
+    pick_pipelines "${pipelines}"
+    exit_code=$?
+fi
 
 if [ "${cded}" -eq 1 ]; then
     cd - &> /dev/null || fail "failed to return to previous directory"
