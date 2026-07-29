@@ -8,9 +8,9 @@ WATCH_FIRST_DELAY=10
 
 NL=$'\n'
 HEADER="ID  STATUS  SOURCE  REF  CREATED  URL"
-KEYS="ctrl-o,ctrl-j,ctrl-l,esc,ctrl-c,ctrl-d,enter"
-KEY_DESCS="enter:copy url,ctrl-o:open in browser,ctrl-j:jobs,ctrl-l:logs"
-KEY_DESCS_HELP="enter copy url, ctrl-o open in browser, ctrl-j jobs, ctrl-l logs"
+KEYS="ctrl-o,ctrl-l,esc,ctrl-c,ctrl-d,enter"
+KEY_DESCS="enter:copy url,ctrl-o:open,ctrl-l:logs"
+KEY_DESCS_HELP="enter copy url, ctrl-o open, ctrl-l logs"
 
 usage() {
     cat <<EOF 1>&2
@@ -444,10 +444,6 @@ handle_key() {
             ;;
         ctrl-o)
             open_url "${url}"
-            exit 0
-            ;;
-        ctrl-j)
-            show_jobs "${pid}" | less -R
             exit 0
             ;;
         ctrl-l)
