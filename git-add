@@ -38,8 +38,8 @@ MAGENTA='\e[35m'
 NC='\e[0m'
 
 HEADER="KEY\tTYPE\tPATH"
-KEYS="alt-+,alt--,alt-d,alt-r,alt-i,ctrl-d,ctrl-e,esc,ctrl-c,enter,del,insert,+,-"
-KEY_DESCS="+:stage,-:unstage,alt-d:delete,alt-r:reset,alt-i:ignore,ctrl-d:diff,ctrl-e:edit,del:unstage,insert:stage"
+KEYS="alt-+,alt--,alt-d,alt-r,alt-i,alt-v,ctrl-d,ctrl-e,esc,ctrl-c,enter,del,insert,+,-"
+KEY_DESCS="+:stage,-:unstage,alt-d:delete,alt-r:reset,alt-i:ignore,alt-v:vimdiff,ctrl-d:diff,ctrl-e:edit,del:unstage,insert:stage"
 
 print_diff() {
     local current_state="${1}"; shift
@@ -73,6 +73,17 @@ edit_file() {
     fi
     echo "vim" > "${POST_COMMAND_FILE}"
     echo "+${lineno}" >> "${POST_COMMAND_FILE}"
+    echo "${path}" >> "${POST_COMMAND_FILE}"
+    cat "${POST_COMMAND_FILE}" | tr '\n' ' ' | sed -E 's/^/+ /g ; s/ $/\n/' 1>&2
+}
+
+vimdiff_file() {
+    local path="${1}"; shift
+    # git-diff resolves the path against the repo root and handles the readonly
+    # side (HEAD version, or an empty file for untracked files).
+    echo "git-diff" > "${POST_COMMAND_FILE}"
+    echo "--vim" >> "${POST_COMMAND_FILE}"
+    echo "--path" >> "${POST_COMMAND_FILE}"
     echo "${path}" >> "${POST_COMMAND_FILE}"
     cat "${POST_COMMAND_FILE}" | tr '\n' ' ' | sed -E 's/^/+ /g ; s/ $/\n/' 1>&2
 }
@@ -259,6 +270,10 @@ if [ -n "${key_result}" ]; then
             ;;
         ctrl-e)
             edit_file "${current_state}" "${path}"
+            exit 1
+            ;;
+        alt-v)
+            vimdiff_file "${path}"
             exit 1
             ;;
         alt-+|insert|+)
