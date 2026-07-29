@@ -4,6 +4,7 @@ APP_NAME="$(basename "${0}")"
 
 PER_PAGE_DEFAULT=20
 WATCH_SECONDS_DEFAULT=5
+WATCH_FIRST_DELAY="${WATCH_SECONDS_DEFAULT}"
 
 NL=$'\n'
 HEADER="ID  STATUS  SOURCE  REF  CREATED  URL"
@@ -18,7 +19,8 @@ usage: ${APP_NAME} COMMAND [OPTIONS]
 Show and search GitLab CI or GitHub Actions pipeline information for a repository.
 
 Results are shown in an interactive picker (keys: ${KEY_DESCS_HELP}).
-As long as pipelines are still running, the picker refreshes itself.
+The picker reloads once ${WATCH_FIRST_DELAY} seconds after it opened, then keeps reloading
+as long as pipelines are still running.
 
 COMMAND
     status                  show CI pipeline status for a ref
@@ -31,7 +33,7 @@ Options:
     -q|--query <QUERY>      start the picker with a search query
     -p|--print              print the result table instead of opening the picker
     -w|--watch <SECONDS>    reload interval while pipelines are still running
-                            (default ${WATCH_SECONDS_DEFAULT}, 0 disables)
+                            (default ${WATCH_SECONDS_DEFAULT}, 0 disables auto-reloading)
 
 search options:
         --all-refs            do not filter by ref (search all refs)
@@ -503,8 +505,11 @@ pick_pipelines() {
     local watch_args=() refresh_bind=()
 
     if [ "${refresh}" -eq 1 ]; then
-        need_cmd curl
-        watch_args=("--watch" "${watch_seconds}")
+        # reload once shortly after the picker opened - a pipeline may have
+        # started in the meantime - then keep reloading while something runs
+        watch_args=("--watch" "${watch_seconds}"
+                    "--watch-delay" "${WATCH_FIRST_DELAY}"
+                    "--watch-while" "${APP_NAME} --id ${id} --active")
         # keep the job preview in sync with every reload of the list
         refresh_bind=("--bind=result:refresh-preview")
     fi
@@ -636,6 +641,9 @@ while [ "${#}" -gt 0 ]; do
             mode="preview"
             preview_id="${1}"
             ;;
+        --active)
+            mode="active"
+            ;;
         --var)
             shift
             [ -z "${1:-}" ] && error "Missing var argument" && usage
@@ -708,6 +716,10 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
         need_cmd glab
     fi
     case "${mode}" in
+        active)
+            has_active_pipelines "$(cat "${JSON_FILE}")"
+            exit $?
+            ;;
         key)
             handle_key
             ;;
@@ -737,7 +749,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
 fi
 
 case "${mode}" in
-    key|preview)
+    key|preview|active)
         fail "no cached pipeline result for id ${id}"
         ;;
 esac
@@ -775,34 +787,25 @@ fi
 
 [ "${provider}" = "gitlab" ] && project_id >/dev/null
 
-pipelines=""
-case "${action}" in
-    status)
-        pipelines="$(cmd_status)" || exit 1
-        ;;
-    search)
-        pipelines="$(cmd_search)" || exit 1
-        ;;
-    *)
-        usage
-        ;;
-esac
+pipelines="$(fetch_pipelines)" || exit 1
 
 pipeline_count="$(jq 'length' <<< "${pipelines}")"
 
 exit_code=0
 if [ "${output}" = "json" ]; then
     echo "${pipelines}"
-elif [ "${mode}" = "print" ] || [ ! -t 1 ] || [ "${pipeline_count}" -eq 0 ]; then
+elif [ "${pipeline_count}" -eq 0 ]; then
+    warning "no pipelines found"
+elif [ "${mode}" = "print" ] || [ ! -t 1 ]; then
     need_cmd k-format
-    [ "${pipeline_count}" -eq 0 ] && warning "no pipelines found"
     print_pipelines "${pipelines}"
 else
     need_cmd k-format
     need_cmd fzf-with-header
-    if [ "${watch_seconds}" -gt 0 ] && has_active_pipelines "${pipelines}"; then
+    if [ "${watch_seconds}" -gt 0 ]; then
         if [ -n "${grep_pattern}" ] || [ "${#var_specs[@]}" -gt 0 ]; then
-            warning "pipelines are still running, but --grep/--var results are too expensive to refresh automatically"
+            has_active_pipelines "${pipelines}" \
+                && warning "pipelines are still running, but --grep/--var results are too expensive to refresh automatically"
         else
             refresh=1
         fi
