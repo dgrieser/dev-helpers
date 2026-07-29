@@ -153,12 +153,12 @@ git-package <check|list|delete> [ID] [-n <name>] [-v <version>] [-o txt|json]
 ### git-pipe
 Show GitLab CI or GitHub Actions pipeline status for a ref, or search pipelines by log content, source, or status. Defaults to the current branch; use `--all-refs` to search every ref. Variable search is GitLab-only.
 
-Results open in an interactive picker with the pipeline's jobs in the preview: `enter` copies the URL, `ctrl-o` opens it in the browser, `ctrl-j` shows the jobs, `ctrl-l` the job logs. Use `-p` or `-o json` for non-interactive output.
+Results open in an interactive picker with the pipeline's jobs in the preview: `enter` copies the URL, `ctrl-o` opens it in the browser, `ctrl-j` shows the jobs, `ctrl-l` the job logs. While pipelines are still running, the picker reloads itself every few seconds (`-w`, `-w 0` disables) and stops once everything reached a final state. Use `-p` or `-o json` for non-interactive output.
 ```bash
-git-pipe status [-r <project>] [--ref <ref>] [-q <query>] [-p] [-o txt|json]
+git-pipe status [-r <project>] [--ref <ref>] [-q <query>] [-w <seconds>] [-p] [-o txt|json]
 git-pipe search [-r <project>] [--ref <ref>|--all-refs] [--var <NAME[=VALUE]>] [--grep <pattern>] \
                 [--source <source>] [-s <status>|--failed|--succeeded|--aborted|...] \
-                [-n <limit>] [-a] [-q <query>] [-p] [-o txt|json]
+                [-n <limit>] [-a] [-q <query>] [-w <seconds>] [-p] [-o txt|json]
 ```
 
 ### git-pr

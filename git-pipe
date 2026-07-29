@@ -3,6 +3,7 @@
 APP_NAME="$(basename "${0}")"
 
 PER_PAGE_DEFAULT=20
+WATCH_SECONDS_DEFAULT=5
 
 NL=$'\n'
 HEADER="ID  STATUS  SOURCE  REF  CREATED  URL"
@@ -17,6 +18,7 @@ usage: ${APP_NAME} COMMAND [OPTIONS]
 Show and search GitLab CI or GitHub Actions pipeline information for a repository.
 
 Results are shown in an interactive picker (keys: ${KEY_DESCS_HELP}).
+As long as pipelines are still running, the picker refreshes itself.
 
 COMMAND
     status                  show CI pipeline status for a ref
@@ -28,6 +30,8 @@ Options:
         --ref <REF>         ref to filter by (default: current branch)
     -q|--query <QUERY>      start the picker with a search query
     -p|--print              print the result table instead of opening the picker
+    -w|--watch <SECONDS>    reload interval while pipelines are still running
+                            (default ${WATCH_SECONDS_DEFAULT}, 0 disables)
 
 search options:
         --all-refs            do not filter by ref (search all refs)
@@ -465,21 +469,57 @@ write_state() {
         declare -p github_api_args
         printf 'PROJECT_ID=%q\n' "${PROJECT_ID:-}"
         printf 'repo_dir=%q\n' "${PWD}"
+        # the query context, so a --watch reload can fetch the result set again
+        printf 'refresh=%q\n' "${refresh}"
+        printf 'action=%q\n' "${action}"
+        printf 'ref=%q\n' "${ref}"
+        printf 'source=%q\n' "${source}"
+        printf 'grep_pattern=%q\n' "${grep_pattern}"
+        printf 'per_page=%q\n' "${per_page}"
+        printf 'paginate=%q\n' "${paginate}"
+        declare -p statuses
+        declare -p var_specs
     } > "${STATE_FILE}"
 }
 
-pick_pipelines() {
-    local json="${1}"
+fetch_pipelines() {
+    case "${action}" in
+        status) cmd_status ;;
+        search) cmd_search ;;
+        *)      return 1 ;;
+    esac
+}
 
-    print_pipelines "${json}" | fzf-with-header --key-command "${APP_NAME} --id ${id} --key" \
-                                                --key-descriptions "${KEY_DESCS}" \
-                                                --columns 1,2,3,4,5 \
-                                                --command "${APP_NAME} --id ${id} --print" \
-                                                "${query}" \
-                                                --preview="${APP_NAME} --id ${id} --preview {1}" \
-                                                --preview-window=right:50%,wrap \
-                                                --expect="${KEYS}" \
-                                                --no-sort
+# pipelines that are not in a final state yet, so the view has to keep updating
+has_active_pipelines() {
+    jq -e '
+        any(.[].status; . == "created" or . == "waiting_for_resource" or . == "preparing"
+            or . == "pending" or . == "queued" or . == "requested" or . == "waiting"
+            or . == "running" or . == "in_progress")
+    ' <<< "${1}" >/dev/null
+}
+
+pick_pipelines() {
+    local watch_args=() refresh_bind=()
+
+    if [ "${refresh}" -eq 1 ]; then
+        need_cmd curl
+        watch_args=("--watch" "${watch_seconds}")
+        # keep the job preview in sync with every reload of the list
+        refresh_bind=("--bind=result:refresh-preview")
+    fi
+
+    fzf-with-header --key-command "${APP_NAME} --id ${id} --key" \
+                    --key-descriptions "${KEY_DESCS}" \
+                    --columns 1,2,3,4,5 \
+                    --command "${APP_NAME} --id ${id} --print" \
+                    "${watch_args[@]}" \
+                    "${query}" \
+                    --preview="${APP_NAME} --id ${id} --preview {1}" \
+                    --preview-window=right:50%,wrap \
+                    "${refresh_bind[@]}" \
+                    --expect="${KEYS}" \
+                    --no-sort
 }
 
 cmd_search() {
@@ -534,6 +574,8 @@ statuses=()
 var_specs=()
 TRUNCATED=0
 mode="list"
+watch_seconds="${WATCH_SECONDS_DEFAULT}"
+refresh=0
 id=$$
 id_given=0
 query=""
@@ -569,6 +611,12 @@ while [ "${#}" -gt 0 ]; do
             ;;
         -p|--print)
             mode="print"
+            ;;
+        -w|--watch)
+            shift
+            [ -z "${1:-}" ] && error "Missing watch argument" && usage
+            ! [[ "${1}" =~ ^[0-9]+$ ]] && error "Invalid watch interval: ${1}" && usage
+            watch_seconds="${1}"
             ;;
         --id)
             shift
@@ -669,7 +717,20 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
             ;;
         print)
             need_cmd k-format
-            print_pipelines "$(cat "${JSON_FILE}")"
+            pipelines=""
+            if [ "${refresh:-0}" -eq 1 ]; then
+                pipelines="$(fetch_pipelines 2>/dev/null)"
+                if [ -n "${pipelines}" ]; then
+                    printf '%s\n' "${pipelines}" > "${JSON_FILE}"
+                    # nothing is running anymore: stop refetching on every reload
+                    if ! has_active_pipelines "${pipelines}"; then
+                        refresh=0
+                        write_state
+                    fi
+                fi
+            fi
+            [ -z "${pipelines}" ] && pipelines="$(cat "${JSON_FILE}")"
+            print_pipelines "${pipelines}"
             exit 0
             ;;
     esac
@@ -739,6 +800,13 @@ elif [ "${mode}" = "print" ] || [ ! -t 1 ] || [ "${pipeline_count}" -eq 0 ]; the
 else
     need_cmd k-format
     need_cmd fzf-with-header
+    if [ "${watch_seconds}" -gt 0 ] && has_active_pipelines "${pipelines}"; then
+        if [ -n "${grep_pattern}" ] || [ "${#var_specs[@]}" -gt 0 ]; then
+            warning "pipelines are still running, but --grep/--var results are too expensive to refresh automatically"
+        else
+            refresh=1
+        fi
+    fi
     trap 'rm -f "${STATE_FILE}" "${JSON_FILE}"' EXIT
     printf '%s\n' "${pipelines}" > "${JSON_FILE}"
     write_state
