@@ -164,10 +164,11 @@ detected from the remote, so `git-mr` and `git-pr` are the same command.
 Approve, merge, create, copy a channel message, create an issue, or show the
 review feedback.
 
-Without an action an interactive menu offers every action plus the branch and
-state filter (`branch` and `states` change the filter and return to the menu).
-The requests are then listed in a picker with the request and its diff in the
-preview: `enter` runs the chosen action (approve + merge by default), `ctrl-s`
+Without an action a `prompt-select` menu offers every action plus the branch and
+state filter (`branch` opens a branch list, `states` toggles, both return to the
+menu). The requests are then listed in an fzf picker with the request and its
+diff in the preview: `enter` runs the chosen action (approve + merge by
+default), `ctrl-s`
 shows the request, `ctrl-d` its diff, `ctrl-o` opens it in the browser,
 `ctrl-y` copies a channel message, `ctrl-f` shows the feedback, `alt-a`
 approves, `alt-m` merges, `alt-i` creates an issue from it, and `esc` goes

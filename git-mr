@@ -15,11 +15,8 @@ C_LABEL=$'\033[38;5;250m'
 C_RESET=$'\033[0m'
 
 LIST_HEADER=$'ID\tSTATE\tUPDATED\tAUTHOR\tBRANCHES\tTITLE'
-MENU_HEADER=$'ACTION\tDESCRIPTION'
 
 LIST_KEYS="enter,esc,ctrl-q,ctrl-s,ctrl-d,ctrl-o,ctrl-y,ctrl-f,alt-a,alt-m,alt-i"
-MENU_KEYS="enter,esc,ctrl-q"
-MENU_KEY_DESCS="enter:choose,esc:quit"
 
 JQ_STATE_COLOR='
     def statecolor:
@@ -85,9 +82,10 @@ Work with GitLab merge requests and GitHub pull requests. The provider is
 detected from the remote, so ${APP_NAME} handles both; git-mr and git-pr are
 the same command.
 
-Without an action an interactive menu offers every action plus the branch and
-state filter. The requests themselves are listed in a picker with the request
-and its diff in the preview:
+Without an action a prompt-select menu offers every action plus the branch and
+state filter; the filter entries change the filter and return to the menu. The
+requests themselves are listed in a picker with the request and its diff in the
+preview:
 
 $(key_help "enter:the chosen action (approve + merge by default),ctrl-s:show the request,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the feedback,alt-a:approve,alt-m:merge,alt-i:create an issue,esc:back")
 
@@ -400,17 +398,6 @@ list_print() {
         return 0
     fi
     printf '%s\n' "${LIST_HEADER}${NL}${rows}" | toage | render_table
-}
-
-# the menu preview would fetch the list on every cursor move, so the rendered
-# table is kept until a filter changes
-cached_list() {
-    [ -s "${TABLE_FILE}" ] || list_print > "${TABLE_FILE}" 2>/dev/null
-    cat "${TABLE_FILE}"
-}
-
-drop_cache() {
-    rm -f "${TABLE_FILE}"
 }
 
 item_json() {
@@ -877,8 +864,10 @@ state_filter_label() {
     fi
 }
 
-menu_print() {
-    local rows source_branch target_branch create_description
+# the rows of the action menu; prompt-select colors the list itself, so the
+# rows stay plain and only the columns are padded
+menu_items() {
+    local source_branch target_branch create_description
 
     source_branch="$(git branch --show-current 2>/dev/null)"
     target_branch="$(create_target_branch "${source_branch}")"
@@ -888,7 +877,8 @@ menu_print() {
     else
         create_description="create a ${NOUN}: check out a feature branch first"
     fi
-    rows="$(printf '%s\t%s\n' \
+    printf '%s\t%s\n' \
+        "ACTION"   "DESCRIPTION" \
         "review"   "approve, merge, or inspect a ${NOUN}" \
         "create"   "${create_description}" \
         "copy"     "copy a channel message for a ${NOUN}" \
@@ -896,9 +886,7 @@ menu_print() {
         "issue"    "create an issue from a ${NOUN}" \
         "branch"   "branch filter: $(branch_filter_label)" \
         "states"   "state filter: $(state_filter_label)" \
-        | awk -F'\t' -v OFS='\t' -v cid="${C_ID}" -v creset="${C_RESET}" \
-              '{ print cid $1 creset, $2 }')"
-    printf '%s\n' "${MENU_HEADER}${NL}${rows}" | render_table
+        | render_table
 }
 
 print_context() {
@@ -909,53 +897,22 @@ print_context() {
     printf '%s%-10s%s%s\n' "${C_LABEL}" "States:" "${C_RESET}" "$(state_filter_label)"
 }
 
-menu_preview() {
-    local entry
-    local source_branch target_branch
-
-    entry="$(awk '{print $1}' <<< "${1}")"
-    print_context
-    echo
-    case "${entry}" in
-        create)
-            source_branch="$(git branch --show-current 2>/dev/null)"
-            target_branch="$(create_target_branch "${source_branch}")"
-            if [ -z "${source_branch}" ] || [ -z "${target_branch}" ] \
-                || [ "${source_branch}" = "${target_branch}" ]; then
-                printf 'A %s needs a source branch that differs from %s.\n\n' \
-                    "${NOUN}" "${target_branch:-the target branch}"
-            else
-                printf '%sCommits of %s not in %s:%s\n\n' \
-                    "${C_LABEL}" "${source_branch}" "${target_branch}" "${C_RESET}"
-                git log --oneline --no-decorate "${target_branch}..${source_branch}" 2>/dev/null \
-                    || echo "Failed to compare ${target_branch}..${source_branch}"
-                echo
-            fi
-            git status --short --branch 2>/dev/null
-            ;;
-        branch)
-            printf '%sRecently used branches:%s\n\n' "${C_LABEL}" "${C_RESET}"
-            git for-each-ref --sort=-committerdate --count=20 \
-                --format='%(refname:short)' refs/heads 2>/dev/null
-            ;;
-        *)
-            printf '%s%s:%s\n\n' "${C_LABEL}" "${NOUN_PLURAL^}" "${C_RESET}"
-            cached_list
-            ;;
-    esac
-}
-
 pick_branch_filter() {
-    local choice
+    local choice branches
     local all_branches="(all branches)"
+    local select_args=("--prompt" "Branch filter:" "--delimiter" "")
 
-    choice="$( { printf '%s\n' "BRANCH" "${all_branches}"
-                 git for-each-ref --sort=-committerdate \
-                     --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
-                     | sed -e 's|^origin/||' -e '/^HEAD$/d' \
-                     | awk '!seen[$0]++'; } \
-        | fzf --header-lines 1 --layout=default --info inline-right \
-              --prompt "branch filter> " )" || return 1
+    branches="$( { printf '%s\n' "${all_branches}"
+                   git for-each-ref --sort=-committerdate \
+                       --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
+                       | sed -e 's|^origin/||' -e '/^HEAD$/d' \
+                       | awk '!seen[$0]++'; } )"
+    # a filter that is not a branch of this repo has no item to start on
+    if [ -n "${branch}" ] && grep -qxF -- "${branch}" <<< "${branches}"; then
+        select_args+=("--default" "${branch}")
+    fi
+
+    choice="$(printf '%s\n' "${branches}" | prompt-select "${select_args[@]}")" || return 1
     [ -z "${choice}" ] && return 1
     if [ "${choice}" = "${all_branches}" ]; then
         branch=""
@@ -963,55 +920,53 @@ pick_branch_filter() {
         branch="${choice}"
     fi
     resolve_branch_mode
-    drop_cache
     write_state
     return 0
 }
 
-handle_menu_key() {
-    local key line entry
+has_requests() {
+    local count
 
-    key="$(head -n 1 <<< "${key_result}")"
-    line="$(sed -n '2p' <<< "${key_result}")"
-    entry="$(awk '{print $1}' <<< "${line}")"
+    count="$(list_json | jq 'length')"
+    [ -n "${count}" ] && [ "${count}" -gt 0 ]
+}
 
-    [ -z "${key}" ] && exit 255
-    case "${key}" in
-        esc|ctrl-q)
-            exit 255
-            ;;
-    esac
-    [ -z "${entry}" ] && exit 0
+# the menu keeps coming back until an action ran or it is left with esc; the
+# filter entries only change the state and redraw
+run_menu() {
+    local choice rc
 
-    case "${entry}" in
-        branch)
-            pick_branch_filter
-            exit 0
-            ;;
-        states)
-            all=$((1 - all))
-            drop_cache
-            write_state
-            exit 0
-            ;;
-        create)
-            create_request
-            exit 1
-            ;;
-        review|copy|feedback|issue)
-            action="${entry}"
-            write_state
-            # the picker returns 1 when it was left with esc, so the menu comes
-            # back instead of ending the run
-            if "${0}" --id "${id}" --pick; then
-                exit 1
-            fi
-            exit 0
-            ;;
-        *)
-            exit 0
-            ;;
-    esac
+    while true; do
+        # the header row of the menu names the columns, so no prompt is needed
+        choice="$(menu_items | prompt-select --prompt "" \
+            --key-regex '^\S+' --header-lines 1)"
+        rc="${?}"
+        [ "${rc}" -ne 0 ] && return 0
+        case "${choice}" in
+            branch)
+                pick_branch_filter
+                ;;
+            states)
+                all=$((1 - all))
+                write_state
+                ;;
+            create)
+                create_request
+                return "${?}"
+                ;;
+            review|copy|feedback|issue)
+                action="${choice}"
+                write_state
+                if ! has_requests; then
+                    warning "No ${NOUN_PLURAL} found"
+                    continue
+                fi
+                # the picker returns non-zero when it was left with esc, so the
+                # menu comes back instead of ending the run
+                pick_list && return 0
+                ;;
+        esac
+    done
 }
 
 handle_list_key() {
@@ -1080,16 +1035,6 @@ pick_list() {
                     --preview="${APP_NAME} --id ${id} --list-preview {1}" \
                     --preview-window=right:60%,nowrap \
                     --expect="${LIST_KEYS}" \
-                    --no-sort
-}
-
-pick_menu() {
-    fzf-with-header --key-command "${APP_NAME} --id ${id} --menu-key" \
-                    --key-descriptions "${MENU_KEY_DESCS}" \
-                    --command "${APP_NAME} --id ${id} --menu-print" \
-                    --preview="${APP_NAME} --id ${id} --menu-preview {1}" \
-                    --preview-window=right:60%,wrap \
-                    --expect="${MENU_KEYS}" \
                     --no-sort
 }
 
@@ -1218,28 +1163,16 @@ while [ "${#}" -gt 0 ]; do
                 *) error "Invalid output format: ${1}"; usage ;;
             esac
             ;;
-        --menu-print)
-            mode="menu-print"
-            ;;
         --list-print)
             mode="list-print"
             ;;
-        --pick)
-            mode="pick"
-            ;;
-        --menu-preview|--list-preview)
-            case "${1}" in
-                --menu-preview) mode="menu-preview" ;;
-                --list-preview) mode="list-preview" ;;
-            esac
+        --list-preview)
+            mode="list-preview"
             shift
             preview_arg="${1}"
             ;;
-        --menu-key|--list-key)
-            case "${1}" in
-                --menu-key) mode="menu-key" ;;
-                --list-key) mode="list-key" ;;
-            esac
+        --list-key)
+            mode="list-key"
             shift
             [ -z "${1}" ] && fail "Missing argument for key"
             key_result="${1}"
@@ -1263,7 +1196,6 @@ while [ "${#}" -gt 0 ]; do
 done
 
 STATE_FILE="/tmp/${APP_NAME}-${id}.state"
-TABLE_FILE="/tmp/${APP_NAME}-${id}.table"
 
 # the picker calls back into the script, those runs reuse the state of the run
 # that opened it
@@ -1273,38 +1205,22 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
     cd "${repo_dir}" || fail "Failed to enter ${repo_dir}"
     set_provider_labels
     case "${mode}" in
-        menu-print)
-            menu_print
-            exit 0
-            ;;
         list-print)
             list_print
-            exit 0
-            ;;
-        menu-preview)
-            menu_preview "${preview_arg}"
             exit 0
             ;;
         list-preview)
             preview_item "${preview_arg}"
             exit 0
             ;;
-        menu-key)
-            handle_menu_key
-            ;;
         list-key)
             handle_list_key
-            ;;
-        pick)
-            need_cmd fzf-with-header
-            pick_list
-            exit "${?}"
             ;;
     esac
 fi
 
 case "${mode}" in
-    menu-print|list-print|menu-preview|list-preview|menu-key|list-key|pick)
+    list-print|list-preview|list-key)
         fail "No state for id ${id}"
         ;;
 esac
@@ -1362,14 +1278,10 @@ fi
 resolve_branch_mode
 
 echo 1>&2
-{
-    printf 'URL:      %s\n' "${remote_url}"
-    printf 'Provider: %s\n' "${provider}"
-    printf 'Branch:   %s\n' "$(branch_filter_label)"
-} 1>&2
+print_context 1>&2
 echo 1>&2
 
-trap 'rm -f "${STATE_FILE}" "${TABLE_FILE}"' EXIT
+trap 'rm -f "${STATE_FILE}"' EXIT
 write_state
 
 exit_code=0
@@ -1387,21 +1299,17 @@ elif [ -n "${number}" ]; then
     [ "${exit_code}" -eq 2 ] && exit_code=1
 else
     need_cmd toage
+    need_cmd prompt-select
     need_cmd fzf-with-header
     if [ -z "${action}" ]; then
-        pick_menu
+        run_menu
         exit_code="${?}"
-        # leaving the menu without choosing anything is not an error
-        [ "${exit_code}" -eq 1 ] && exit_code=0
+    elif ! has_requests; then
+        warning "No ${NOUN_PLURAL} found"
+        exit_code=1
     else
-        list_count="$(list_json | jq 'length')"
-        if [ -z "${list_count}" ] || [ "${list_count}" -eq 0 ]; then
-            warning "No ${NOUN_PLURAL} found"
-            exit_code=1
-        else
-            pick_list
-            exit_code="${?}"
-        fi
+        pick_list
+        exit_code="${?}"
     fi
 fi
 
