@@ -159,10 +159,31 @@ git-move [-b|--base <ref>] [-c|--with-commits] [-C|--no-commits] [-y|--yes] [BRA
 ```
 
 ### git-mr
-Create or work with GitLab merge requests: copy message, create issue, or fetch review feedback.
+Work with GitLab merge requests and GitHub pull requests; the provider is
+detected from the remote, so `git-mr` and `git-pr` are the same command.
+Approve, merge, create, copy a channel message, create an issue, or show the
+review feedback.
+
+Without an action an interactive menu offers every action plus the branch and
+state filter (`branch` and `states` change the filter and return to the menu).
+The requests are then listed in a picker with the request and its diff in the
+preview: `enter` runs the chosen action (approve + merge by default), `ctrl-s`
+shows the request, `ctrl-d` its diff, `ctrl-o` opens it in the browser,
+`ctrl-y` copies a channel message, `ctrl-f` shows the feedback, `alt-a`
+approves, `alt-m` merges, `alt-i` creates an issue from it, and `esc` goes
+back.
+
+By default the requests of the current branch are listed; on the default or
+production branch (`--prod-branch`) requests are filtered by their target
+branch instead. `--feedback` prints the comments and review feedback as
+Markdown (`-u` hides resolved discussions, `-r` skips the terminal
+rendering). `-n` acts on one request without the picker, `-p` prints the list.
 ```bash
-git-mr [-c|--create] [-m|--copy-message] [-i|--issue] [--feedback] [-r|--raw] \
-       [-b|--branch <branch>] [--prod-branch <branch>] [-A|--all] <project>
+git-mr [-c|--create] [-a|--approve] [-M|--merge] [-m|--copy-message] \
+       [-i|--issue] [--feedback] [-u|--unresolved] [-r|--raw] \
+       [-b|--branch <branch>] [-k|--checkout] [--prod-branch <branch>] \
+       [-A|--all] [-n|--number <id>] [-q|--query <query>] [-l|--limit <n>] \
+       [-p|--print] [-o txt|json] [<project>]
 ```
 
 ### git-package
@@ -183,9 +204,10 @@ git-pipe search [-r <project>] [--ref <ref>|--all-refs] [--var <NAME[=VALUE]>] [
 ```
 
 ### git-pr
-List open PRs, create new PR, or fetch unresolved review feedback.
+Symlink to [git-mr](#git-mr), which handles GitHub pull requests and GitLab
+merge requests alike.
 ```bash
-git-pr [-b|--branch] [-c|--create] [--feedback]
+git-pr [OPTIONS] [<project>]
 ```
 
 ### git-push

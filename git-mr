@@ -1,25 +1,139 @@
 #!/bin/bash
 
+APP_NAME="$(basename "${0}")"
+
+LIMIT_DEFAULT=100
+PROD_BRANCH_DEFAULT="prod"
+ASSIGNEE_DEFAULT="dgrieser"
+
+NL=$'\n'
+
+C_ID=$'\033[33m'
+C_AUTHOR=$'\033[38;5;33m'
+C_BRANCH=$'\033[38;5;208m'
+C_LABEL=$'\033[38;5;250m'
+C_RESET=$'\033[0m'
+
+LIST_HEADER=$'ID\tSTATE\tUPDATED\tAUTHOR\tBRANCHES\tTITLE'
+MENU_HEADER=$'ACTION\tDESCRIPTION'
+
+LIST_KEYS="enter,esc,ctrl-q,ctrl-s,ctrl-d,ctrl-o,ctrl-y,ctrl-f,alt-a,alt-m,alt-i"
+MENU_KEYS="enter,esc,ctrl-q"
+MENU_KEY_DESCS="enter:choose,esc:quit"
+
+JQ_STATE_COLOR='
+    def statecolor:
+        if . == "open" or . == "opened" then "\u001b[32m"
+        elif . == "draft" then "\u001b[33m"
+        elif . == "merged" then "\u001b[35m"
+        elif . == "closed" then "\u001b[31m"
+        elif . == "locked" then "\u001b[90m"
+        else "" end;
+    def colored: ((. // "-") | ascii_downcase) as $s | ($s | statecolor) + $s + "\u001b[0m";
+'
+
+# every feedback source is normalized to the same item shape, so both providers
+# share one renderer
+JQ_FEEDBACK_RENDER='
+    def author: (.author // "unknown");
+    def created: (.created // "unknown time");
+    def body: (if (.body // "") == "" then "_No body._" else .body end);
+    def location:
+        if (.path // null) != null then
+            "**Location:** `" + .path +
+            (if (.line // null) != null then ":" + (.line | tostring) else "" end) +
+            "`\n\n"
+        else "" end;
+    def thread:
+        if (.thread // null) != null then
+            "**Thread:** `" + (.thread | tostring) + "`\n\n"
+        else "" end;
+    def resolution:
+        if (.resolved // null) != null then
+            "**Resolved:** " + (if .resolved then "yes" else "no" end) + "\n\n"
+        else "" end;
+    def heading:
+        if .kind == "review" then
+            "## Review by " + author +
+            (if (.state // null) != null then " (" + (.state | ascii_downcase) + ")" else "" end)
+        elif .kind == "thread" then
+            "## Review comment by " + author
+        else
+            "## Comment by " + author
+        end;
+
+    sort_by(.created // "")
+    | if length == 0 then
+        $empty
+      else
+        "# " + $title + "\n\n" +
+        (map(heading + "\n\n**Created:** " + created + "\n\n" +
+             location + thread + resolution + body)
+         | join("\n\n---\n\n"))
+      end
+'
+
+key_help() {
+    printf '%s' "${1}" | tr ',' '\n' | awk -F':' '{ printf "  %-8s %s\n", $1, $2 }'
+}
+
 usage() {
     cat <<EOF 1>&2
-Usage: $(basename "$0") [-c|--create] [-m|--copy-message] [-i|--issue] [--feedback] [-r|--raw] [-b|--branch <branch>] [-A|--all] <project>
+usage: ${APP_NAME} [OPTIONS] [<project>]
+
+Work with GitLab merge requests and GitHub pull requests. The provider is
+detected from the remote, so ${APP_NAME} handles both; git-mr and git-pr are
+the same command.
+
+Without an action an interactive menu offers every action plus the branch and
+state filter. The requests themselves are listed in a picker with the request
+and its diff in the preview:
+
+$(key_help "enter:the chosen action (approve + merge by default),ctrl-s:show the request,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the feedback,alt-a:approve,alt-m:merge,alt-i:create an issue,esc:back")
+
+Actions:
+  -c, --create            create a request from the current branch
+  -a, --approve           approve the selected request
+  -M, --merge             merge the selected request
+  -m, --copy-message      copy a channel message for the selected request
+  -i, --issue             create an issue from the selected request
+      --feedback          print the comments and review feedback
+  <none>                  ask, or approve and merge with -n/--number
 
 Options:
-  -c, --create        Create a new merge request
-  -m, --copy-message  Copy a channel message for the selected merge request
-  -i, --issue         Create an issue from the selected merge request
-      --feedback      Print comments and review feedback for the selected merge request
-  -r, --raw           With --feedback, print Markdown without terminal rendering
-  -b, --branch        Filter merge requests by branch
-      --prod-branch   Name of the production branch (default: prod)
-  -A, --all           Include all merge request states
-  -h, --help          Show this help message and exit
+  -b, --branch <branch>   filter by branch (default: the current branch); with
+                          --create the target branch of the new request
+  -k, --checkout          check out and pull <branch> before continuing
+      --prod-branch <b>   name of the production branch (default ${PROD_BRANCH_DEFAULT}); on the
+                          default or production branch requests are filtered by
+                          their target branch instead of their source branch
+  -A, --all               include every request state
+  -n, --number <id>       act on <id> and skip the picker
+  -u, --unresolved        with --feedback, hide resolved discussions
+  -r, --raw               with --feedback, print Markdown without rendering
+  -q, --query <query>     start the picker with a search query
+  -l, --limit <n>         number of requests to list (default ${LIMIT_DEFAULT})
+  -p, --print             print the request list instead of opening the picker
+  -o, --output txt|json   output format of --print (default txt)
+  -h, --help              show this help message and exit
+
+<project> is looked up with git-find-repo, so requests of another repository
+can be handled without changing directory first.
 EOF
     exit 1
 }
 
 error() {
-    echo "ERROR: $1" 1>&2
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
 }
 
 abort() {
@@ -27,156 +141,1034 @@ abort() {
     exit 1
 }
 
-fail() {
-    local message="$1"
-    [ -z "${message}" ] && message="Failed."
-    error "${message}" 1>&2
-    exit 1
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "${1} not found"
 }
 
-commit-to-title() {
+pager() {
+    if [ -t 1 ]; then
+        less -R
+    else
+        cat
+    fi
+}
+
+# pad tab separated columns, ANSI aware, so colored cells still line up; the
+# last column stays unpadded and the two space separator doubles as the column
+# delimiter of the picker
+render_table() {
+    awk -F'\t' '
+        function vlen(s) { gsub(/\033\[[0-9;]*m/, "", s); return length(s) }
+        { rows[NR] = $0
+          for (i = 1; i <= NF; i++) { l = vlen($i); if (l > w[i]) w[i] = l } }
+        END {
+            for (r = 1; r <= NR; r++) {
+                nf = split(rows[r], f, "\t")
+                line = ""
+                for (i = 1; i <= nf; i++) {
+                    if (i > 1) line = line "  "
+                    line = line f[i]
+                    if (i < nf) { pad = w[i] - vlen(f[i]); while (pad-- > 0) line = line " " }
+                }
+                print line
+            }
+        }'
+}
+
+set_provider_labels() {
+    if [ "${provider}" = "github" ]; then
+        NOUN="pull request"
+        NOUN_PLURAL="pull requests"
+        ABBR="PR"
+        SIGIL="#"
+    else
+        NOUN="merge request"
+        NOUN_PLURAL="merge requests"
+        ABBR="MR"
+        SIGIL="!"
+    fi
+}
+
+item_ref() {
+    printf '%s %s%s' "${ABBR}" "${SIGIL}" "${1}"
+}
+
+host_from_url() {
+    local url="${1}"
+    local host
+
+    case "${url}" in
+        *://*)
+            host="${url#*://}"
+            host="${host%%/*}"
+            host="${host#*@}"
+            host="${host%%:*}"
+            ;;
+        *@*:*)
+            host="${url#*@}"
+            host="${host%%:*}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    printf '%s\n' "${host}"
+}
+
+repository_from_url() {
+    local url="${1}"
+    local repository
+
+    url="${url%/}"
+    url="${url%.git}"
+    case "${url}" in
+        *://*)
+            repository="${url#*://}"
+            repository="${repository#*@}"
+            repository="${repository#*/}"
+            ;;
+        *@*:*)
+            repository="${url#*:}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    [ "${repository}" = "${repository#*/}" ] && return 1
+    printf '%s\n' "${repository}"
+}
+
+# the remote gh resolved to wins, then origin; only an ambiguous set of remotes
+# is worth a prompt
+select_remote_url() {
+    local remote url resolved="" origin_url="" first_url=""
+    local remotes=()
+
+    while IFS= read -r remote; do
+        [ -z "${remote}" ] && continue
+        url="$(git remote get-url "${remote}" 2>/dev/null)" || continue
+        [ -z "${url}" ] && continue
+        remotes+=("${remote}")
+        [ -z "${first_url}" ] && first_url="${url}"
+        [ "${remote}" = "origin" ] && origin_url="${url}"
+        [ -n "$(git config --get "remote.${remote}.gh-resolved" 2>/dev/null)" ] && resolved="${url}"
+    done < <(git remote)
+
+    [ "${#remotes[@]}" -eq 0 ] && return 1
+    [ -n "${resolved}" ] && printf '%s\n' "${resolved}" && return 0
+    [ -n "${origin_url}" ] && printf '%s\n' "${origin_url}" && return 0
+    [ "${#remotes[@]}" -eq 1 ] && printf '%s\n' "${first_url}" && return 0
+
+    need_cmd choose
+    remote="$(choose -p "Select remote:" "${remotes[@]}")" || return 1
+    git remote get-url "${remote}"
+}
+
+detect_provider() {
+    local remote_url="${1}"
+    local host
+
+    host="$(host_from_url "${remote_url}")" || fail "Failed to determine the remote host"
+    remote_host="${host}"
+    remote_repository="$(repository_from_url "${remote_url}")" || remote_repository=""
+    if [[ "${host}" == *github* ]] \
+        || [ -n "$(git config --get remote.origin.gh-resolved 2>/dev/null)" ]; then
+        provider="github"
+        github_repository="$(repository_from_url "${remote_url}")" \
+            || fail "Failed to determine the GitHub repository"
+        github_repo_selector="${github_repository}"
+        github_api_args=()
+        if [ "${host}" != "github.com" ]; then
+            github_api_args+=("--hostname" "${host}")
+            github_repo_selector="${host}/${github_repository}"
+        fi
+    else
+        provider="gitlab"
+    fi
+}
+
+resolve_branch_mode() {
+    local default_branch
+
+    branch_mode="source"
+    [ -z "${branch}" ] && return 0
+    default_branch="$(git-default 2>/dev/null)"
+    if [ "${branch}" = "${default_branch}" ] \
+        || { [ -n "${prod_branch}" ] && [ "${branch}" = "${prod_branch}" ]; }; then
+        branch_mode="target"
+    fi
+    return 0
+}
+
+list_gitlab_json() {
+    local args=("--output" "json" "-P" "${limit}")
+
+    [ "${all}" -eq 1 ] && args+=("--all")
+    if [ -n "${branch}" ]; then
+        if [ "${branch_mode}" = "target" ]; then
+            args+=("--target-branch" "${branch}")
+        else
+            args+=("--source-branch" "${branch}")
+        fi
+    fi
+    glab mr list --order "updated_at" "${args[@]}" 2>/dev/null \
+        | jq '[ .[] | {
+                id: .iid,
+                title: ((.title // "-") | gsub("[[:space:]]+"; " ")),
+                state: (if (.draft // false) then "draft" else (.state // "-") end),
+                draft: (.draft // false),
+                author: (.author.username // .author.name // "-"),
+                source: (.source_branch // "-"),
+                target: (.target_branch // "-"),
+                updated: ((.updated_at // "") | sub("\\.[0-9]+(?=(Z|[+-]))"; "")),
+                url: (.web_url // "-")
+            } ]'
+}
+
+list_github_json() {
+    local args=("--repo" "${github_repo_selector}" "--limit" "${limit}"
+                "--json" "number,title,state,isDraft,author,headRefName,baseRefName,updatedAt,url")
+
+    if [ "${all}" -eq 1 ]; then
+        args+=("--state" "all")
+    else
+        args+=("--state" "open")
+    fi
+    if [ -n "${branch}" ]; then
+        if [ "${branch_mode}" = "target" ]; then
+            args+=("--base" "${branch}")
+        else
+            args+=("--head" "${branch}")
+        fi
+    fi
+    gh pr list "${args[@]}" 2>/dev/null \
+        | jq '[ .[] | {
+                id: .number,
+                title: ((.title // "-") | gsub("[[:space:]]+"; " ")),
+                state: (if (.isDraft // false) then "draft" else (.state // "-") end),
+                draft: (.isDraft // false),
+                author: (.author.login // .author.name // "-"),
+                source: (.headRefName // "-"),
+                target: (.baseRefName // "-"),
+                updated: ((.updatedAt // "") | sub("\\.[0-9]+(?=(Z|[+-]))"; "")),
+                url: (.url // "-")
+            } ]'
+}
+
+list_json() {
+    if [ "${provider}" = "github" ]; then
+        list_github_json
+    else
+        list_gitlab_json
+    fi
+}
+
+list_by_source() {
+    # shellcheck disable=SC2034
+    local branch="${1}" branch_mode="source" all=0
+    list_json
+}
+
+list_print() {
+    local json rows
+
+    json="$(list_json)" || fail "Failed to list ${NOUN_PLURAL}"
+    [ -z "${json}" ] && json="[]"
+
+    if [ "${output}" = "json" ]; then
+        printf '%s\n' "${json}"
+        return 0
+    fi
+
+    rows="$(jq -r \
+        --arg cid "${C_ID}" --arg cauthor "${C_AUTHOR}" \
+        --arg cbranch "${C_BRANCH}" --arg creset "${C_RESET}" \
+        "${JQ_STATE_COLOR}"'
+        .[] | [
+            $cid + (.id | tostring) + $creset,
+            (.state | colored),
+            (.updated // "-"),
+            $cauthor + .author + $creset,
+            $cbranch + .source + " → " + .target + $creset,
+            .title
+        ] | @tsv
+    ' <<< "${json}")"
+
+    if [ -z "${rows}" ]; then
+        printf '%s\n' "${LIST_HEADER}" | render_table
+        return 0
+    fi
+    printf '%s\n' "${LIST_HEADER}${NL}${rows}" | toage | render_table
+}
+
+# the menu preview would fetch the list on every cursor move, so the rendered
+# table is kept until a filter changes
+cached_list() {
+    [ -s "${TABLE_FILE}" ] || list_print > "${TABLE_FILE}" 2>/dev/null
+    cat "${TABLE_FILE}"
+}
+
+drop_cache() {
+    rm -f "${TABLE_FILE}"
+}
+
+item_json() {
+    local n="${1}"
+
+    if [ "${provider}" = "github" ]; then
+        gh pr view "${n}" --repo "${github_repo_selector}" \
+            --json number,title,state,isDraft,author,headRefName,baseRefName,updatedAt,url,body 2>/dev/null \
+            | jq '{
+                id: .number,
+                title: (.title // "-"),
+                state: ((.state // "-") | ascii_downcase),
+                draft: (.isDraft // false),
+                author: (.author.login // .author.name // "-"),
+                source: (.headRefName // "-"),
+                target: (.baseRefName // "-"),
+                updated: (.updatedAt // "-"),
+                url: (.url // "-"),
+                body: (.body // "")
+            }'
+    else
+        glab mr view "${n}" --output json 2>/dev/null \
+            | jq '{
+                id: .iid,
+                title: (.title // "-"),
+                state: ((.state // "-") | ascii_downcase),
+                draft: (.draft // false),
+                author: (.author.username // .author.name // "-"),
+                source: (.source_branch // "-"),
+                target: (.target_branch // "-"),
+                updated: (.updated_at // "-"),
+                url: (.web_url // "-"),
+                body: (.description // "")
+            }'
+    fi
+}
+
+print_item_summary() {
+    local json="${1}"
+
+    jq -r --arg cl "${C_LABEL}" --arg cb "${C_BRANCH}" --arg cr "${C_RESET}" '
+        [ $cl + "Title:  " + $cr + (.title // "-"),
+          $cl + "State:  " + $cr + (.state // "-") + (if .draft then " (draft)" else "" end),
+          $cl + "Author: " + $cr + (.author // "-"),
+          $cl + "Branch: " + $cr + $cb + (.source // "-") + " → " + (.target // "-") + $cr,
+          $cl + "URL:    " + $cr + (.url // "-") ]
+        | join("\n")
+    ' <<< "${json}"
+}
+
+item_diff() {
+    local n="${1}"
+
+    if [ "${provider}" = "github" ]; then
+        gh pr diff "${n}" --repo "${github_repo_selector}" --color always 2>&1
+    else
+        glab mr diff "${n}" --color always 2>&1
+    fi
+}
+
+preview_item() {
+    local n="${1}"
+    local json
+
+    [[ "${n}" =~ ^[0-9]+$ ]] || return 0
+    json="$(item_json "${n}")"
+    if [ -z "${json}" ]; then
+        echo "No $(item_ref "${n}")"
+        return 0
+    fi
+    print_item_summary "${json}"
+    jq -r --arg cl "${C_LABEL}" --arg cr "${C_RESET}" '
+        if (.body // "") == "" then empty else "\n" + $cl + "Description:" + $cr + "\n\n" + .body end
+    ' <<< "${json}"
+    printf '\n%sDiff:%s\n\n' "${C_LABEL}" "${C_RESET}"
+    item_diff "${n}"
+}
+
+show_details() {
+    local n="${1}"
+    local json
+
+    json="$(item_json "${n}")"
+    [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
+    {
+        print_item_summary "${json}"
+        jq -r 'if (.body // "") == "" then empty else "\n" + .body end' <<< "${json}"
+        printf '\n'
+        item_diff "${n}"
+    } | pager
+}
+
+show_diff() {
+    local n="${1}"
+
+    item_diff "${n}" | pager
+}
+
+open_item() {
+    local n="${1}"
+
+    if [ "${provider}" = "github" ]; then
+        gh pr view "${n}" --repo "${github_repo_selector}" --web
+    else
+        glab mr view "${n}" --web
+    fi
+}
+
+copy_message() {
+    local n="${1}"
+    local json message
+
+    need_cmd clip
+    json="$(item_json "${n}")"
+    [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
+    message="$(jq -r '"@hier *" + .title + "* (`" + .source + "` → `" + .target + "`)\n" + .url' <<< "${json}")"
+    [ -z "${message}" ] && { error "Failed to build the channel message"; return 1; }
+    printf '%s' "${message}" | clip || { error "Failed to copy the channel message"; return 1; }
+    echo "Channel message for $(item_ref "${n}") copied to clipboard." 1>&2
+}
+
+approve_item() {
+    local n="${1}"
+
+    if [ "${provider}" = "github" ]; then
+        gh pr review "${n}" --repo "${github_repo_selector}" --approve \
+            || { error "Failed to approve $(item_ref "${n}")"; return 1; }
+    else
+        glab mr approve "${n}" || { error "Failed to approve $(item_ref "${n}")"; return 1; }
+    fi
+}
+
+merge_item() {
+    local n="${1}"
+
+    if [ "${provider}" = "github" ]; then
+        gh pr merge "${n}" --repo "${github_repo_selector}" \
+            || { error "Failed to merge $(item_ref "${n}")"; return 1; }
+    else
+        glab mr merge "${n}" || { error "Failed to merge $(item_ref "${n}")"; return 1; }
+    fi
+}
+
+approve_and_merge() {
+    local n="${1}"
+    local json
+
+    json="$(item_json "${n}")"
+    [ -n "${json}" ] && print_item_summary "${json}"
+    echo 1>&2
+    prompt-continue "Approve and merge $(item_ref "${n}")?" \
+        || { echo "Abort." 1>&2; return 2; }
+    approve_item "${n}" || return 1
+    merge_item "${n}"
+}
+
+feedback_gitlab_json() {
+    local n="${1}"
+
+    glab api "projects/:fullpath/merge_requests/${n}/discussions" --paginate 2>/dev/null \
+        | jq -s 'add // []' \
+        | jq '[ .[]
+                | .id as $tid
+                | (.notes // [])[]
+                | select((.system // false) == false)
+                | {
+                    kind: (if (.position // null) != null then "thread" else "comment" end),
+                    author: (.author.username // .author.name // "unknown"),
+                    created: (.created_at // null),
+                    body: (.body // ""),
+                    path: (.position.new_path // .position.old_path // null),
+                    line: (.position.new_line // .position.old_line // null),
+                    resolved: (if (.resolvable // false) then (.resolved // false) else null end),
+                    thread: $tid,
+                    state: null
+                } ]'
+}
+
+feedback_github_json() {
+    local n="${1}"
+    local owner name json
+
+    name="${github_repository#*/}"
+    owner="${github_repository%%/*}"
+
+    # shellcheck disable=SC2016
+    json="$(gh api graphql "${github_api_args[@]}" -f query='
+      query($owner: String!, $repo: String!, $pr: Int!) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $pr) {
+            comments(first: 100) {
+              nodes { createdAt body author { login } }
+            }
+            reviews(first: 100) {
+              nodes { createdAt body state author { login } }
+            }
+            reviewThreads(first: 100) {
+              nodes {
+                id
+                isResolved
+                comments(first: 100) {
+                  nodes { createdAt body author { login } path originalLine line }
+                }
+              }
+            }
+          }
+        }
+      }
+    ' -F owner="${owner}" -F repo="${name}" -F pr="${n}" 2>/dev/null)" || return 1
+
+    jq '.data.repository.pullRequest as $pr
+        | [ (($pr.comments.nodes // [])[]
+             | { kind: "comment",
+                 author: (.author.login // "unknown"),
+                 created: (.createdAt // null),
+                 body: (.body // ""),
+                 path: null, line: null, resolved: null, thread: null, state: null }),
+            (($pr.reviews.nodes // [])[]
+             # a review without a body only carries its thread comments
+             | select(((.body // "") != "") or ((.state // "COMMENTED") != "COMMENTED"))
+             | { kind: "review",
+                 author: (.author.login // "unknown"),
+                 created: (.createdAt // null),
+                 body: (.body // ""),
+                 path: null, line: null, resolved: null, thread: null,
+                 state: (.state // null) }),
+            (($pr.reviewThreads.nodes // [])[]
+             | .isResolved as $resolved
+             | .id as $tid
+             | (.comments.nodes // [])[]
+             | { kind: "thread",
+                 author: (.author.login // "unknown"),
+                 created: (.createdAt // null),
+                 body: (.body // ""),
+                 path: (.path // null),
+                 line: (.originalLine // .line // null),
+                 resolved: $resolved,
+                 thread: $tid,
+                 state: null })
+          ]
+    ' <<< "${json}"
+}
+
+show_feedback() {
+    local n="${1}"
+    local json markdown title empty
+
+    if [ "${provider}" = "github" ]; then
+        json="$(feedback_github_json "${n}")" || { error "Failed to fetch the ${NOUN} feedback"; return 1; }
+    else
+        json="$(feedback_gitlab_json "${n}")" || { error "Failed to fetch the ${NOUN} feedback"; return 1; }
+    fi
+    [ -z "${json}" ] && json="[]"
+
+    if [ "${unresolved}" -eq 1 ]; then
+        json="$(jq '[ .[] | select((.resolved // false) != true) ]' <<< "${json}")"
+        title="Unresolved feedback of $(item_ref "${n}")"
+        empty="No unresolved feedback found."
+    else
+        title="Feedback of $(item_ref "${n}")"
+        empty="No comments found."
+    fi
+
+    markdown="$(jq -r --arg title "${title}" --arg empty "${empty}" \
+        "${JQ_FEEDBACK_RENDER}" <<< "${json}")" \
+        || { error "Failed to format the feedback"; return 1; }
+
+    if [ "${raw}" -eq 0 ] && [ -t 1 ] && command -v glow >/dev/null 2>&1; then
+        printf '%s\n' "${markdown}" | glow -
+    else
+        printf '%s\n' "${markdown}"
+    fi
+}
+
+create_issue() {
+    local n="${1}"
+    local json title description link qwen_json assignee
+    local create_args=()
+
+    json="$(item_json "${n}")"
+    [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
+    title="$(jq -r '.title // empty' <<< "${json}")"
+    description="$(jq -r '.body // empty' <<< "${json}")"
+    link="$(jq -r '.url // empty' <<< "${json}")"
+    [ -z "${title}" ] && { error "Failed to read the ${NOUN} title"; return 1; }
+
+    if command -v qwen-auto >/dev/null 2>&1; then
+        qwen_json="$(qwen-auto -c /issue:from-pr-mr "${title}${NL}${description}")"
+        if [ -n "$(jq -r '.title // empty' <<< "${qwen_json}" 2>/dev/null)" ]; then
+            title="$(jq -r '.title // empty' <<< "${qwen_json}")"
+            description="$(jq -r '.description // empty' <<< "${qwen_json}")"
+        else
+            warning "Failed to summarize $(item_ref "${n}"), using its title and description"
+        fi
+    fi
+    [ -n "${link}" ] && description="${description}${NL}${NL}See: ${link}"
+
+    title="$(prompt-input "Title:" --default "${title}")" || return 2
+    [ -z "${title}" ] && return 2
+    assignee="$(prompt-input "Assignee:" --default "${ASSIGNEE_DEFAULT}")" || return 2
+
+    create_args+=("--title" "${title}")
+    [ -n "${assignee}" ] && create_args+=("--assignee" "${assignee}")
+    if [ -n "${description}" ]; then
+        echo 1>&2
+        echo "Description:" 1>&2
+        printf '%s\n' "${description}" 1>&2
+    fi
+    echo 1>&2
+    prompt-continue || return 2
+
+    if [ "${provider}" = "github" ]; then
+        gh issue create --repo "${github_repo_selector}" "${create_args[@]}" \
+            --body "${description}" --web || { error "Failed to create the issue"; return 1; }
+    else
+        glab issue create "${create_args[@]}" --description "${description}" --web \
+            || { error "Failed to create the issue"; return 1; }
+    fi
+}
+
+commit_to_title() {
     local last_commit_message
+
     last_commit_message="$(git log -1 --pretty=%s)"
     if [[ "${last_commit_message}" =~ ^[[:alnum:]]+\([^\)]+\):[[:space:]]*(.+)$ ]]; then
         last_commit_message="${BASH_REMATCH[1]}"
     fi
     # uppercase first letter
     [ -n "${last_commit_message}" ] && last_commit_message="${last_commit_message^}"
-    echo "${last_commit_message}"
+    printf '%s\n' "${last_commit_message}"
     return 0
 }
 
-wait_for_mr() {
-    local branch="${1}"
-    local iid=""
+wait_for_request() {
+    local source_branch="${1}"
     local attempts=0
-    while [ -z "${mr_json}" ]; do
+    local n
+
+    while [ "${attempts}" -lt 6 ]; do
         attempts=$((attempts + 1))
-        glab_mr_list_args=("--source-branch" "${branch}" "--output" "json")
-        iid="$(glab mr list "${glab_mr_list_args[@]}" | jq -r '.[0].iid // empty')"
-        if [ -n "${iid}" ]; then
-            echo "${iid}"
+        n="$(list_by_source "${source_branch}" | jq -r '.[0].id // empty')"
+        if [ -n "${n}" ]; then
+            printf '%s\n' "${n}"
             return 0
         fi
-        [ "${attempts}" -ge 6 ] && break
         sleep 5
     done
     return 1
 }
 
-copy_message() {
-    local mr_iid="${1}"
-    local mr_json=""
-    local glab_mr_view_args=("${mr_iid}" "--output" "json")
-    mr_json="$(glab mr view "${glab_mr_view_args[@]}")"
-    if [ -n "${mr_json}" ]; then
-        echo "${mr_json}" \
-            | jq -r '. | "@hier *" + .title + "* (`" + .source_branch + "` → `" + .target_branch + "`)" + "\n" + .web_url' \
-            | clip
-        echo "Channel message copied to clipboard." 1>&2
+# the branch filter doubles as the target branch of a new request, but only
+# when it is not the branch the request would come from
+create_target_branch() {
+    local source_branch="${1}"
+
+    if [ -n "${branch}" ] && [ "${branch}" != "${source_branch}" ]; then
+        printf '%s\n' "${branch}"
         return 0
     fi
-    return 1
+    git-default 2>/dev/null
 }
 
-show_feedback() {
-    local mr_iid="${1}"
-    local raw="${2}"
-    local discussions_json=""
-    local feedback_markdown=""
+create_request() {
+    local source_branch target_branch default_branch title n
+    local draft=0
+    local keep_source_branch=1
+    local squash_before_merge=0
+    local prompt_args=()
+    local create_args=()
 
-    discussions_json="$(glab api "projects/:fullpath/merge_requests/${mr_iid}/discussions" --paginate)" \
-        || fail "Failed to fetch merge request discussions"
+    source_branch="$(git branch --show-current)"
+    # -k checked out the target branch, so the request comes from the branch
+    # that was checked out before
+    [ -n "${previous_branch}" ] && [ "${previous_branch}" != "${source_branch}" ] \
+        && source_branch="${previous_branch}"
+    [ -z "${source_branch}" ] && fail "Failed to determine the current branch (detached HEAD?)"
+    default_branch="$(git-default 2>/dev/null)"
+    target_branch="$(create_target_branch "${source_branch}")"
+    [ -z "${target_branch}" ] && fail "Failed to determine the target branch, use -b/--branch"
+    [ "${source_branch}" = "${target_branch}" ] \
+        && fail "Source and target branch are the same: ${source_branch}"
 
-    feedback_markdown="$(
-        printf '%s\n' "${discussions_json}" | jq -r '
-          def author:
-            (.author.username // .author.name // "unknown");
-          def created:
-            (.created_at // "unknown time");
-          def body:
-            (.body // "_No body._");
-          def location:
-            if .position and (.position.new_path or .position.old_path) then
-              "**Location:** `" +
-              (.position.new_path // .position.old_path) +
-              (if .position.new_line then
-                ":" + (.position.new_line | tostring)
-              elif .position.old_line then
-                ":" + (.position.old_line | tostring)
-              else
-                ""
-              end) +
-              "`\n\n"
-            else
-              ""
-            end;
-          def parent:
-            if .discussion_id then
-              "**Discussion:** `" + .discussion_id + "`\n\n"
-            else
-              ""
-            end;
-          def resolved:
-            if (.resolvable // false) then
-              "**Resolved:** " +
-              (if (.resolved // false) then "yes" else "no" end) +
-              "\n\n"
-            else
-              ""
-            end;
-          def heading:
-            if .position and (.position.new_path or .position.old_path) then
-              "## Review Comment by " + author
-            else
-              "## Comment by " + author
-            end;
+    echo "Creating a ${NOUN} for ${source_branch} → ${target_branch}..." 1>&2
+    git fetch --all 1>&2
 
-          [
-            .[]
-            | .id as $discussion_id
-            | (.notes // [])[]
-            | select((.system // false) == false)
-            | . + { discussion_id: $discussion_id }
-          ]
-          | sort_by(.created_at // "")
-          | if length == 0 then
-              "No merge request comments found."
-            else
-              "# Merge Request Comments\n\n" +
-              (map(
-                heading +
-                "\n\n**Created:** " + created + "\n\n" +
-                location + parent + resolved + body
-              ) | join("\n\n---\n\n"))
-            end
-        '
-    )" || fail "Failed to format feedback"
+    title="$(commit_to_title)"
+    echo 1>&2
+    [ -n "${title}" ] && prompt_args+=("--default" "${title}")
+    title="$(prompt-input "Title:" "${prompt_args[@]}")" || abort
+    [ -z "${title}" ] && abort
+    prompt-no-yes "Draft?" && draft=1
 
-    if [ "${raw}" -eq 0 ] && [ -t 1 ] && command -v glow >/dev/null 2>&1; then
-        printf '%s\n' "${feedback_markdown}" | glow -
+    if [ "${provider}" = "github" ]; then
+        create_args=("--repo" "${github_repo_selector}"
+                     "--head" "${source_branch}" "--base" "${target_branch}"
+                     "--title" "${title}" "--fill" "--assignee" "${ASSIGNEE_DEFAULT}")
+        [ "${draft}" -eq 1 ] && create_args+=("--draft")
+        gh pr create "${create_args[@]}" || fail "Failed to create the ${NOUN}"
     else
-        printf '%s\n' "${feedback_markdown}"
+        if [ "${source_branch}" != "${default_branch}" ]; then
+            prompt-no-yes "Keep source branch ${source_branch}?" || keep_source_branch=0
+        fi
+        prompt-no-yes "Squash before merge?" && squash_before_merge=1
+        create_args=("--source-branch" "${source_branch}" "--target-branch" "${target_branch}"
+                     "--title" "${title}" "--assignee" "${ASSIGNEE_DEFAULT}")
+        # --fill pushes the source branch, so it is skipped when the source is
+        # the default branch
+        [ "${source_branch}" != "${default_branch}" ] && create_args+=("--fill" "--fill-commit-body")
+        [ "${keep_source_branch}" -eq 0 ] && create_args+=("--remove-source-branch")
+        [ "${squash_before_merge}" -eq 1 ] && create_args+=("--squash-before-merge")
+        [ "${draft}" -eq 1 ] && create_args+=("--draft")
+        glab mr create "${create_args[@]}" || fail "Failed to create the ${NOUN}"
+    fi
+
+    n="$(wait_for_request "${source_branch}")" || return 0
+    copy_message "${n}"
+    return 0
+}
+
+action_label() {
+    case "${1}" in
+        review)   echo "approve + merge" ;;
+        approve)  echo "approve" ;;
+        merge)    echo "merge" ;;
+        copy)     echo "copy message" ;;
+        feedback) echo "feedback" ;;
+        issue)    echo "issue" ;;
+        create)   echo "create" ;;
+        *)        echo "${1}" ;;
+    esac
+}
+
+# 0 the action ran, 1 it failed, 2 the user aborted a prompt
+run_action() {
+    local act="${1}"
+    local n="${2}"
+
+    case "${act}" in
+        review)   approve_and_merge "${n}" ;;
+        approve)  approve_item "${n}" ;;
+        merge)    merge_item "${n}" ;;
+        copy)     copy_message "${n}" ;;
+        feedback) show_feedback "${n}" ;;
+        issue)    create_issue "${n}" ;;
+        *)        error "Unknown action: ${act}"; return 1 ;;
+    esac
+}
+
+branch_filter_label() {
+    if [ -z "${branch}" ]; then
+        echo "all branches"
+    elif [ "${branch_mode}" = "target" ]; then
+        echo "${branch} (as target branch)"
+    else
+        echo "${branch}"
     fi
 }
 
-NL=$'\n'
+state_filter_label() {
+    if [ "${all}" -eq 1 ]; then
+        echo "all states"
+    else
+        echo "open only"
+    fi
+}
+
+menu_print() {
+    local rows source_branch target_branch create_description
+
+    source_branch="$(git branch --show-current 2>/dev/null)"
+    target_branch="$(create_target_branch "${source_branch}")"
+    if [ -n "${source_branch}" ] && [ -n "${target_branch}" ] \
+        && [ "${source_branch}" != "${target_branch}" ]; then
+        create_description="create a ${NOUN} for ${source_branch} → ${target_branch}"
+    else
+        create_description="create a ${NOUN}: check out a feature branch first"
+    fi
+    rows="$(printf '%s\t%s\n' \
+        "review"   "approve, merge, or inspect a ${NOUN}" \
+        "create"   "${create_description}" \
+        "copy"     "copy a channel message for a ${NOUN}" \
+        "feedback" "show the comments and review feedback of a ${NOUN}" \
+        "issue"    "create an issue from a ${NOUN}" \
+        "branch"   "branch filter: $(branch_filter_label)" \
+        "states"   "state filter: $(state_filter_label)" \
+        | awk -F'\t' -v OFS='\t' -v cid="${C_ID}" -v creset="${C_RESET}" \
+              '{ print cid $1 creset, $2 }')"
+    printf '%s\n' "${MENU_HEADER}${NL}${rows}" | render_table
+}
+
+print_context() {
+    printf '%s%-10s%s%s\n' "${C_LABEL}" "Provider:" "${C_RESET}" "${provider} (${remote_host})"
+    printf '%s%-10s%s%s\n' "${C_LABEL}" "Repo:" "${C_RESET}" \
+        "${remote_repository:-$(basename "${repo_dir}")}"
+    printf '%s%-10s%s%s\n' "${C_LABEL}" "Branch:" "${C_RESET}" "$(branch_filter_label)"
+    printf '%s%-10s%s%s\n' "${C_LABEL}" "States:" "${C_RESET}" "$(state_filter_label)"
+}
+
+menu_preview() {
+    local entry
+    local source_branch target_branch
+
+    entry="$(awk '{print $1}' <<< "${1}")"
+    print_context
+    echo
+    case "${entry}" in
+        create)
+            source_branch="$(git branch --show-current 2>/dev/null)"
+            target_branch="$(create_target_branch "${source_branch}")"
+            if [ -z "${source_branch}" ] || [ -z "${target_branch}" ] \
+                || [ "${source_branch}" = "${target_branch}" ]; then
+                printf 'A %s needs a source branch that differs from %s.\n\n' \
+                    "${NOUN}" "${target_branch:-the target branch}"
+            else
+                printf '%sCommits of %s not in %s:%s\n\n' \
+                    "${C_LABEL}" "${source_branch}" "${target_branch}" "${C_RESET}"
+                git log --oneline --no-decorate "${target_branch}..${source_branch}" 2>/dev/null \
+                    || echo "Failed to compare ${target_branch}..${source_branch}"
+                echo
+            fi
+            git status --short --branch 2>/dev/null
+            ;;
+        branch)
+            printf '%sRecently used branches:%s\n\n' "${C_LABEL}" "${C_RESET}"
+            git for-each-ref --sort=-committerdate --count=20 \
+                --format='%(refname:short)' refs/heads 2>/dev/null
+            ;;
+        *)
+            printf '%s%s:%s\n\n' "${C_LABEL}" "${NOUN_PLURAL^}" "${C_RESET}"
+            cached_list
+            ;;
+    esac
+}
+
+pick_branch_filter() {
+    local choice
+    local all_branches="(all branches)"
+
+    choice="$( { printf '%s\n' "BRANCH" "${all_branches}"
+                 git for-each-ref --sort=-committerdate \
+                     --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
+                     | sed -e 's|^origin/||' -e '/^HEAD$/d' \
+                     | awk '!seen[$0]++'; } \
+        | fzf --header-lines 1 --layout=default --info inline-right \
+              --prompt "branch filter> " )" || return 1
+    [ -z "${choice}" ] && return 1
+    if [ "${choice}" = "${all_branches}" ]; then
+        branch=""
+    else
+        branch="${choice}"
+    fi
+    resolve_branch_mode
+    drop_cache
+    write_state
+    return 0
+}
+
+handle_menu_key() {
+    local key line entry
+
+    key="$(head -n 1 <<< "${key_result}")"
+    line="$(sed -n '2p' <<< "${key_result}")"
+    entry="$(awk '{print $1}' <<< "${line}")"
+
+    [ -z "${key}" ] && exit 255
+    case "${key}" in
+        esc|ctrl-q)
+            exit 255
+            ;;
+    esac
+    [ -z "${entry}" ] && exit 0
+
+    case "${entry}" in
+        branch)
+            pick_branch_filter
+            exit 0
+            ;;
+        states)
+            all=$((1 - all))
+            drop_cache
+            write_state
+            exit 0
+            ;;
+        create)
+            create_request
+            exit 1
+            ;;
+        review|copy|feedback|issue)
+            action="${entry}"
+            write_state
+            # the picker returns 1 when it was left with esc, so the menu comes
+            # back instead of ending the run
+            if "${0}" --id "${id}" --pick; then
+                exit 1
+            fi
+            exit 0
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+}
+
+handle_list_key() {
+    local key line n rc
+
+    key="$(head -n 1 <<< "${key_result}")"
+    line="$(sed -n '2p' <<< "${key_result}")"
+    n="$(awk '{print $1}' <<< "${line}")"
+
+    [ -z "${key}" ] && exit 255
+    case "${key}" in
+        esc|ctrl-q)
+            exit 255
+            ;;
+    esac
+    [[ "${n}" =~ ^[0-9]+$ ]] || exit 0
+
+    # read-only actions keep the picker open
+    case "${key}" in
+        ctrl-s)
+            show_details "${n}"
+            exit 0
+            ;;
+        ctrl-d)
+            show_diff "${n}"
+            exit 0
+            ;;
+        ctrl-o)
+            open_item "${n}"
+            exit 0
+            ;;
+        ctrl-f)
+            run_action feedback "${n}"
+            exit 0
+            ;;
+    esac
+    if [ "${key}" = "enter" ] && [ "${action}" = "feedback" ]; then
+        run_action feedback "${n}"
+        exit 0
+    fi
+
+    case "${key}" in
+        enter)  run_action "${action}" "${n}" ;;
+        ctrl-y) run_action copy "${n}" ;;
+        alt-a)  run_action approve "${n}" ;;
+        alt-m)  run_action merge "${n}" ;;
+        alt-i)  run_action issue "${n}" ;;
+        *)      fail "Unknown key: ${key}" ;;
+    esac
+    rc=$?
+    # an aborted prompt changed nothing, so the picker comes back
+    [ "${rc}" -eq 2 ] && exit 0
+    exit 1
+}
+
+list_key_descs() {
+    printf 'enter:%s,ctrl-s:show,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:feedback,alt-a:approve,alt-m:merge,alt-i:issue,esc:back' \
+        "$(action_label "${action}")"
+}
+
+pick_list() {
+    fzf-with-header --key-command "${APP_NAME} --id ${id} --list-key" \
+                    --key-descriptions "$(list_key_descs)" \
+                    --command "${APP_NAME} --id ${id} --list-print" \
+                    "${query}" \
+                    --preview="${APP_NAME} --id ${id} --list-preview {1}" \
+                    --preview-window=right:60%,nowrap \
+                    --expect="${LIST_KEYS}" \
+                    --no-sort
+}
+
+pick_menu() {
+    fzf-with-header --key-command "${APP_NAME} --id ${id} --menu-key" \
+                    --key-descriptions "${MENU_KEY_DESCS}" \
+                    --command "${APP_NAME} --id ${id} --menu-print" \
+                    --preview="${APP_NAME} --id ${id} --menu-preview {1}" \
+                    --preview-window=right:60%,wrap \
+                    --expect="${MENU_KEYS}" \
+                    --no-sort
+}
+
+write_state() {
+    {
+        printf 'provider=%q\n' "${provider}"
+        printf 'remote_host=%q\n' "${remote_host}"
+        printf 'remote_repository=%q\n' "${remote_repository}"
+        printf 'github_repository=%q\n' "${github_repository}"
+        printf 'github_repo_selector=%q\n' "${github_repo_selector}"
+        declare -p github_api_args
+        printf 'repo_dir=%q\n' "${repo_dir}"
+        printf 'action=%q\n' "${action}"
+        printf 'branch=%q\n' "${branch}"
+        printf 'branch_mode=%q\n' "${branch_mode}"
+        printf 'prod_branch=%q\n' "${prod_branch}"
+        printf 'all=%q\n' "${all}"
+        printf 'limit=%q\n' "${limit}"
+        printf 'output=%q\n' "txt"
+        printf 'raw=%q\n' "${raw}"
+        printf 'unresolved=%q\n' "${unresolved}"
+        printf 'query=%q\n' "${query}"
+    } > "${STATE_FILE}"
+}
+
+set_action() {
+    [ -n "${action}" ] && error "Only one action can be used at a time" && usage
+    action="${1}"
+}
+
+action=""
 all=0
-create=0
 branch=""
-cd_project=1
-copy_message=0
-feedback=0
-issue=0
+branch_mode="source"
+checkout=0
+github_api_args=()
+github_repository=""
+github_repo_selector=""
+id=$$
+id_given=0
+key_result=""
+limit="${LIMIT_DEFAULT}"
+mode="default"
+number=""
+output="txt"
+preview_arg=""
+previous_branch=""
+prod_branch="${PROD_BRANCH_DEFAULT}"
+project=""
+provider=""
+query=""
 raw=0
-prod_branch="prod"
-while [ "$#" -gt 0 ]; do
-    case "$1" in
+remote_host=""
+remote_repository=""
+repo_dir=""
+unresolved=0
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
         -h|--help)
             usage
             ;;
         -c|--create)
-            create=1
+            set_action "create"
+            ;;
+        -a|--approve)
+            set_action "approve"
+            ;;
+        -M|--merge)
+            set_action "merge"
+            ;;
+        -m|--copy-message)
+            set_action "copy"
+            ;;
+        -i|--issue)
+            set_action "issue"
+            ;;
+        --feedback)
+            set_action "feedback"
             ;;
         -A|--all)
             all=1
@@ -186,173 +1178,234 @@ while [ "$#" -gt 0 ]; do
             [ -z "${1}" ] && usage
             branch="${1}"
             ;;
+        -k|--checkout)
+            checkout=1
+            ;;
         --prod-branch)
             shift
             [ -z "${1}" ] && usage
             prod_branch="${1}"
             ;;
-        -m|--copy-message)
-            copy_message=1
+        -n|--number)
+            shift
+            [[ "${1}" =~ ^[0-9]+$ ]] || { error "Invalid number: ${1}"; usage; }
+            number="${1}"
             ;;
-        --feedback)
-            feedback=1
+        -u|--unresolved)
+            unresolved=1
             ;;
         -r|--raw)
             raw=1
             ;;
-        -i|--issue)
-            issue=1
+        -q|--query)
+            shift
+            [ -z "${1}" ] && usage
+            query="${1}"
+            ;;
+        -l|--limit)
+            shift
+            [[ "${1}" =~ ^[0-9]+$ ]] || { error "Invalid limit: ${1}"; usage; }
+            [ "${1}" -lt 1 ] && { error "Invalid limit: ${1}"; usage; }
+            limit="${1}"
+            ;;
+        -p|--print)
+            mode="print"
+            ;;
+        -o|--output)
+            shift
+            case "${1}" in
+                txt|json) output="${1}" ;;
+                *) error "Invalid output format: ${1}"; usage ;;
+            esac
+            ;;
+        --menu-print)
+            mode="menu-print"
+            ;;
+        --list-print)
+            mode="list-print"
+            ;;
+        --pick)
+            mode="pick"
+            ;;
+        --menu-preview|--list-preview)
+            case "${1}" in
+                --menu-preview) mode="menu-preview" ;;
+                --list-preview) mode="list-preview" ;;
+            esac
+            shift
+            preview_arg="${1}"
+            ;;
+        --menu-key|--list-key)
+            case "${1}" in
+                --menu-key) mode="menu-key" ;;
+                --list-key) mode="list-key" ;;
+            esac
+            shift
+            [ -z "${1}" ] && fail "Missing argument for key"
+            key_result="${1}"
+            ;;
+        --id)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for id"
+            id="${1}"
+            id_given=1
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
             ;;
         *)
-            [ -z "${project}" ] || usage
+            [ -n "${project}" ] && error "Unexpected argument: ${1}" && usage
             project="${1}"
             ;;
     esac
     shift
 done
 
-[ "${all}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-A|--all can not be combined with -c|--create" && usage
-[ "${copy_message}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-m|--copy-message can not be combined with -c|--create" && usage
-[ "${feedback}" -eq 1 ] && [ "${create}" -eq 1 ] && error "--feedback can not be combined with -c|--create" && usage
-[ "${issue}" -eq 1 ] && [ "${create}" -eq 1 ] && error "-i|--issue can not be combined with -c|--create" && usage
-[ "${issue}" -eq 1 ] && [ "${copy_message}" -eq 1 ] && error "-i|--issue can not be combined with -m|--copy-message" && usage
-[ "${issue}" -eq 1 ] && [ "${feedback}" -eq 1 ] && error "-i|--issue can not be combined with --feedback" && usage
-[ "${copy_message}" -eq 1 ] && [ "${feedback}" -eq 1 ] && error "-m|--copy-message can not be combined with --feedback" && usage
-[ "${raw}" -eq 1 ] && [ "${feedback}" -eq 0 ] && error "-r|--raw requires --feedback" && usage
+STATE_FILE="/tmp/${APP_NAME}-${id}.state"
+TABLE_FILE="/tmp/${APP_NAME}-${id}.table"
 
-if [ -z "${project}" ]; then
-    git_dir="$(git rev-parse --show-toplevel 2>/dev/null)"
-    [ -n "${git_dir}" ] && cd "${git_dir}"
-    if project="$(git remote get-url origin)"; then
-        cd_project=0
-    else
-        fail "Failed to determine project"
-    fi
+# the picker calls back into the script, those runs reuse the state of the run
+# that opened it
+if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
+    # shellcheck source=/dev/null
+    . "${STATE_FILE}"
+    cd "${repo_dir}" || fail "Failed to enter ${repo_dir}"
+    set_provider_labels
+    case "${mode}" in
+        menu-print)
+            menu_print
+            exit 0
+            ;;
+        list-print)
+            list_print
+            exit 0
+            ;;
+        menu-preview)
+            menu_preview "${preview_arg}"
+            exit 0
+            ;;
+        list-preview)
+            preview_item "${preview_arg}"
+            exit 0
+            ;;
+        menu-key)
+            handle_menu_key
+            ;;
+        list-key)
+            handle_list_key
+            ;;
+        pick)
+            need_cmd fzf-with-header
+            pick_list
+            exit "${?}"
+            ;;
+    esac
 fi
 
-if [ ${cd_project} -eq 1 ]; then
+case "${mode}" in
+    menu-print|list-print|menu-preview|list-preview|menu-key|list-key|pick)
+        fail "No state for id ${id}"
+        ;;
+esac
+
+[ "${all}" -eq 1 ] && [ "${action}" = "create" ] \
+    && error "-A|--all can not be combined with -c|--create" && usage
+[ -n "${number}" ] && [ "${action}" = "create" ] \
+    && error "-n|--number can not be combined with -c|--create" && usage
+[ "${raw}" -eq 1 ] && [ "${action}" != "feedback" ] \
+    && error "-r|--raw requires --feedback" && usage
+[ "${unresolved}" -eq 1 ] && [ "${action}" != "feedback" ] \
+    && error "-u|--unresolved requires --feedback" && usage
+[ "${output}" = "json" ] && [ "${mode}" != "print" ] \
+    && error "-o|--output requires -p|--print" && usage
+
+need_cmd git
+need_cmd jq
+need_cmd git-default
+need_cmd prompt-input
+
+cded=0
+if [ -n "${project}" ]; then
+    need_cmd git-find-repo
     folder="$(git-find-repo "${project}")" || fail "Failed to find project: ${project}"
-    cd "${folder}" 1> /dev/null || fail "Failed to change to: ${folder}"
+    cd "${folder}" 1>/dev/null || fail "Failed to change to: ${folder}"
+    cded=1
 fi
-url="$(git remote get-url origin)" || fail "Failed to determine origin"
-previous_branch="$(git branch --show-current)"
 
-[[ "${url}" =~ "github.com" ]] && fail "Not a gitlab repository: ${url}"
+repo_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not a git repo"
+[ -z "${repo_dir}" ] && fail "Not a git repo"
+cd "${repo_dir}" 1>/dev/null || fail "Failed to change to: ${repo_dir}"
 
-if [ -z "${branch}" ]; then
-    sleep 1 # might be a subsequent call, right after the branch was created
-    if ! branch="$(git branch --show-current)"; then
-        fail "Failed to determine branch"
-    fi
+remote_url="$(select_remote_url)" || fail "Failed to determine the remote"
+detect_provider "${remote_url}"
+set_provider_labels
+if [ "${provider}" = "github" ]; then
+    need_cmd gh
 else
+    need_cmd glab
+fi
+
+if [ "${checkout}" -eq 1 ]; then
+    [ -z "${branch}" ] && fail "-k|--checkout requires -b|--branch"
+    need_cmd git-checkout
+    previous_branch="$(git branch --show-current 2>/dev/null)"
     if git-checkout "${branch}"; then
         git pull
     else
-        error "Failed to checkout branch: ${branch}, continue anyway"
+        error "Failed to check out branch: ${branch}, continue anyway"
     fi
 fi
 
+# the branch of the working tree is the default filter
+[ -z "${branch}" ] && [ "${action}" != "create" ] && branch="$(git branch --show-current 2>/dev/null)"
+resolve_branch_mode
+
 echo 1>&2
-echo "URL:    ${url}" 1>&2
-echo "Branch: ${branch}" 1>&2
+{
+    printf 'URL:      %s\n' "${remote_url}"
+    printf 'Provider: %s\n' "${provider}"
+    printf 'Branch:   %s\n' "$(branch_filter_label)"
+} 1>&2
 echo 1>&2
 
-if [ "${create}" -eq 0 ]; then
-    glab_mr_list_args=()
-    if [ "${branch}" == "$(git-default)" ] || { [ -n "${prod_branch}" ] && [ "${branch}" == "${prod_branch}" ]; }; then
-        glab_mr_list_args+=("--target-branch")
-    else
-        glab_mr_list_args+=("--source-branch")
-    fi
-    glab_mr_list_args+=("${branch}")
-    [ "${all}" -eq 1 ] && glab_mr_list_args+=("--all")
-    if [ "${issue}" -eq 1 ]; then
-        glab_mr_list_args+=("-P")
-        glab_mr_list_args+=("10")
-        echo "Open MRs: "
-        glab mr list --order "updated_at" "${glab_mr_list_args[@]}"
-        echo
-        echo "Merged MRs:"
-        glab mr list --order "merged_at" --merged "${glab_mr_list_args[@]}"
-        echo
-        mr="$(prompt-input "Choose MR:")"
-        mr_json="$(glab mr view "${mr}" --output "json")"
-        mr_link="$(echo "${mr_json}" | jq -r '.web_url // empty')"
-        mr_title="$(echo "${mr_json}" | jq -r '.title // empty')"
-        mr_description="$(echo "${mr_json}" | jq -r '.description // empty')"
-        [ -z "${mr_title}" ] && fail "Failed to read MR title"
+trap 'rm -f "${STATE_FILE}" "${TABLE_FILE}"' EXIT
+write_state
 
-        qwen_json="$(qwen-auto -c /issue:from-pr-mr "${mr_title}${NL}${mr_description}")"
-        title="$(echo "${qwen_json}" | jq -r '.title // empty')"
-        description="$(echo "${qwen_json}" | jq -r '.description // empty')"
-        description="$(echo -e "${description}\n\nSee: ${mr_link}")"
-        title="$(prompt-input "Title:" --default "${title}")" || abort
-        assignee="$(prompt-input "Assignee:" --default "dgrieser")"
-        glab_issue_create_args=("--assignee" "${assignee}")
-        glab_issue_create_args+=("--title" "${title}")
-        if [ -n "${description}" ]; then
-            glab_issue_create_args+=("--description" "${description}")
-            echo -e "Description:\n${description}"
-        fi
-        glab_issue_create_args+=("--web")
-        echo
-        prompt-continue || abort
-        glab issue create "${glab_issue_create_args[@]}"
-    else
-        glab_mr_list_args+=("-P")
-        glab_mr_list_args+=("100")
-        glab mr list --order "updated_at" "${glab_mr_list_args[@]}" 1>&2
-        echo 1>&2
-        mr=$(prompt-input "Choose MR:")
-        if [ "${feedback}" -eq 1 ]; then
-            show_feedback "${mr}" "${raw}"
-        elif [ "${copy_message}" -eq 1 ]; then
-            copy_message "${mr}"
-        else
-            glab mr show "${mr}"
-            glab mr diff "${mr}"
-            echo
-            prompt-continue || abort
-            glab mr approve "${mr}" && \
-            glab mr merge "${mr}"
-        fi
-    fi
+exit_code=0
+if [ "${action}" = "create" ]; then
+    create_request
+    exit_code="${?}"
+elif [ "${mode}" = "print" ] || { [ ! -t 1 ] && [ -z "${number}" ]; }; then
+    need_cmd toage
+    list_print
+    exit_code="${?}"
+elif [ -n "${number}" ]; then
+    [ -z "${action}" ] && action="review"
+    run_action "${action}" "${number}"
+    exit_code="${?}"
+    [ "${exit_code}" -eq 2 ] && exit_code=1
 else
-    target_branch=""
-    source_branch=""
-    # really not sure about this automagic
-    if [ "${branch}" == "${previous_branch}" ]; then
-        source_branch="${branch}"
-        target_branch="$(git-default)"
+    need_cmd toage
+    need_cmd fzf-with-header
+    if [ -z "${action}" ]; then
+        pick_menu
+        exit_code="${?}"
+        # leaving the menu without choosing anything is not an error
+        [ "${exit_code}" -eq 1 ] && exit_code=0
     else
-        target_branch="${branch}"
-        source_branch="${previous_branch}"
+        list_count="$(list_json | jq 'length')"
+        if [ -z "${list_count}" ] || [ "${list_count}" -eq 0 ]; then
+            warning "No ${NOUN_PLURAL} found"
+            exit_code=1
+        else
+            pick_list
+            exit_code="${?}"
+        fi
     fi
-    echo "Creating MR for ${source_branch} → ${target_branch}..."
-
-    git fetch --all
-
-    last_commit_message="$(commit-to-title)"
-    echo
-    prompt_args=()
-    [ -n "${last_commit_message}" ] && prompt_args+=("--default" "${last_commit_message}")
-    title="$(prompt-input "Title:" "${prompt_args[@]}")" || abort
-    [ -z "${title}" ] && abort
-    draft="$(prompt-no-yes "Draft?" && echo 1 || echo 0)"
-    if [ "${source_branch}" == "$(git-default)" ]; then
-        keep_source_branch=1
-    else
-        keep_source_branch="$(prompt-no-yes "Keep source branch ${branch}?" && echo 1 || echo 0)"
-    fi
-    squash_before_merge="$(prompt-no-yes "Squash before merge?" && echo 1 || echo 0)"
-    glab_mr_create_args=("--source-branch" "${source_branch}" "--target-branch" "${target_branch}" "--title" "${title}" "--assignee" "dgrieser")
-    # --fill will automatically push source branch changes, so don't fill when source branch is (master/main)
-    [ "${source_branch}" != "$(git-default)" ] && glab_mr_create_args+=("--fill" "--fill-commit-body")
-    [ "${keep_source_branch}" -eq 0 ] && glab_mr_create_args+=("--remove-source-branch")
-    [ "${squash_before_merge}" -eq 1 ] && glab_mr_create_args+=("--squash-before-merge")
-    [ "${draft}" -eq 1 ] && glab_mr_create_args+=("--draft")
-    glab mr create "${glab_mr_create_args[@]}"
-    mr_iid="$(wait_for_mr "${source_branch}")" && copy_message "${mr_iid}"
 fi
 
-cd - &> /dev/null
+if [ "${cded}" -eq 1 ]; then
+    cd - &>/dev/null || true
+fi
+exit "${exit_code}"

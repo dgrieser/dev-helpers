@@ -308,13 +308,16 @@ _git-mr()
     local cur prev
     __dh_init
     case "${prev}" in
-        -b|--branch)
+        -b|--branch|--prod-branch)
             __dh_compgen "$(__dh_all_branches)"
             return 0 ;;
-        --prod-branch) return 0 ;;
+        -o|--output)
+            __dh_compgen "txt json"
+            return 0 ;;
+        -n|--number|-q|--query|-l|--limit) return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-c --create -m --copy-message -i --issue --feedback -r --raw -b --branch --prod-branch -A --all -h --help"
+        __dh_compgen "-c --create -a --approve -M --merge -m --copy-message -i --issue --feedback -u --unresolved -r --raw -b --branch -k --checkout --prod-branch -A --all -n --number -q --query -l --limit -p --print -o --output -h --help"
     else
         __dh_compgen "$(__dh_projects)"
     fi
@@ -372,14 +375,8 @@ _git-pipe()
 }
 complete -F _git-pipe git-pipe
 
-_git-pr()
-{
-    local cur prev
-    __dh_init
-    __dh_compgen "-b --branch -c --create --feedback -r --raw -h --help"
-    return 0
-}
-complete -F _git-pr git-pr
+# git-pr is a symlink to git-mr, so it takes the same options
+complete -F _git-mr git-pr
 
 _git-push()
 {
