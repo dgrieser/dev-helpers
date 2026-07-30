@@ -49,6 +49,11 @@ __dh_tags()
     git tag --sort=-v:refname 2>/dev/null
 }
 
+__dh_commits()
+{
+    git log --max-count=50 --pretty=format:'%h' 2>/dev/null
+}
+
 __dh_projects()
 {
     git-find-repo --list 2>/dev/null
@@ -258,16 +263,45 @@ _git-log()
     local cur prev
     __dh_init
     case "${prev}" in
-        -d|--diff|-p|--create-patch|-r|--revert|-q|--query) return 0 ;;
+        -d|--diff|-f|--files|-p|--create-patch|-r|--revert|-b|--revert-branch)
+            __dh_compgen "$(__dh_commits)"
+            return 0 ;;
+        --ref)
+            __dh_compgen "$(__dh_all_branches) $(__dh_tags)"
+            return 0 ;;
+        -o|--output-dir)
+            __dh_dirs
+            return 0 ;;
+        -q|--query|-n|--max-count|--author|--grep) return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-h --help --print -d --diff -p --create-patch -r --revert -q --query"
+        __dh_compgen "-h --help --print -q --query -n --max-count --ref --all \
+                      --author --grep --merges --no-merges -d --diff -f --files \
+                      -p --create-patch -o --output-dir -r --revert -b --revert-branch"
     else
         __dh_files
     fi
     return 0
 }
 complete -F _git-log git-log
+
+_git-move()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -b|--base)
+            __dh_compgen "$(__dh_all_branches)"
+            return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-b --base -c --with-commits -C --no-commits -y --yes -h --help"
+    else
+        __dh_compgen "$(__dh_local_branches)"
+    fi
+    return 0
+}
+complete -F _git-move git-move
 
 _git-mr()
 {

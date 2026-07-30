@@ -132,9 +132,30 @@ git-last-change
 ```
 
 ### git-log
-Interactive log picker with diff/patch/revert/query actions.
+Interactive log picker. Commits are listed as COMMIT / AGE / AUTHOR / MESSAGE
+(with branch and tag decorations), the preview shows the commit with its stat
+and patch. Keys: `ctrl-c` copies the hash, `ctrl-d` shows the diff, `ctrl-o`
+opens the commit in the browser, `alt-p` writes it as a patch file, `alt-r`
+reverts it in the working tree, `alt-b` reverts it on a new branch and
+optionally pushes it and opens a merge/pull request.
+
+`enter` steps into a commit and opens a file picker with the changed files
+plus their churn on the left and the diff of the selected file in the preview:
+`enter` shows the file diff, `ctrl-c` copies the path, `alt-v` opens the before
+and after version in vimdiff, `alt-p` writes the file's diff as a patch, and
+`alt-r` reverts just that file's change. `esc` and `backspace` return to the
+commit list. Merge commits are shown against their first parent.
 ```bash
-git-log [--print] [-d <commit>] [-p <commit>] [-r <commit>] [-q <query>] [<path>...]
+git-log [--print] [-q <query>] [-n <count>] [--ref <rev>] [--all] \
+        [--author <pattern>] [--grep <pattern>] [--merges|--no-merges] \
+        [-d <commit>] [-f <commit>] [-p <commit>] [-o <dir>] \
+        [-r <commit>] [-b <commit>] [--] [<path>...]
+```
+
+### git-move
+Move uncommitted changes to a new branch, leaving the current branch clean; optionally take unpushed commits along and reset the current branch to its upstream. Changes travel with the branch switch when the branch starts at the current commit, otherwise through a stash that is only dropped once it applied cleanly.
+```bash
+git-move [-b|--base <ref>] [-c|--with-commits] [-C|--no-commits] [-y|--yes] [BRANCH]
 ```
 
 ### git-mr

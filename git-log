@@ -2,8 +2,78 @@
 
 APP="$(basename "${0}")"
 
+NL=$'\n'
+
+MAX_COUNT_DEFAULT=500
+
+C_HASH=$'\033[33m'
+C_AGE=$'\033[38;5;6m'
+C_AUTHOR=$'\033[38;5;33m'
+C_REFS=$'\033[38;5;208m'
+C_ADD=$'\033[32m'
+C_DEL=$'\033[31m'
+C_MOD=$'\033[33m'
+C_MOVE=$'\033[38;5;33m'
+C_RESET=$'\033[0m'
+
+SHOW_ARGS=(--format= -m --first-parent)
+
+LOG_HEADER=$'COMMIT\tAGE\tAUTHOR\tMESSAGE'
+LOG_KEYS="ctrl-c,ctrl-d,ctrl-o,alt-p,alt-r,alt-b,esc,enter"
+LOG_KEY_DESCS="enter:files,ctrl-c:copy hash,ctrl-d:diff,ctrl-o:open,alt-p:patch,alt-r:revert,alt-b:revert on branch"
+
+FILES_HEADER=$'STATUS\t+\t-\tPATH'
+FILES_KEYS="ctrl-c,alt-v,alt-p,alt-r,esc,bspace,enter"
+FILES_KEY_DESCS="enter:diff,ctrl-c:copy path,alt-v:vimdiff,alt-p:patch,alt-r:revert file,esc:back,bspace:back"
+
+key_help() {
+    printf '%s' "${1}" | tr ',' '\n' | awk -F':' '{ printf "  %-8s %s\n", $1, $2 }'
+}
+
 usage() {
-    echo "usage: ${APP} [-h|--help] [--print] [-d|--diff <commit>] [-p|--create-patch <commit>] [-r|--revert <commit>] [-q|--query <query>] [<path ...>]" 1>&2
+    cat <<EOF 1>&2
+usage: ${APP} [OPTIONS] [--] [<path> ...]
+
+Interactive git log picker. Commits are listed as COMMIT / AGE / AUTHOR /
+MESSAGE and the preview shows the commit with its stat and patch.
+
+Keys:
+$(key_help "${LOG_KEY_DESCS}")
+
+enter steps into a commit and opens a file picker with the changed files on
+the left and the diff of the selected file in the preview:
+$(key_help "${FILES_KEY_DESCS}")
+
+esc and backspace leave the file picker and return to the commit list, so
+backspace does not erase the search query there.
+
+Options:
+  -q, --query <query>       start the picker with a search query
+  -n, --max-count <n>       number of commits to list (default ${MAX_COUNT_DEFAULT}, 0 for all)
+      --ref <rev>           list <rev>, a branch, tag, or range, instead of
+                            HEAD; may be repeated
+      --all                 list the commits of all refs
+      --author <pattern>    only commits whose author matches <pattern>
+      --grep <pattern>      only commits whose message matches <pattern>
+      --merges              only merge commits
+      --no-merges           skip merge commits
+      --print               print the commit list instead of opening the picker
+  -d, --diff <commit>       show the diff of <commit>
+  -f, --files <commit>      open the file picker for <commit>
+  -p, --create-patch <commit>
+                            write <commit> to a patch file
+  -o, --output-dir <dir>    directory for the patch files (default: the current
+                            directory)
+  -r, --revert <commit>     revert <commit> in the working tree, without
+                            committing
+  -b, --revert-branch <commit>
+                            revert <commit> on a new branch, commit it, and
+                            optionally push it and open a merge/pull request
+  -h, --help                show this help message and exit
+
+<path> arguments limit the log, the previews, and the file picker to those
+paths.
+EOF
     exit 1
 }
 
@@ -16,50 +86,535 @@ fail() {
     exit 1
 }
 
-GIT_DIR="$(git rev-parse --show-toplevel)"
-HEADER="COMMIT  DATE  AUTHOR  MESSAGE"
-NL=$'\n'
-KEYS="alt-p,alt-r,alt-d,esc,ctrl-c,ctrl-d,enter"
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "${1} not found"
+}
+
+pager() {
+    if [ -t 1 ]; then
+        less -R
+    else
+        cat
+    fi
+}
+
+# pad tab separated columns, ANSI aware, so colored cells still line up; the
+# last column stays unpadded and the two space separator doubles as the column
+# delimiter of the picker
+render_table() {
+    awk -F'\t' '
+        function vlen(s) { gsub(/\033\[[0-9;]*m/, "", s); return length(s) }
+        { rows[NR] = $0
+          for (i = 1; i <= NF; i++) { l = vlen($i); if (l > w[i]) w[i] = l } }
+        END {
+            for (r = 1; r <= NR; r++) {
+                nf = split(rows[r], f, "\t")
+                line = ""
+                for (i = 1; i <= nf; i++) {
+                    if (i > 1) line = line "  "
+                    line = line f[i]
+                    if (i < nf) { pad = w[i] - vlen(f[i]); while (pad-- > 0) line = line " " }
+                }
+                print line
+            }
+        }'
+}
+
+# the parent to diff against; empty for a root commit
+parent_of() {
+    git rev-parse --verify --quiet "${1}^" 2>/dev/null
+}
+
+resolve_commit() {
+    local rev
+    rev="$(git rev-parse --verify --quiet "${1}^{commit}" 2>/dev/null)" \
+        || fail "Not a commit: ${1}"
+    [ -z "${rev}" ] && fail "Not a commit: ${1}"
+    printf '%s\n' "${rev}"
+}
+
+print_log() {
+    local rows
+
+    rows="$(git log --pretty=format:"%h%x09%cI%x09%al%x09%D%x09%s" \
+                "${log_args[@]}" -- "${paths[@]}" 2>/dev/null \
+        | toage \
+        | awk -F'\t' -v OFS='\t' -v crefs="${C_REFS}" -v chash="${C_HASH}" \
+              -v cage="${C_AGE}" -v cauthor="${C_AUTHOR}" -v reset="${C_RESET}" '
+            {
+                msg = $5
+                for (i = 6; i <= NF; i++) msg = msg " " $i
+                gsub(/[ \t]+/, " ", msg)
+                if ($4 != "") msg = crefs "(" $4 ")" reset " " msg
+                print chash $1 reset, cage $2 reset, cauthor $3 reset, msg
+            }')"
+
+    if [ -z "${rows}" ]; then
+        printf '%s\n' "${LOG_HEADER}" | render_table
+        return 0
+    fi
+    printf '%s\n' "${LOG_HEADER}${NL}${rows}" | render_table
+}
+
+print_files() {
+    local rows
+
+    # --numstat and --name-status walk the same diff in the same order, so the
+    # line number joins the churn counts to the status
+    rows="$(awk -F'\t' -v OFS='\t' -v cadd="${C_ADD}" -v cdel="${C_DEL}" \
+                -v cmod="${C_MOD}" -v cmove="${C_MOVE}" -v reset="${C_RESET}" '
+            NR == FNR { add[FNR] = $1; del[FNR] = $2; next }
+            NF < 2 { next }
+            {
+                status = $1
+                path = (NF >= 3 ? $2 " -> " $3 : $2)
+                color = cmod
+                if (status ~ /^A/) color = cadd
+                else if (status ~ /^D/) color = cdel
+                else if (status ~ /^[RC]/) color = cmove
+                a = (add[FNR] == "" ? "-" : add[FNR])
+                d = (del[FNR] == "" ? "-" : del[FNR])
+                print color status reset, cadd a reset, cdel d reset, color path reset
+            }' \
+            <(git show "${SHOW_ARGS[@]}" --numstat "${commit}" -- "${paths[@]}" 2>/dev/null | grep -v '^$') \
+            <(git show "${SHOW_ARGS[@]}" --name-status "${commit}" -- "${paths[@]}" 2>/dev/null | grep -v '^$'))"
+
+    if [ -z "${rows}" ]; then
+        printf '%s\n' "${FILES_HEADER}" | render_table
+        return 0
+    fi
+    printf '%s\n' "${FILES_HEADER}${NL}${rows}" | render_table
+}
+
+# the path is the last column of the file picker; renames are listed as
+# "old -> new" and the new path is the one that exists in the commit
+path_from_line() {
+    local path
+
+    path="$(sed -E 's/^([^[:space:]]+[[:space:]]+){3}//' <<< "${1}")"
+    path="${path%"${path##*[![:space:]]}"}"
+    [[ "${path}" == *" -> "* ]] && path="${path##* -> }"
+    printf '%s\n' "${path}"
+}
+
+is_merge() {
+    [ "$(git rev-list --parents -n 1 "${1}" | wc -w)" -gt 2 ]
+}
+
+preview_commit() {
+    git show -m --first-parent --color=always --stat --patch "${1}" -- "${paths[@]}"
+}
+
+preview_file() {
+    git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" --color=always "${commit}" -- "${1}"
+}
+
+show_diff() {
+    git show -m --first-parent --color=always --stat --patch "${1}" -- "${paths[@]}" | pager
+}
+
+show_file_diff() {
+    git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" --color=always "${commit}" -- "${1}" | pager
+}
+
+create_patch() {
+    local rev="${1}"
+    local out
+
+    [ -d "${output_dir}" ] || fail "No such directory: ${output_dir}"
+    # format-patch skips merges, so those are written as a plain diff instead
+    if is_merge "${rev}"; then
+        out="${output_dir}/$(git rev-parse --short "${rev}").patch"
+        git show -m --first-parent --patch "${rev}" -- "${paths[@]}" > "${out}" \
+            || fail "Failed to create a patch for ${rev}"
+        [ -s "${out}" ] || { rm -f "${out}"; fail "Nothing to patch in ${rev}"; }
+    else
+        out="$(git format-patch -1 --output-directory "${output_dir}" "${rev}" -- "${paths[@]}")" \
+            || fail "Failed to create a patch for ${rev}"
+        [ -z "${out}" ] && fail "Nothing to patch in ${rev}"
+    fi
+    printf '%s\n' "${out}"
+}
+
+create_file_patch() {
+    local path="${1}"
+    local short out
+
+    [ -d "${output_dir}" ] || fail "No such directory: ${output_dir}"
+    short="$(git rev-parse --short "${commit}")"
+    out="${output_dir}/$(basename "${path}").${short}.patch"
+    git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" "${commit}" -- "${path}" > "${out}" \
+        || fail "Failed to create a patch for ${path}"
+    [ -s "${out}" ] || { rm -f "${out}"; fail "Nothing to patch for ${path} in ${short}"; }
+    printf '%s\n' "${out}"
+}
+
+revert_commit() {
+    local rev="${1}"
+    local revert_args=(--no-commit)
+
+    # reverting a merge needs to know which side to keep
+    is_merge "${rev}" && revert_args+=(--mainline 1)
+    if ! git revert "${revert_args[@]}" "${rev}"; then
+        error "Reverting ${rev} did not apply cleanly."
+        error "Resolve the conflicts and commit, or run 'git revert --abort'."
+        return 1
+    fi
+    echo "Reverted ${rev} in the working tree. Run 'git commit' to record it." 1>&2
+}
+
+revert_file() {
+    local path="${1}"
+    local short
+
+    short="$(git rev-parse --short "${commit}")"
+    if ! git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" "${commit}" -- "${path}" \
+        | git -C "${repo_root_dir}" apply -R -; then
+        error "Reverting ${path} from ${short} did not apply cleanly."
+        return 1
+    fi
+    echo "Reverted ${path} from ${short} in the working tree." 1>&2
+}
+
+provider() {
+    local host
+
+    host="$(git-browse -p --host-only 2>/dev/null)"
+    if [[ "${host}" == *github* ]] || [ -n "$(git config --get remote.origin.gh-resolved 2>/dev/null)" ]; then
+        echo "github"
+    else
+        echo "gitlab"
+    fi
+}
+
+commit_url() {
+    local base host
+
+    base="$(git-browse -p 2>/dev/null)" || return 1
+    host="$(git-browse -p --host-only 2>/dev/null)" || return 1
+    [ -z "${base}" ] && return 1
+    if [[ "${host}" == *github* ]]; then
+        echo "${base}/commit/${1}"
+    else
+        echo "${base}/-/commit/${1}"
+    fi
+}
+
+open_commit() {
+    local url
+
+    need_cmd git-browse
+    url="$(commit_url "${1}")" || fail "Failed to determine the commit URL"
+    need_cmd gio
+    gio open "${url}" &>/dev/null
+}
+
+revert_branch() {
+    local rev="${1}"
+    local short subject branch default_branch prov
+    local revert_args=(--no-edit)
+
+    need_cmd prompt-input
+    # untracked files travel along with the branch switch, tracked changes
+    # would be in the way of the revert
+    [ -n "$(git status --porcelain --untracked-files=no)" ] \
+        && fail "The working tree has changes, commit or stash them first."
+
+    short="$(git rev-parse --short "${rev}")"
+    subject="$(git log -1 --pretty=%s "${rev}")"
+    default_branch="revert/${short}"
+
+    echo "Reverting ${short} ${subject}" 1>&2
+    branch="$(prompt-input "Branch name:" --default "${default_branch}")" || abort
+    [ -z "${branch}" ] && abort
+
+    is_merge "${rev}" && revert_args+=(--mainline 1)
+    git switch -c "${branch}" || fail "Failed to create branch ${branch}"
+    if ! git revert "${revert_args[@]}" "${rev}"; then
+        error "Reverting ${short} did not apply cleanly."
+        error "Resolve the conflicts, then run 'git revert --continue'."
+        return 1
+    fi
+
+    prov="$(provider)"
+    if [ "${prov}" = "github" ]; then
+        prompt-no-yes "Push ${branch} and create a pull request?" || return 0
+        git-push -p || fail "Failed to push ${branch}"
+        git-pr -c
+    else
+        prompt-no-yes "Push ${branch} and create a merge request?" || return 0
+        git-push -p || fail "Failed to push ${branch}"
+        git-mr -c
+    fi
+}
+
+vimdiff_file() {
+    local path="${1}"
+    local parent tmp_root old new
+
+    need_cmd vim
+    parent="$(parent_of "${commit}")"
+    tmp_root="$(mktemp -d)" || fail "Cannot create a temp directory"
+    trap 'rm -rf "${tmp_root}"' EXIT
+
+    old="${tmp_root}/before/${path}"
+    new="${tmp_root}/after/${path}"
+    mkdir -p "$(dirname "${old}")" "$(dirname "${new}")"
+    # a file that is missing on either side diffs against an empty file
+    if [ -n "${parent}" ]; then
+        git -C "${repo_root_dir}" show "${parent}:${path}" > "${old}" 2>/dev/null || : > "${old}"
+    else
+        : > "${old}"
+    fi
+    git -C "${repo_root_dir}" show "${commit}:${path}" > "${new}" 2>/dev/null || : > "${new}"
+
+    # both sides are history, so neither is editable; closing one window quits
+    # vim so the picker comes back right away
+    vim -d "${old}" "${new}" \
+        -c 'windo setlocal readonly nomodifiable' -c 'wincmd h' \
+        -c 'autocmd WinClosed * ++nested qall' \
+        -c 'redraw!'
+}
+
+write_state() {
+    {
+        printf 'start_dir=%q\n' "${PWD}"
+        printf 'repo_root_dir=%q\n' "${repo_root_dir}"
+        printf 'output_dir=%q\n' "${output_dir}"
+        printf 'commit=%q\n' "${commit}"
+        declare -p paths
+        declare -p log_args
+    } > "${STATE_FILE}"
+}
+
+pick_log() {
+    fzf-with-header --key-command "${APP} --id ${id} --key" \
+                    --key-descriptions "${LOG_KEY_DESCS}" \
+                    --command "${APP} --id ${id} --print" \
+                    "${query}" \
+                    --preview="${APP} --id ${id} --preview {1}" \
+                    --preview-window=right:60%,nowrap \
+                    --expect="${LOG_KEYS}" \
+                    --no-sort
+}
+
+pick_files() {
+    fzf-with-header --key-command "${APP} --id ${id} --files-key" \
+                    --key-descriptions "${FILES_KEY_DESCS}" \
+                    --command "${APP} --id ${id} --files-print" \
+                    --preview="${APP} --id ${id} --file-preview {}" \
+                    --preview-window=right:70%,nowrap \
+                    --expect="${FILES_KEYS}" \
+                    --no-sort
+}
+
+handle_log_key() {
+    local key line rev
+
+    key="$(head -n 1 <<< "${key_result}")"
+    line="$(sed -n '2p' <<< "${key_result}")"
+    rev="$(awk '{print $1}' <<< "${line}")"
+
+    case "${key}" in
+        esc)
+            exit 255
+            ;;
+    esac
+    [ -z "${rev}" ] && exit 0
+
+    case "${key}" in
+        enter)
+            # leaving the file picker with esc returns to the commit list,
+            # accepting one of its actions ends the picker altogether
+            "${0}" --files "${rev}" -- "${paths[@]}" || exit 0
+            exit 1
+            ;;
+        ctrl-c)
+            printf '%s\n' "${line}"
+            need_cmd clip
+            printf '%s' "${rev}" | clip
+            exit 1
+            ;;
+        ctrl-d)
+            show_diff "${rev}"
+            exit 0
+            ;;
+        ctrl-o)
+            open_commit "${rev}"
+            exit 0
+            ;;
+        alt-p)
+            create_patch "${rev}"
+            exit 1
+            ;;
+        alt-r)
+            revert_commit "${rev}"
+            exit 1
+            ;;
+        alt-b)
+            revert_branch "${rev}"
+            exit 1
+            ;;
+        *)
+            fail "Unknown key: ${key}"
+            ;;
+    esac
+}
+
+handle_files_key() {
+    local key line path
+
+    key="$(head -n 1 <<< "${key_result}")"
+    line="$(sed -n '2p' <<< "${key_result}")"
+    path="$(path_from_line "${line}")"
+
+    case "${key}" in
+        esc|bspace)
+            exit 255
+            ;;
+    esac
+    [ -z "${path}" ] && exit 0
+
+    case "${key}" in
+        enter)
+            show_file_diff "${path}"
+            exit 0
+            ;;
+        ctrl-c)
+            printf '%s\n' "${path}"
+            need_cmd clip
+            printf '%s' "${path}" | clip
+            exit 1
+            ;;
+        alt-v)
+            vimdiff_file "${path}"
+            exit 0
+            ;;
+        alt-p)
+            create_file_patch "${path}"
+            exit 1
+            ;;
+        alt-r)
+            revert_file "${path}"
+            exit 1
+            ;;
+        *)
+            fail "Unknown key: ${key}"
+            ;;
+    esac
+}
+
 paths=()
+log_args=()
+revs=()
 mode="list"
 commit=""
+preview_arg=""
 key_result=""
 query=""
+output_dir=""
+max_count="${MAX_COUNT_DEFAULT}"
+id=$$
+id_given=0
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
         -h|--help)
             usage
             ;;
-        -d|--diff|-p|--create-patch|-r|--revert)
-            [ "${mode}" != "list" ] && fail "Either use -d|--diff, -p|--create-patch or -r|--revert"
+        -d|--diff|-p|--create-patch|-r|--revert|-b|--revert-branch|-f|--files)
+            [ "${mode}" != "list" ] && fail "Only one of -d, -f, -p, -r, -b can be used"
             case "${1}" in
-                -d|--diff)
-                    mode="diff"
-                    ;;
-                -p|--create-patch)
-                    mode="patch"
-                    ;;
-                -r|--revert)
-                    mode="revert"
-                    ;;
-            esac 
+                -d|--diff)          mode="diff" ;;
+                -f|--files)         mode="files" ;;
+                -p|--create-patch)  mode="patch" ;;
+                -r|--revert)        mode="revert" ;;
+                -b|--revert-branch) mode="revert-branch" ;;
+            esac
             shift
-            [ -z "${1}" ] && fail "You must specify a commit"
+            [ -z "${1}" ] && fail "Missing commit argument"
             commit="${1}"
             ;;
         --print)
             mode="print"
+            ;;
+        --files-print)
+            mode="files-print"
+            ;;
+        --preview)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for preview"
+            mode="preview"
+            preview_arg="${1}"
+            ;;
+        --file-preview)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for file preview"
+            mode="file-preview"
+            preview_arg="${1}"
+            ;;
+        --key)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for key"
+            mode="key"
+            key_result="${1}"
+            ;;
+        --files-key)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for key"
+            mode="files-key"
+            key_result="${1}"
+            ;;
+        --id)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for id"
+            id="${1}"
+            id_given=1
             ;;
         -q|--query)
             shift
             [ -z "${1}" ] && fail "Missing argument for query"
             query="${1}"
             ;;
-        --key)
+        -o|--output-dir)
             shift
-            [ -z "${1}" ] && fail "Missing argument for key"
-            key_result="${1}"
+            [ -z "${1}" ] && fail "Missing argument for output directory"
+            output_dir="${1}"
+            ;;
+        -n|--max-count)
+            shift
+            [[ "${1}" =~ ^[0-9]+$ ]] || fail "Invalid count: ${1}"
+            max_count="${1}"
+            ;;
+        --ref)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for ref"
+            revs+=("${1}")
+            ;;
+        --all)
+            log_args+=("--all")
+            ;;
+        --author|--grep)
+            opt="${1}"
+            shift
+            [ -z "${1}" ] && fail "Missing argument for ${opt}"
+            log_args+=("${opt}=${1}")
+            ;;
+        --merges|--no-merges)
+            log_args+=("${1}")
+            ;;
+        --)
+            shift
+            paths+=("${@}")
+            break
+            ;;
+        -*)
+            fail "Unknown option: ${1}"
             ;;
         *)
             paths+=("${1}")
@@ -68,65 +623,103 @@ while [ "${#}" -gt 0 ]; do
     shift
 done
 
-if [ -n "${key_result}" ]; then
-    key="$(echo "${key_result}" | head -n 1)"
-    line="$(echo "${key_result}" | tail -n 1)"
-    commit="$(echo "${line}" | awk '{print $1}')"
-    case "${key}" in
-        alt-p)
-            mode="patch"
+STATE_FILE="/tmp/${APP}-${id}.state"
+
+# --print, --preview and --key are called by the picker and reuse the state of
+# the run that opened it
+if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
+    # shellcheck source=/dev/null
+    . "${STATE_FILE}"
+    cd "${start_dir}" || fail "Failed to enter ${start_dir}"
+    case "${mode}" in
+        print)
+            print_log
+            exit 0
             ;;
-        alt-r)
-            mode="revert"
+        files-print)
+            print_files
+            exit 0
             ;;
-        alt-d)
-            mode="diff"
+        preview)
+            preview_commit "${preview_arg}"
+            exit 0
             ;;
-        esc|ctrl-c|ctrl-d)
-            exit 255
+        file-preview)
+            preview_file "$(path_from_line "${preview_arg}")"
+            exit 0
             ;;
-        enter)
-            echo "${line}"
-            echo -n "${commit}" | clip
-            exit 1
+        key)
+            handle_log_key
             ;;
-        *)
-            fail "Unknown key: ${key}"
+        files-key)
+            handle_files_key
             ;;
     esac
 fi
 
 case "${mode}" in
-    diff)
-        git --no-pager diff --color=always "${commit}^!" -- "${paths[@]}" | less -R
-        exit 1
-        ;;
-    patch)
-        git format-patch -1 "${commit}"
-        exit 1
-        ;;
-    revert)
-        git revert --no-commit "${commit}"
-        echo "Run git commit..."
-        exit 1
-        ;;
-esac
-
-
-result="$(echo "${HEADER}${NL}$(git log --color=always --pretty=format:"%h  %p  %C(6)%cI%Creset  %C(33)%cl%Creset  %s" "${paths[@]}")" | k-format)"
-
-case "${mode}" in
-    list)
-        echo "${result}" | fzf-with-header --key-command "${APP} --key" \
-                                           --columns 3,4,5,6 \
-                                           --command "${APP} --print ${paths[@]}" \
-                                           "${query}" \
-                                           --preview='git show --color=always {1}' \
-                                           --preview-window=right:50%,wrap \
-                                           --expect="${KEYS}" \
-                                           --no-sort 
+    files-print|preview|file-preview|key|files-key)
+        fail "No state for id ${id}"
         ;;
     print)
-        echo "${result}"
+        [ "${id_given}" -eq 1 ] && fail "No state for id ${id}"
         ;;
 esac
+
+need_cmd git
+repo_root_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not a git repo"
+[ -z "${repo_root_dir}" ] && fail "Not a git repo"
+[ -z "${output_dir}" ] && output_dir="${PWD}"
+
+[ "${max_count}" -gt 0 ] && log_args+=("--max-count=${max_count}")
+[ "${#revs[@]}" -gt 0 ] && log_args+=("${revs[@]}")
+
+case "${mode}" in
+    diff|patch|revert|revert-branch|files)
+        commit="$(resolve_commit "${commit}")" || exit 1
+        ;;
+esac
+
+case "${mode}" in
+    diff)
+        show_diff "${commit}"
+        exit 0
+        ;;
+    patch)
+        create_patch "${commit}"
+        exit 0
+        ;;
+    revert)
+        revert_commit "${commit}"
+        exit $?
+        ;;
+    revert-branch)
+        revert_branch "${commit}"
+        exit $?
+        ;;
+esac
+
+git rev-parse --verify --quiet HEAD >/dev/null 2>&1 || fail "No commits yet"
+
+write_state
+trap 'rm -f "${STATE_FILE}"' EXIT
+
+if [ "${mode}" = "files" ]; then
+    if [ ! -t 1 ]; then
+        print_files
+        exit 0
+    fi
+    need_cmd fzf-with-header
+    pick_files
+    exit $?
+fi
+
+need_cmd toage
+
+if [ "${mode}" = "print" ] || [ ! -t 1 ]; then
+    print_log
+    exit 0
+fi
+
+need_cmd fzf-with-header
+pick_log
