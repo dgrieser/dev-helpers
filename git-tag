@@ -97,10 +97,10 @@ if [ -z "${tag}" ]; then
     elif [ "${delete}" -eq 1 ]; then
         # the tag has to exist to be deleted, so its name completes
         tag="$(git tag --sort=-v:refname \
-            | prompt-complete --default "${next_tag}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
+            | prompt-complete --default "${next_tag}" --prompt "${message}:")"
     else
         # the tag is new, so there is nothing to complete against
-        tag="$(prompt-input "$(echo -e "\e[1m${message}\e[0m:")" --default "${next_tag}")"
+        tag="$(prompt-input "${message}:" --default "${next_tag}")"
     fi
     [ -z "${tag}" ] && abort
 fi
@@ -120,7 +120,7 @@ if [ "${delete}" -eq 1 ] && [ "${create}" -eq 1 ]; then
         git log -n 10 --format='%h %s'
         echo
         commit="$(commit_candidates "${tag_commit}" \
-            | prompt-complete --default "${default_commit}" --prompt "$(echo -e "\e[1mCommit to tag\e[0m:")")"
+            | prompt-complete --default "${default_commit}" --prompt "Commit to tag:")"
         [ -z "${commit}" ] && commit="${default_commit}"
     fi
 fi
