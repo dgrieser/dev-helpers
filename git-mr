@@ -258,8 +258,8 @@ select_remote_url() {
     [ -n "${origin_url}" ] && printf '%s\n' "${origin_url}" && return 0
     [ "${#remotes[@]}" -eq 1 ] && printf '%s\n' "${first_url}" && return 0
 
-    need_cmd choose
-    remote="$(choose -p "Select remote:" "${remotes[@]}")" || return 1
+    need_cmd prompt-select
+    remote="$(prompt-select -p "Select remote:" "${remotes[@]}")" || return 1
     git remote get-url "${remote}"
 }
 
@@ -701,11 +701,9 @@ create_issue() {
 
     create_args+=("--title" "${title}")
     [ -n "${assignee}" ] && create_args+=("--assignee" "${assignee}")
-    if [ -n "${description}" ]; then
-        echo 1>&2
-        echo "Description:" 1>&2
-        printf '%s\n' "${description}" 1>&2
-    fi
+    echo 1>&2
+    echo "Description:" 1>&2
+    description="$(prompt-multiline --default "${description}")" || return 2
     echo 1>&2
     prompt-continue || return 2
 
@@ -1240,6 +1238,7 @@ need_cmd git
 need_cmd jq
 need_cmd git-default
 need_cmd prompt-input
+need_cmd prompt-multiline
 
 cded=0
 if [ -n "${project}" ]; then

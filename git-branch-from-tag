@@ -58,7 +58,8 @@ echo -e "\e[1mRecent tags\e[0m:" && echo "${recent_tags}" && echo
 
 if [ -z "${tag}" ]; then
     message="Tag name"
-    tag="$(prompt --single-line --default "${last_tag}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
+    tag="$(git tag --sort=-v:refname \
+        | prompt-complete --default "${last_tag}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
     [ -z "${tag}" ] && abort
 fi
 
@@ -66,7 +67,7 @@ fi
 new_branch="$(echo "${tag}" | sed 's/^v//g' | sed 's/\./-/g')"
 
 message="Branch name"
-new_branch="$(prompt --single-line --default "${new_branch}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
+new_branch="$(prompt-input "$(echo -e "\e[1m${message}\e[0m:")" --default "${new_branch}")"
 [ -z "${new_branch}" ] && abort
 
 git checkout -b "${new_branch}" "$(get_fq_tag "${tag}")"

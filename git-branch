@@ -38,36 +38,6 @@ abort() {
 	exit 1
 }
 
-confirm() {
-	printf '%s [y/N] ' "${1}" 1>&2
-	read -r response
-	echo 1>&2
-
-	case "${response}" in
-		y|Y|yes|YES)
-			return 0
-			;;
-		*)
-			abort
-			;;
-	esac
-}
-
-prompt_yes_no() {
-	printf '%s [y/N] ' "${1}" 1>&2
-	read -r response
-	echo 1>&2
-
-	case "${response}" in
-		y|Y|yes|YES)
-			return 0
-			;;
-		*)
-			return 1
-			;;
-	esac
-}
-
 get_upstream_branch() {
 	if [ -n "${branch_name}" ]; then
 		git rev-parse --abbrev-ref --symbolic-full-name "${branch_name}@{upstream}" 2>/dev/null
@@ -196,7 +166,7 @@ if [ "${reset_mode}" -eq 1 ]; then
 	fi
 
 	if [ "${assume_yes}" -eq 0 ]; then
-		confirm "Reset hard to \"${remote_branch}\"?"
+		prompt-no-yes "Reset hard to \"${remote_branch}\"?" || abort
 	fi
 
 	git reset --hard "${remote_branch}"
@@ -224,10 +194,10 @@ if [ "${delete_mode}" -eq 1 ]; then
 			delete_remote=1
 		fi
 	else
-		if prompt_yes_no "Delete local branch \"${branch_name}\"?"; then
+		if prompt-no-yes "Delete local branch \"${branch_name}\"?"; then
 			delete_local=1
 		fi
-		if [ -n "${upstream_branch}" ] && is_remote_upstream "${upstream_branch}" && prompt_yes_no "Delete remote branch \"${upstream_branch}\"?"; then
+		if [ -n "${upstream_branch}" ] && is_remote_upstream "${upstream_branch}" && prompt-no-yes "Delete remote branch \"${upstream_branch}\"?"; then
 			delete_remote=1
 		fi
 	fi
@@ -247,7 +217,7 @@ if [ "${delete_mode}" -eq 1 ]; then
 fi
 
 if [ "${assume_yes}" -eq 0 ]; then
-	confirm "Create branch \"${branch_name}\"?"
+	prompt-no-yes "Create branch \"${branch_name}\"?" || abort
 fi
 
 git checkout -b "${branch_name}"

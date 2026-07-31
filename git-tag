@@ -33,6 +33,18 @@ get_fq_tag() {
     echo "${fq_tag}"
 }
 
+# anything git resolves to a commit works, so the candidates only have to cover
+# the names worth completing; each one stays a bare commit-ish, since the
+# completed line is handed to git as is
+commit_candidates() {
+    local tag_commit="${1}"
+
+    echo "HEAD"
+    [ -n "${tag_commit}" ] && echo "${tag_commit}"
+    git log -n 20 --format=%h 2>/dev/null
+    git branch --format='%(refname:short)' 2>/dev/null
+}
+
 yes=0
 create=1
 delete=0
@@ -80,7 +92,16 @@ if [ -z "${tag}" ]; then
         next_tag="${last_tag}"
         [ "${create}" -eq 1 ] && message="${message} to recreate" || message="${message} to delete"
     fi
-    [ "${yes}" -eq 1 ] && tag="${next_tag}" || tag="$(prompt --single-line --default "${next_tag}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
+    if [ "${yes}" -eq 1 ]; then
+        tag="${next_tag}"
+    elif [ "${delete}" -eq 1 ]; then
+        # the tag has to exist to be deleted, so its name completes
+        tag="$(git tag --sort=-v:refname \
+            | prompt-complete --default "${next_tag}" --prompt "$(echo -e "\e[1m${message}\e[0m:")")"
+    else
+        # the tag is new, so there is nothing to complete against
+        tag="$(prompt-input "$(echo -e "\e[1m${message}\e[0m:")" --default "${next_tag}")"
+    fi
     [ -z "${tag}" ] && abort
 fi
 
@@ -94,7 +115,12 @@ if [ "${delete}" -eq 1 ] && [ "${create}" -eq 1 ]; then
         echo && echo -e "Tag \e[1m${tag}\e[0m is based on commit \e[1m${tag_commit}\e[0m"
     fi
     if [ "${yes}" -eq 0 ]; then
-        commit="$(prompt --single-line --default "${default_commit}" --prompt "$(echo -e "\e[1mCommit to tag\e[0m:")")"
+        # the candidates are bare hashes, so the subjects go on screen instead
+        echo && echo -e "\e[1mRecent commits\e[0m:"
+        git log -n 10 --format='%h %s'
+        echo
+        commit="$(commit_candidates "${tag_commit}" \
+            | prompt-complete --default "${default_commit}" --prompt "$(echo -e "\e[1mCommit to tag\e[0m:")")"
         [ -z "${commit}" ] && commit="${default_commit}"
     fi
 fi

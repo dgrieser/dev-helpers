@@ -86,16 +86,9 @@ if [ "${PUSH_FORCE_WITH_LEASE}" -eq 0 ]; then
     if git -C "${git_dir}" rev-parse -q --verify "${BRANCH}" >/dev/null && \
        git -C "${git_dir}" rev-parse -q --verify "${remote_ref}" >/dev/null && \
        ! git -C "${git_dir}" merge-base --is-ancestor "${remote_ref}" "${BRANCH}"; then
-        echo -n "Remote \"origin/${BRANCH_SHORT}\" has diverged from local (e.g. after rebase). Push with --force-with-lease? [y/N] "
-        read -r answer
-        case "${answer}" in
-            y|Y|yes|YES)
-                PUSH_FORCE_WITH_LEASE=1
-                ;;
-            *)
-                abort
-                ;;
-        esac
+        prompt-no-yes "Remote \"origin/${BRANCH_SHORT}\" has diverged from local (e.g. after rebase). Push with --force-with-lease?" \
+            || abort
+        PUSH_FORCE_WITH_LEASE=1
     fi
 fi
 if [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ]; then

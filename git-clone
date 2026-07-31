@@ -30,21 +30,9 @@ fi
 
 PARENT_DIR="$(pwd)"
 
-function choose() {
-    local prompt="${1}"
-    shift
-    local list="${@}"
-    # print names with numbers prefixed and prompt for number
-    echo 1>&2
-    echo "${prompt}" 1>&2
-    for i in $(seq 1 $(echo "${list}" | wc -l)); do
-        echo "${i}) $(echo "${list}" | sed -n ${i}p)" 1>&2
-    done
-    read -p "Choose number: " -r REPLY
-    [ -z "${REPLY}" ] && echo "Abort." 1>&2 && exit 1
-    choice="$(echo "${list}" | sed -n ${REPLY}p)"
-    echo "Chose '${choice}'" 1>&2
-    echo "${choice}"
+abort() {
+    echo "Abort." 1>&2
+    exit 1
 }
 
 if [[ ! "${URL}" =~ ^(https?|ssh)://.* ]] && [[ ! "${URL}" =~ ^git@.* ]]; then
@@ -57,8 +45,9 @@ if [[ ! "${URL}" =~ ^(https?|ssh)://.* ]] && [[ ! "${URL}" =~ ^git@.* ]]; then
     fi
     count=$(echo "${repo}" | wc -l)
     if [ ${count} -gt 1 ]; then
-        repo="$(choose "Choose repository:" "${repo}")"
-    else 
+        echo 1>&2
+        repo="$(printf '%s\n' "${repo}" | prompt-select -p "Choose repository:")" || abort
+    else
         echo "Found repository: ${repo}" 1>&2
     fi
     if [[ "${repo}" =~ github\.com/ ]]; then
@@ -82,8 +71,8 @@ fi
 
 [ -n "${REPO_PATH}" ] && PARENT_DIR="${WORKSPACE}/$(dirname "${REPO_PATH}")"
 
-read -e -p "Enter parent directory to clone into: " -i "${PARENT_DIR}" PARENT_DIR 1>&2
-[ -z "${PARENT_DIR}" ] && echo "Abort." 1>&2 && exit 1
+PARENT_DIR="$(prompt-folder "Enter parent directory to clone into:" -d "${PARENT_DIR}")" || abort
+[ -z "${PARENT_DIR}" ] && abort
 
 mkdir -p "${PARENT_DIR}" 1>&2
 cd "${PARENT_DIR}" 1>&2
@@ -91,8 +80,7 @@ PARENT_DIR="$(pwd)"
 
 DIR_NAME="$(basename "${URL}" .git)"
 if [ -d "${DIR_NAME}" ]; then
-    read -p "WARNING: ${PARENT_DIR}/${DIR_NAME} already exists, remove it first? [y/N] " -r 1>&2
-    [[ ! $REPLY =~ ^[Yy]$ ]] && echo "Abort." 1>&2 && exit 1
+    prompt-no-yes "WARNING: ${PARENT_DIR}/${DIR_NAME} already exists, remove it first?" || abort
     rm -rf "${DIR_NAME}" 1>&2
 fi
 
