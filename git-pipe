@@ -726,16 +726,12 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
         print)
             need_cmd k-format
             pipelines=""
+            # every reload refetches, so a pipeline that started after the picker
+            # opened shows up; the watcher stops on its own once nothing runs
+            # anymore, a manual refresh still picks up new pipelines
             if [ "${refresh:-0}" -eq 1 ]; then
                 pipelines="$(fetch_pipelines 2>/dev/null)"
-                if [ -n "${pipelines}" ]; then
-                    printf '%s\n' "${pipelines}" > "${JSON_FILE}"
-                    # nothing is running anymore: stop refetching on every reload
-                    if ! has_active_pipelines "${pipelines}"; then
-                        refresh=0
-                        write_state
-                    fi
-                fi
+                [ -n "${pipelines}" ] && printf '%s\n' "${pipelines}" > "${JSON_FILE}"
             fi
             [ -z "${pipelines}" ] && pipelines="$(cat "${JSON_FILE}")"
             print_pipelines "${pipelines}"
