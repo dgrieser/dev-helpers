@@ -119,6 +119,33 @@ _git-add()
 }
 complete -F _git-add git-add
 
+_git-blame()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -r|--ref|--ignore-rev)
+            __dh_compgen "$(__dh_all_branches) $(__dh_tags) $(__dh_commits)"
+            return 0 ;;
+        --ignore-revs-file)
+            __dh_files
+            return 0 ;;
+        -o|--output-dir)
+            __dh_dirs
+            return 0 ;;
+        -q|--query|-L|--lines) return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-h --help --print -q --query -r --ref -L --lines \
+                      -w --ignore-whitespace -M -C --ignore-rev \
+                      --ignore-revs-file -o --output-dir"
+    else
+        __dh_files
+    fi
+    return 0
+}
+complete -F _git-blame git-blame
+
 _git-branch()
 {
     local cur prev
@@ -145,7 +172,18 @@ _git-browse()
 {
     local cur prev
     __dh_init
-    __dh_compgen "-p --print --host-only --include-branch -h --help"
+    case "${prev}" in
+        -b|--branch)
+            __dh_compgen "$(__dh_all_branches) $(__dh_tags) $(__dh_commits)"
+            return 0 ;;
+        -L|--lines) return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-p --print --host-only --include-branch -i --interactive \
+                      -b --branch -L --lines -h --help"
+    else
+        __dh_files
+    fi
     return 0
 }
 complete -F _git-browse git-browse

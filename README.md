@@ -40,6 +40,32 @@ Interactive fuzzy stager: stage/unstage/delete/reset/ignore files and resolve co
 git-add [-p] [<path>...] [-s <path>] [-u <path>] [-d <path>] [-r <path>] [-i <path>] [-q <query>]
 ```
 
+### git-blame
+Interactive blame picker. Lines are listed as LVL / AGE / AUTHOR / LINE / CODE
+and the preview shows the commit that last touched the selected line with its
+stat and patch, limited to that file. Without a file a picker lists the tracked
+files first.
+
+`enter` blames the file again as it was before the commit of the selected line,
+so a line can be walked change by change; renames are followed and the file is
+blamed under the name it had back then. LVL is the depth of that walk, `1` for
+the blame of the file itself, and a `^` next to it marks a line whose commit has
+nothing before it - `enter` stays where it is on those. A dimmed row is a line
+that is not committed yet. `esc` and `backspace` leave a nested level and return
+to the previous blame; on the first level `backspace` stays the key that erases
+the search query.
+
+`ctrl-s` shows the commit, `ctrl-d` its diff for the file, `ctrl-l` the history
+of that single line (`git log -L`), `ctrl-c` copies the hash, `ctrl-o` opens the
+commit in the browser, `alt-v` opens the file before and after the commit in
+vimdiff, `alt-e` opens the file in the editor at that line, and `alt-p` writes
+the commit's diff for the file as a patch.
+```bash
+git-blame [--print] [-q <query>] [-r <ref>] [-L <range>] [-w] [-M] [-C] \
+          [--ignore-rev <rev>] [--ignore-revs-file <file>] [-o <dir>] \
+          [--] [<file>]
+```
+
 ### git-branch
 Create/checkout a branch, or delete/reset/backup it (with confirmation).
 ```bash
@@ -53,9 +79,17 @@ git-branch-from-tag [<tag>]
 ```
 
 ### git-browse
-Open the current repo (and optionally branch) in the browser.
+Open the current repo (and optionally a branch, file or line range) in the browser.
+
+`--interactive` asks for the ref, picks the file and then offers to mark a line
+or a range in it; `--branch`, `<path>` and `--lines` each skip their step. In the
+line picker `tab` marks a line, `shift-tab` marks everything between the marks
+and the cursor, so a range is a `tab` on its first line and a `shift-tab` on its
+last one. Marking nothing links the line under the cursor. Once the query is gone
+the picker scrolls back to the line that was marked last.
 ```bash
-git-browse [-p|--print] [--host-only] [--include-branch]
+git-browse [-p|--print] [--host-only] [--include-branch] [-i|--interactive] \
+           [-b|--branch <ref>] [-L|--lines <range>] [--] [<path>]
 ```
 
 ### git-change

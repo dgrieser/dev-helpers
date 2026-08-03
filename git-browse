@@ -1,15 +1,88 @@
 #!/bin/bash
 
+APP="$(basename "${0}")"
+
+NL=$'\n'
+
+C_LINE=$'\033[38;5;245m'
+C_RESET=$'\033[0m'
+
+MARKER='✓'
+
+PICK_HEADER=$'PATH'
+PICK_KEY_DESCS="enter:link file,esc:cancel"
+LINE_KEY_DESCS="tab:mark line,shift-tab:mark up to here,enter:confirm,esc:cancel"
+
+# a range wider than this is marked by its two ends only
+RANGE_MARK_LIMIT=400
+
 usage() {
-    echo "usage: $(basename "${0}") [-p|--print] [--host-only] [--include-branch]" 1>&2
+    cat <<EOF 1>&2
+usage: ${APP} [-p|--print] [--host-only] [--include-branch] [-i|--interactive]
+       [-b|--branch <ref>] [-L|--lines <range>] [--] [<path>]
+
+Open the current repository in the browser, or print the URL.
+
+With <path> the file (or directory) is opened on GitHub/GitLab instead of the
+repository root. The link points at the current branch unless --branch names
+another ref.
+
+--interactive asks for the ref, picks the file and then offers to mark a line
+or a range in it. Whatever is given on the command line is not asked for again,
+so --branch, <path> and --lines each skip their step.
+
+Options:
+  -p, --print             print the URL instead of opening it
+      --host-only         only the host of the remote
+      --include-branch    link the current branch; the open PR/MR is preferred
+                          over the branch itself
+  -i, --interactive       select the ref, the file and the lines interactively
+  -b, --branch <ref>      link <ref> instead of the current branch; without
+                          <path> it implies --include-branch
+  -L, --lines <range>     highlight a line or a range, e.g. 20 or 20,40
+                          (needs <path>)
+  -h, --help              show this help message and exit
+
+Keys of the line picker:
+$(printf '%s' "${LINE_KEY_DESCS}" | tr ',' '\n' | awk -F':' '{ printf "  %-10s %s\n", $1, $2 }')
+
+tab marks a single line, shift-tab marks everything between the marks and the
+cursor, so a range is a tab on its first line and a shift-tab on its last one.
+Marking nothing links the line under the cursor. A range wider than
+${RANGE_MARK_LIMIT} lines only shows its two ends marked. Once the query is gone the
+picker scrolls back to the line that was marked last, so a line found by typing
+does not run off the screen.
+EOF
     exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "${1} not found"
 }
 
 print_only=0
 host_only=0
 include_branch=0
+interactive=0
+branch=""
+path=""
+line_start=""
+line_end=""
+repo_root_dir=""
+positional=()
 
 urlencode() {
+    # byte wise, so a multibyte character becomes one escape per byte
+    local LC_ALL=C
     local raw="${1}"
     local encoded=""
     local i char
@@ -27,6 +100,308 @@ urlencode() {
     done
 
     echo "${encoded}"
+}
+
+# encode a path segment by segment, so the slashes stay slashes
+urlencode_path() {
+    local IFS='/'
+    local out="" seg
+    local segs=()
+
+    read -ra segs <<< "${1}"
+    for seg in "${segs[@]}"; do
+        [ -n "${out}" ] && out+="/"
+        out+="$(urlencode "${seg}")"
+    done
+
+    echo "${out}"
+}
+
+parse_lines() {
+    local raw="${1}"
+
+    [[ "${raw}" =~ ^([0-9]+)([,-]([0-9]+))?$ ]] || fail "Invalid line range: ${raw}"
+    line_start="${BASH_REMATCH[1]}"
+    line_end="${BASH_REMATCH[3]}"
+    [ "${line_start}" -gt 0 ] || fail "Invalid line range: ${raw}"
+    if [ -n "${line_end}" ]; then
+        [ "${line_end}" -ge "${line_start}" ] || fail "Invalid line range: ${raw}"
+        [ "${line_end}" -eq "${line_start}" ] && line_end=""
+    fi
+}
+
+line_anchor() {
+    local provider="${1}"
+
+    [ -z "${line_start}" ] && return 0
+    if [ -z "${line_end}" ]; then
+        echo "#L${line_start}"
+    elif [ "${provider}" = "github" ]; then
+        echo "#L${line_start}-L${line_end}"
+    else
+        echo "#L${line_start}-${line_end}"
+    fi
+}
+
+trim() {
+    local text="${1}"
+
+    printf '%s' "${text%"${text##*[![:space:]]}"}"
+}
+
+require_repo_root() {
+    [ -n "${repo_root_dir}" ] && return 0
+    repo_root_dir="$(git rev-parse --show-toplevel 2>/dev/null)"
+    [ -z "${repo_root_dir}" ] && fail "Not a git repo"
+    need_cmd realpath
+    return 0
+}
+
+# a path as the repository sees it; empty for the repository root
+resolve_rel() {
+    local given="${1}"
+    local rel
+
+    rel="$(realpath -m --relative-to="${repo_root_dir}" -- "${given}")"
+    case "${rel}" in
+        ..|../*)
+            fail "Not inside the repository: ${given}"
+            ;;
+        .)
+            rel=""
+            ;;
+    esac
+
+    printf '%s' "${rel}"
+}
+
+ref_exists() {
+    [ -n "$(git rev-parse --verify --quiet "${1}^{commit}" 2>/dev/null)" ]
+}
+
+# the state of the line picker: the row its marking keys last touched and a
+# range that still waits to be marked, as "<anchor> <lo> <hi>" with "-" for a
+# range that is done
+write_line_state() {
+    printf '%s %s %s\n' "${1}" "${2:--}" "${3:--}" > "${state_file}" 2>/dev/null
+}
+
+read_line_state() {
+    local fields=()
+
+    read -ra fields < "${state_file}" 2>/dev/null
+    state_anchor="${fields[0]:--}"
+    state_lo="${fields[1]:--}"
+    state_hi="${fields[2]:--}"
+}
+
+# a picker position is the index of the row in the input plus one, which only
+# holds while no query filters the list
+mark_actions() {
+    local lo="${1}"
+    local hi="${2}"
+    local cursor="${3}"
+    local index actions=""
+
+    if [ $(( hi - lo )) -gt "${RANGE_MARK_LIMIT}" ]; then
+        # marking thousands of rows one by one is not worth it, the two ends
+        # already carry the range
+        actions="pos($(( lo + 1 )))+select+pos($(( hi + 1 )))+select"
+    else
+        for (( index = lo; index <= hi; index++ )); do
+            [ -n "${actions}" ] && actions+="+"
+            actions+="pos($(( index + 1 )))+select"
+        done
+    fi
+
+    printf '%s+pos(%d)\n' "${actions}" "$(( cursor + 1 ))"
+}
+
+range_actions() {
+    local query="${1}"
+    local current="${2}"
+    shift 2
+    local index lo hi
+
+    lo="${current}"
+    hi="${current}"
+    for index in "${@}"; do
+        [[ "${index}" =~ ^[0-9]+$ ]] || continue
+        [ "${index}" -lt "${lo}" ] && lo="${index}"
+        [ "${index}" -gt "${hi}" ] && hi="${index}"
+    done
+
+    if [ -z "${query}" ]; then
+        write_line_state "${current}"
+        mark_actions "${lo}" "${hi}" "${current}"
+        return 0
+    fi
+
+    # dropping the query rebuilds the list, and that only finishes after this
+    # command returned, so the range is left for the result event; marking the
+    # row under the cursor needs no position and keeps the range right even if
+    # the rebuild never reports back
+    write_line_state "${current}" "${lo}" "${hi}"
+    printf 'select+clear-query\n'
+}
+
+# mark a range that waited for the list to be rebuilt, otherwise scroll back to
+# the row the marking keys last touched, so a line that was found through a
+# query is still on screen once the query is gone
+focus_actions() {
+    local query="${1}"
+    local state_anchor state_lo state_hi
+
+    read_line_state
+    [[ "${state_anchor}" =~ ^[0-9]+$ ]] || return 0
+
+    if [[ "${state_lo}" =~ ^[0-9]+$ ]] && [[ "${state_hi}" =~ ^[0-9]+$ ]]; then
+        write_line_state "${state_anchor}"
+        mark_actions "${state_lo}" "${state_hi}" "${state_anchor}"
+        return 0
+    fi
+
+    [ -n "${query}" ] && return 0
+    printf 'pos(%d)\n' "$(( state_anchor + 1 ))"
+}
+
+ref_candidates() {
+    { git for-each-ref --sort=-committerdate --format='%(refname:short)' \
+          refs/heads refs/remotes
+      git tag --sort=-v:refname; } 2>/dev/null \
+        | sed -e 's|^origin/||' -e '/^HEAD$/d' \
+        | awk '!seen[$0]++'
+}
+
+list_paths() {
+    local ref="${1}"
+
+    # a ref that is not in this clone, e.g. a branch that only exists on the
+    # remote, has no tree to list, so the working tree stands in for it;
+    # quotePath would hand out "dir/\303\274.txt" instead of the real name
+    if ref_exists "${ref}"; then
+        git -c core.quotePath=false ls-tree -r --name-only "${ref}"
+    else
+        git -c core.quotePath=false ls-files
+    fi
+}
+
+file_content() {
+    local ref="${1}"
+    local rel="${2}"
+
+    if ref_exists "${ref}" && git cat-file -e "${ref}:${rel}" 2>/dev/null; then
+        git show "${ref}:${rel}"
+    elif [ -f "${repo_root_dir}/${rel}" ]; then
+        cat "${repo_root_dir}/${rel}"
+    else
+        return 1
+    fi
+}
+
+pick_ref() {
+    local current
+
+    need_cmd prompt-complete
+    current="$(git branch --show-current 2>/dev/null)"
+    ref_candidates | prompt-complete --prompt "Branch:" --prefill "${current}"
+}
+
+pick_path() {
+    local ref="${1}"
+    local rows self ref_arg
+
+    need_cmd fzf-with-header
+    # the picker renders the first row at the bottom, so the list is fed
+    # reversed and the cursor starts on the last row of the input
+    rows="$(list_paths "${ref}" | tac)"
+    [ -z "${rows}" ] && { error "No files in ${ref}"; return 1; }
+    self="$(printf '%q' "${0}")"
+    ref_arg="$(printf '%q' "${ref}")"
+
+    printf '%s\n' "${PICK_HEADER}${NL}${rows}" \
+        | fzf-with-header --key-descriptions "${PICK_KEY_DESCS}" \
+                          -- --preview="${self} --preview-file ${ref_arg} {1}" \
+                             --preview-window=right:60%,nowrap \
+                             --bind=load:last
+}
+
+# the file with a line number column; marking nothing links the line under the
+# cursor, marking more than one line links the range they span
+pick_line_range() {
+    local ref="${1}"
+    local rel="${2}"
+    local content rows selection numbers self state
+
+    need_cmd fzf-with-header
+    content="$(file_content "${ref}" "${rel}")" || { error "Cannot read ${rel}"; return 1; }
+    [ -z "${content}" ] && { error "No lines in ${rel}"; return 1; }
+    grep -qI . <<< "${content}" || { error "Not a text file: ${rel}"; return 1; }
+
+    # the last row of the input renders at the top, so the file is fed from its
+    # last line upwards to read top-down in the picker
+    rows="$(awk -v cline="${C_LINE}" -v reset="${C_RESET}" '
+        { code[NR] = $0 }
+        END {
+            w = length(NR)
+            if (w < 4) w = 4
+            printf "%s  %s\n", sprintf("%*s", w, "LINE"), "CODE"
+            for (i = NR; i >= 1; i--)
+                printf "%s%s%s  %s\n", cline, sprintf("%*d", w, i), reset, code[i]
+        }' <<< "${content}")"
+
+    self="$(printf '%q' "${0}")"
+    LINE_STATE="$(mktemp "${TMPDIR:-/tmp}/${APP}-lines.XXXXXX")" \
+        || { error "Cannot create a temp file"; return 1; }
+    trap 'rm -f "${LINE_STATE}"' EXIT
+    state="$(printf '%q' "${LINE_STATE}")"
+
+    # fzf strips the colors from what it prints, so the line number is the
+    # first field of every marked row
+    selection="$(fzf-with-header --key-descriptions "${LINE_KEY_DESCS}" \
+                     -- --multi --marker="${MARKER}" --no-sort --bind=load:last \
+                        --bind="tab:toggle+execute-silent(${self} --mark-line ${state} {n})" \
+                        --bind="shift-tab:transform:${self} --range-actions ${state} {q} {n} {+n}" \
+                        --bind="result:transform:${self} --focus-actions ${state} {q}" \
+                        <<< "${rows}")" || return 1
+    rm -f "${LINE_STATE}"
+    numbers="$(awk '{ print $1 }' <<< "${selection}" | grep -E '^[0-9]+$' | sort -n)"
+    [ -z "${numbers}" ] && return 1
+
+    line_start="$(head -n 1 <<< "${numbers}")"
+    line_end="$(tail -n 1 <<< "${numbers}")"
+    [ "${line_end}" = "${line_start}" ] && line_end=""
+    return 0
+}
+
+interactive_select() {
+    local picked scope
+
+    # the pickers read the keys from the terminal, not from stdin
+    (: < /dev/tty) 2>/dev/null || fail "--interactive needs a terminal"
+    require_repo_root
+    if [ -z "${branch}" ]; then
+        branch="$(pick_ref)" || fail "Aborted"
+        branch="$(trim "${branch}")"
+        [ -z "${branch}" ] && fail "Aborted"
+    fi
+
+    if [ -n "${path}" ]; then
+        picked="$(resolve_rel "${path}")" || exit 1
+    else
+        picked="$(pick_path "${branch}")" || fail "Aborted"
+        picked="$(trim "${picked}")"
+    fi
+    [ -z "${picked}" ] && fail "Aborted"
+
+    if [ -z "${line_start}" ]; then
+        need_cmd prompt-select
+        scope="$(prompt-select --prompt "Link to:" \
+                     "file=the whole file" "lines=a line or a range")" || fail "Aborted"
+        [ "${scope}" = "lines" ] && { pick_line_range "${branch}" "${picked}" || fail "Aborted"; }
+    fi
+
+    path="${repo_root_dir}/${picked}"
 }
 
 find_github_pr_url() {
@@ -73,12 +448,79 @@ while [ ${#} -gt 0 ]; do
         --include-branch)
             include_branch=1
             ;;
-        *)
+        -i|--interactive)
+            interactive=1
+            ;;
+        -b|--branch)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for branch"
+            branch="${1}"
+            ;;
+        --mark-line)
+            # the line picker records the row its marking keys last touched
+            shift
+            [ "${#}" -lt 2 ] && fail "Missing arguments for the mark"
+            state_file="${1}"
+            write_line_state "${2}"
+            exit 0
+            ;;
+        --range-actions)
+            shift
+            [ "${#}" -lt 3 ] && fail "Missing arguments for the range"
+            state_file="${1}"
+            shift
+            range_actions "${@}"
+            exit 0
+            ;;
+        --focus-actions)
+            shift
+            [ "${#}" -lt 1 ] && fail "Missing arguments for the focus"
+            state_file="${1}"
+            focus_actions "${2}"
+            exit 0
+            ;;
+        --preview-file)
+            # called by the file picker of the interactive mode
+            shift
+            [ -z "${1}" ] && fail "Missing ref for the preview"
+            preview_ref="${1}"
+            shift
+            [ -z "${1}" ] && fail "Missing path for the preview"
+            require_repo_root
+            file_content "${preview_ref}" "${1}" 2>/dev/null | cat -n
+            exit 0
+            ;;
+        -L|--lines)
+            shift
+            [ -z "${1}" ] && fail "Missing argument for lines"
+            parse_lines "${1}"
+            ;;
+        --)
+            shift
+            positional+=("${@}")
+            break
+            ;;
+        -*)
             usage
+            ;;
+        *)
+            positional+=("${1}")
             ;;
     esac
     shift
 done
+
+[ "${#positional[@]}" -gt 1 ] && fail "Only one path can be browsed"
+[ "${#positional[@]}" -eq 1 ] && path="${positional[0]}"
+
+[ -n "${path}" ] && [ ${host_only} -eq 1 ] && fail "--host-only cannot be combined with a path"
+[ -n "${line_start}" ] && [ -z "${path}" ] && [ ${interactive} -eq 0 ] && fail "--lines needs a path"
+[ ${interactive} -eq 1 ] && [ ${host_only} -eq 1 ] && fail "--host-only cannot be combined with --interactive"
+[ ${interactive} -eq 1 ] && [ ${include_branch} -eq 1 ] && fail "--include-branch cannot be combined with --interactive"
+
+# a ref without a path is a branch link
+[ -n "${branch}" ] && [ -z "${path}" ] && [ ${host_only} -eq 0 ] && [ ${interactive} -eq 0 ] \
+    && include_branch=1
 
 git_url=$(git config --get remote.origin.url)
 if [ -z "${git_url}" ]; then
@@ -99,15 +541,71 @@ fi
 git_url=$(echo "${git_url}" | sed -E 's/:[0-9]+//')
 git_url=$(echo "${git_url}" | sed -E 's/\.git$//')
 
+host_name=$(echo "${git_url}" | sed -E 's|^[a-z]+://||; s|/.*$||')
+repo_path=$(echo "${git_url}" | sed -E 's|^[a-z]+://[^/]+/||')
+
+[ ${interactive} -eq 1 ] && interactive_select
+
 open_target="${git_url}"
 if [ ${host_only} -eq 1 ]; then
-    host_name=$(echo "${git_url}" | sed -E 's|^[a-z]+://||; s|/.*$||')
     [ ${print_only} -eq 1 ] && echo "${host_name}" && exit 0
     open_target="https://${host_name}"
+elif [ -n "${path}" ]; then
+    provider="gitlab"
+    if [[ "${host_name}" == *github* ]] \
+        || [ -n "$(git config --get remote.origin.gh-resolved 2>/dev/null)" ]; then
+        provider="github"
+    fi
+
+    require_repo_root
+    # the link is built from the path as the repository sees it
+    rel="$(resolve_rel "${path}")" || exit 1
+
+    ref="${branch}"
+    if [ -z "${ref}" ]; then
+        ref="$(git branch --show-current 2>/dev/null)"
+        [ -z "${ref}" ] && ref="$(git rev-parse --verify --quiet HEAD 2>/dev/null)"
+    fi
+    [ -z "${ref}" ] && fail "Cannot determine the ref to link"
+
+    # a directory is a tree, a file is a blob; the ref is asked first because
+    # the path may only exist there, the working tree is the fallback for a ref
+    # that is not checked out locally
+    kind="tree"
+    if [ -n "${rel}" ]; then
+        case "$(git cat-file -t "${ref}:${rel}" 2>/dev/null)" in
+            tree)
+                kind="tree"
+                ;;
+            blob)
+                kind="blob"
+                ;;
+            *)
+                if [ -d "${repo_root_dir}/${rel}" ]; then
+                    kind="tree"
+                elif [ -e "${repo_root_dir}/${rel}" ]; then
+                    kind="blob"
+                else
+                    fail "No such path: ${path}"
+                fi
+                [ -n "$(git rev-parse --verify --quiet "${ref}^{commit}" 2>/dev/null)" ] \
+                    && echo "WARNING: ${rel} does not exist in ${ref}" 1>&2
+                ;;
+        esac
+    fi
+
+    [ "${kind}" = "tree" ] && [ -n "${line_start}" ] && fail "--lines needs a file"
+
+    if [ "${provider}" = "github" ]; then
+        open_target="${git_url}/${kind}/$(urlencode_path "${ref}")"
+    else
+        open_target="${git_url}/-/${kind}/$(urlencode "${ref}")"
+    fi
+    [ -n "${rel}" ] && open_target+="/$(urlencode_path "${rel}")"
+    open_target+="$(line_anchor "${provider}")"
 elif [ ${include_branch} -eq 1 ]; then
-    host_name=$(echo "${git_url}" | sed -E 's|^[a-z]+://||; s|/.*$||')
-    repo_path=$(echo "${git_url}" | sed -E 's|^[a-z]+://[^/]+/||')
-    current_branch=$(git branch --show-current 2>/dev/null)
+    current_branch="${branch}"
+    [ -z "${current_branch}" ] && current_branch=$(git branch --show-current 2>/dev/null)
     default_branch=$(git-default 2>/dev/null)
     [ -n "${current_branch}" ] && [[ "${current_branch}" == "${default_branch}" ]] && current_branch=""
 
