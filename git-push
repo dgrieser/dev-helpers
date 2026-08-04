@@ -62,9 +62,7 @@ fi
 message="Commit and push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_ONLY}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\" (force with lease)?"
-echo -n "${message}"
-read
-echo
+prompt-yes-no "${message}" || abort
 git -C "${git_dir}" init
 ok=1
 if [ "${PUSH_ONLY}" -eq 0 ]; then
