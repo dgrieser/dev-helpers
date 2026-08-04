@@ -355,7 +355,7 @@ _git-mr()
         -n|--number|-q|--query|-l|--limit) return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-c --create -a --approve -M --merge -m --copy-message -i --issue --feedback -u --unresolved -r --raw -b --branch -k --checkout --prod-branch -A --all -n --number -q --query -l --limit -p --print -o --output -h --help"
+        __dh_compgen "-c --create -a --approve -M --merge -C --close -D --delete -m --copy-message -i --issue --feedback -u --unresolved -r --raw -b --branch -k --checkout --prod-branch -A --all -n --number -q --query -l --limit -p --print -o --output -h --help"
     else
         __dh_compgen "$(__dh_projects)"
     fi

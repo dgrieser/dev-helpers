@@ -16,7 +16,7 @@ C_RESET=$'\033[0m'
 
 LIST_HEADER=$'ID\tSTATE\tUPDATED\tAUTHOR\tBRANCHES\tTITLE'
 
-LIST_KEYS="enter,esc,ctrl-q,ctrl-s,ctrl-d,ctrl-o,ctrl-y,ctrl-f,alt-a,alt-m,alt-i"
+LIST_KEYS="enter,esc,ctrl-q,ctrl-s,ctrl-d,ctrl-o,ctrl-y,ctrl-f,alt-a,alt-m,alt-i,alt-c,alt-x"
 
 JQ_STATE_COLOR='
     def statecolor:
@@ -87,12 +87,16 @@ state filter; the filter entries change the filter and return to the menu. The
 requests themselves are listed in a picker with the request and its diff in the
 preview:
 
-$(key_help "enter:the chosen action (approve + merge by default),ctrl-s:show the request,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the feedback,alt-a:approve,alt-m:merge,alt-i:create an issue,esc:back")
+$(key_help "enter:the chosen action (approve + merge by default),ctrl-s:show the request,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the feedback,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
 Actions:
   -c, --create            create a request from the current branch
   -a, --approve           approve the selected request
   -M, --merge             merge the selected request
+  -C, --close             close the selected request, then ask whether to
+                          delete its source branch
+  -D, --delete            delete the selected request (GitLab only), then ask
+                          whether to delete its source branch
   -m, --copy-message      copy a channel message for the selected request
   -i, --issue             create an issue from the selected request
       --feedback          print the comments and review feedback
@@ -554,6 +558,93 @@ approve_and_merge() {
     merge_item "${n}"
 }
 
+# the remote the requests belong to; the branch of a request lives there
+item_remote() {
+    local remote url
+
+    while IFS= read -r remote; do
+        url="$(git remote get-url "${remote}" 2>/dev/null)" || continue
+        [ "${url}" = "${remote_url}" ] && { printf '%s\n' "${remote}"; return 0; }
+    done < <(git remote)
+    printf 'origin\n'
+}
+
+delete_source_branch() {
+    local source_branch="${1}"
+    local remote default current
+    local rc=0
+
+    remote="$(item_remote)"
+    default="$(git-default 2>/dev/null)"
+    if git show-ref --verify --quiet "refs/heads/${source_branch}"; then
+        current="$(git branch --show-current 2>/dev/null)"
+        if [ "${current}" = "${source_branch}" ]; then
+            [ -z "${default}" ] && { error "Failed to determine the default branch"; return 1; }
+            git checkout "${default}" 1>&2 || { error "Failed to check out ${default}"; return 1; }
+        fi
+        git branch -D "${source_branch}" 1>&2 || rc=1
+    fi
+    if git ls-remote --exit-code --heads "${remote}" "${source_branch}" >/dev/null 2>&1; then
+        git push "${remote}" --delete "${source_branch}" 1>&2 || rc=1
+    fi
+    [ "${rc}" -ne 0 ] && error "Failed to delete branch ${source_branch}"
+    return "${rc}"
+}
+
+# a closed or deleted request leaves its source branch behind; the default and
+# the production branch are never offered
+ask_delete_source_branch() {
+    local json="${1}"
+    local source_branch default
+
+    source_branch="$(jq -r '.source // empty' <<< "${json}")"
+    [ -z "${source_branch}" ] && return 0
+    [ "${source_branch}" = "-" ] && return 0
+    default="$(git-default 2>/dev/null)"
+    [ "${source_branch}" = "${default}" ] && return 0
+    [ -n "${prod_branch}" ] && [ "${source_branch}" = "${prod_branch}" ] && return 0
+    prompt-no-yes "Delete branch ${source_branch} locally and on ${remote_host}?" || return 0
+    delete_source_branch "${source_branch}"
+}
+
+close_item() {
+    local n="${1}"
+    local json
+
+    json="$(item_json "${n}")"
+    [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
+    print_item_summary "${json}"
+    echo 1>&2
+    prompt-no-yes "Close $(item_ref "${n}")?" || { echo "Abort." 1>&2; return 2; }
+    # gh could delete the branch with --delete-branch, but the branch is asked
+    # for afterwards so both providers behave the same
+    if [ "${provider}" = "github" ]; then
+        gh pr close "${n}" --repo "${github_repo_selector}" \
+            || { error "Failed to close $(item_ref "${n}")"; return 1; }
+    else
+        glab mr close "${n}" || { error "Failed to close $(item_ref "${n}")"; return 1; }
+    fi
+    ask_delete_source_branch "${json}"
+}
+
+delete_item() {
+    local n="${1}"
+    local json
+
+    # the GitHub API can not delete a pull request at all
+    [ "${provider}" = "github" ] \
+        && { error "A ${NOUN} can not be deleted, close it instead"; return 1; }
+
+    json="$(item_json "${n}")"
+    [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
+    print_item_summary "${json}"
+    echo 1>&2
+    warning "Deleting a ${NOUN} can not be undone"
+    prompt-no-yes "Delete $(item_ref "${n}")?" || { echo "Abort." 1>&2; return 2; }
+    glab mr delete "${n}" || { error "Failed to delete $(item_ref "${n}")"; return 1; }
+    ask_delete_source_branch "${json}"
+}
+
 feedback_gitlab_json() {
     local n="${1}"
 
@@ -820,6 +911,8 @@ action_label() {
         review)   echo "approve + merge" ;;
         approve)  echo "approve" ;;
         merge)    echo "merge" ;;
+        close)    echo "close" ;;
+        delete)   echo "delete" ;;
         copy)     echo "copy message" ;;
         feedback) echo "feedback" ;;
         issue)    echo "issue" ;;
@@ -837,6 +930,8 @@ run_action() {
         review)   approve_and_merge "${n}" ;;
         approve)  approve_item "${n}" ;;
         merge)    merge_item "${n}" ;;
+        close)    close_item "${n}" ;;
+        delete)   delete_item "${n}" ;;
         copy)     copy_message "${n}" ;;
         feedback) show_feedback "${n}" ;;
         issue)    create_issue "${n}" ;;
@@ -875,16 +970,23 @@ menu_items() {
     else
         create_description="create a ${NOUN}: check out a feature branch first"
     fi
-    printf '%s\t%s\n' \
-        "ACTION"   "DESCRIPTION" \
-        "review"   "approve, merge, or inspect a ${NOUN}" \
-        "create"   "${create_description}" \
-        "copy"     "copy a channel message for a ${NOUN}" \
-        "feedback" "show the comments and review feedback of a ${NOUN}" \
-        "issue"    "create an issue from a ${NOUN}" \
-        "branch"   "branch filter: $(branch_filter_label)" \
-        "states"   "state filter: $(state_filter_label)" \
-        | render_table
+    # a pull request can not be deleted, so GitHub has no delete entry
+    {   printf '%s\t%s\n' \
+            "ACTION"   "DESCRIPTION" \
+            "review"   "approve, merge, or inspect a ${NOUN}" \
+            "create"   "${create_description}" \
+            "copy"     "copy a channel message for a ${NOUN}" \
+            "feedback" "show the comments and review feedback of a ${NOUN}" \
+            "issue"    "create an issue from a ${NOUN}" \
+            "close"    "close a ${NOUN} and optionally delete its source branch"
+        if [ "${provider}" != "github" ]; then
+            printf '%s\t%s\n' \
+                "delete" "delete a ${NOUN} and optionally delete its source branch"
+        fi
+        printf '%s\t%s\n' \
+            "branch"   "branch filter: $(branch_filter_label)" \
+            "states"   "state filter: $(state_filter_label)"
+    } | render_table
 }
 
 print_context() {
@@ -952,7 +1054,7 @@ run_menu() {
                 create_request
                 return "${?}"
                 ;;
-            review|copy|feedback|issue)
+            review|copy|feedback|issue|close|delete)
                 action="${choice}"
                 write_state
                 if ! has_requests; then
@@ -1008,6 +1110,8 @@ handle_list_key() {
         alt-a)  run_action approve "${n}" ;;
         alt-m)  run_action merge "${n}" ;;
         alt-i)  run_action issue "${n}" ;;
+        alt-c)  run_action close "${n}" ;;
+        alt-x)  run_action delete "${n}" ;;
         *)      fail "Unknown key: ${key}" ;;
     esac
     rc=$?
@@ -1017,8 +1121,9 @@ handle_list_key() {
 }
 
 list_key_descs() {
-    printf 'enter:%s,ctrl-s:show,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:feedback,alt-a:approve,alt-m:merge,alt-i:issue,esc:back' \
-        "$(action_label "${action}")"
+    printf 'enter:%s,ctrl-s:show,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:feedback,alt-a:approve,alt-m:merge,alt-i:issue,alt-c:close%s,esc:back' \
+        "$(action_label "${action}")" \
+        "$([ "${provider}" != "github" ] && printf ',alt-x:delete')"
 }
 
 pick_list() {
@@ -1037,6 +1142,7 @@ write_state() {
         printf 'provider=%q\n' "${provider}"
         printf 'remote_host=%q\n' "${remote_host}"
         printf 'remote_repository=%q\n' "${remote_repository}"
+        printf 'remote_url=%q\n' "${remote_url}"
         printf 'github_repository=%q\n' "${github_repository}"
         printf 'github_repo_selector=%q\n' "${github_repo_selector}"
         declare -p github_api_args
@@ -1083,6 +1189,7 @@ query=""
 raw=0
 remote_host=""
 remote_repository=""
+remote_url=""
 repo_dir=""
 unresolved=0
 
@@ -1099,6 +1206,12 @@ while [ "${#}" -gt 0 ]; do
             ;;
         -M|--merge)
             set_action "merge"
+            ;;
+        -C|--close)
+            set_action "close"
+            ;;
+        -D|--delete)
+            set_action "delete"
             ;;
         -m|--copy-message)
             set_action "copy"
@@ -1253,6 +1366,7 @@ detect_provider "${remote_url}"
 set_provider_labels
 if [ "${provider}" = "github" ]; then
     need_cmd gh
+    [ "${action}" = "delete" ] && fail "A ${NOUN} can not be deleted, close it instead"
 else
     need_cmd glab
 fi
