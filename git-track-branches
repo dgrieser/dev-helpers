@@ -1,6 +1,7 @@
 #!/bin/bash
 
 APP_NAME="$(basename "${0}")"
+MAX_AGE_DEFAULT=30
 
 usage() {
     cat <<EOF 1>&2
@@ -9,8 +10,10 @@ usage: ${APP_NAME} [OPTIONS]
 Track all remote branches
 
 Options:
-    -h, --help  Show this help
-    -C, --clear Clear local branches which don't exist on remote
+    -h, --help              Show this help
+    -a, --max-age <days>    only track branches with commits newer than
+                            <days> days (default ${MAX_AGE_DEFAULT}, 0 for no limit)
+    -C, --clear             Clear local branches which don't exist on remote
 EOF
     exit 1
 }
@@ -25,22 +28,33 @@ fail() {
 }
 
 clear_local_branches=0
+max_age="${MAX_AGE_DEFAULT}"
 
 while [ "$#" -gt 0 ]; do
     case "${1}" in
         -h|--help) usage ;;
+        -a|--max-age)
+            shift
+            [[ "${1}" =~ ^[0-9]+$ ]] || fail "Invalid age: ${1}"
+            max_age="${1}"
+            ;;
         -C|--clear) clear_local_branches=1 ;;
         *) usage ;;
     esac
     shift
 done
 
+cutoff=0
+[ "${max_age}" -gt 0 ] && cutoff=$(( $(date +%s) - max_age * 86400 ))
+
 LC_ALL=C git pull --all || fail "No git repo?"
-remote_branches="$(LC_ALL=C git branch --list --remotes --format="%(refname:lstrip=2)" | grep -v "HEAD")"
-for branch in ${remote_branches}; do
+remote_branches="$(LC_ALL=C git branch --list --remotes --format="%(refname:lstrip=2) %(committerdate:unix)" | grep -v "^origin/HEAD ")"
+while read -r branch committer_date; do
+    [ -z "${branch}" ] && continue
+    [ "${cutoff}" -gt 0 ] && [ "${committer_date}" -lt "${cutoff}" ] && continue
     [ -n "$(LC_ALL=C git branch --list "${branch#origin/}")" ] && continue
     LC_ALL=C git branch --track "${branch#origin/}" "${branch}"
-done
+done <<< "${remote_branches}"
 if [ "${clear_local_branches}" -eq 1 ]; then
     LC_ALL=C git fetch --prune
     LC_ALL=C git branch -vv | awk '/: gone]/{print $1}' | LC_ALL=C xargs git branch -D

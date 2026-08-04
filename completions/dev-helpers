@@ -402,10 +402,10 @@ _git-pipe()
         -o|--output)
             __dh_compgen "txt json"
             return 0 ;;
-        --var|--grep|-n|--limit|-q|--query|-w|--watch) return 0 ;;
+        --var|--grep|-n|--limit|-q|--query|-w|--watch|--tags) return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-h --help -r --repo --ref --all-refs -q --query -w --watch -p --print --var --grep --source -s --status --failed --succeeded --aborted --running --pending --manual --skipped -n --limit -a --all -o --output"
+        __dh_compgen "-h --help -r --repo --ref --all-refs --tags --no-tags -q --query -w --watch -p --print --var --grep --source -s --status --failed --succeeded --aborted --running --pending --manual --skipped -n --limit -a --all -o --output"
     elif [ "${COMP_CWORD}" -eq 1 ]; then
         __dh_compgen "status search"
     fi

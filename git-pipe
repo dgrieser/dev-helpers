@@ -5,6 +5,10 @@ APP_NAME="$(basename "${0}")"
 PER_PAGE_DEFAULT=20
 WATCH_SECONDS_DEFAULT=5
 WATCH_FIRST_DELAY=10
+# how many of the most recent tags to include pipelines for, and how many
+# pipelines to fetch per tag
+TAG_LIMIT_DEFAULT=3
+TAG_PER_PAGE=20
 
 NL=$'\n'
 HEADER="ID  STATUS  SOURCE  REF  CREATED  URL"
@@ -18,6 +22,9 @@ usage: ${APP_NAME} COMMAND [OPTIONS]
 
 Show and search GitLab CI or GitHub Actions pipeline information for a repository.
 
+In addition to the pipelines of the selected ref, the pipelines of the ${TAG_LIMIT_DEFAULT} most
+recent tags are included (see --tags/--no-tags).
+
 Results are shown in an interactive picker (keys: ${KEY_DESCS_HELP}).
 The picker reloads once ${WATCH_FIRST_DELAY} seconds after it opened, then keeps reloading
 as long as pipelines are still running.
@@ -30,6 +37,9 @@ Options:
     -h|--help               show this help
     -r|--repo <PROJECT>     project to operate on (default: current directory)
         --ref <REF>         ref to filter by (default: current branch)
+        --tags <N>          also show the pipelines of the N most recent tags
+                            (default ${TAG_LIMIT_DEFAULT}, 0 disables; one API request per tag)
+        --no-tags           shorthand for --tags 0
     -q|--query <QUERY>      start the picker with a search query
     -p|--print              print the result table instead of opening the picker
     -w|--watch <SECONDS>    reload interval while pipelines are still running
@@ -164,7 +174,9 @@ detect_provider() {
 }
 
 cmd_status() {
-    list_pipelines_json || fail "failed to list pipelines"
+    local pipelines
+    pipelines="$(list_pipelines_json)" || fail "failed to list pipelines"
+    merge_tag_pipelines "${pipelines}"
 }
 
 list_gitlab_pipelines_json() {
@@ -256,6 +268,55 @@ list_pipelines_json() {
     else
         list_gitlab_pipelines_json
     fi
+}
+
+list_tag_names() {
+    if [ "${provider}" = "github" ]; then
+        gh api "${github_api_args[@]}" "repos/${github_repository}/tags?per_page=100" 2>/dev/null \
+            | jq -r '.[].name'
+    else
+        glab api "projects/$(project_id)/repository/tags?per_page=100" 2>/dev/null \
+            | jq -r '.[].name'
+    fi
+}
+
+# neither API can filter pipelines by "is a tag", so query the most recent tags
+# by ref - both providers accept a tag name where they take a branch/ref
+list_tag_pipelines_json() {
+    local out="[]" tag part
+    local saved_ref="${ref}"
+    local saved_per_page="${per_page}"
+    local saved_paginate="${paginate}"
+    local saved_truncated="${TRUNCATED}"
+
+    per_page="${TAG_PER_PAGE}"
+    paginate=0
+    while IFS= read -r tag; do
+        [ -z "${tag}" ] && continue
+        ref="${tag}"
+        part="$(list_pipelines_json)" || part="[]"
+        out="$(jq -s 'add' <(printf '%s\n' "${out}") <(printf '%s\n' "${part}"))"
+    done < <(list_tag_names | head -n "${tag_limit}")
+
+    ref="${saved_ref}"
+    per_page="${saved_per_page}"
+    paginate="${saved_paginate}"
+    # the tag queries use their own window, so keep the warning about the main one
+    TRUNCATED="${saved_truncated}"
+
+    jq 'unique_by(.id) | sort_by(.id) | reverse' <<< "${out}"
+}
+
+merge_tag_pipelines() {
+    local pipelines="${1}"
+    local tag_pipelines
+
+    # without a ref filter every tag pipeline is in the result set already
+    { [ "${tag_limit}" -le 0 ] || [ -z "${ref}" ]; } && { printf '%s\n' "${pipelines}"; return 0; }
+
+    tag_pipelines="$(list_tag_pipelines_json)" || tag_pipelines="[]"
+    jq -s 'add | unique_by(.id) | sort_by(.id) | reverse' \
+        <(printf '%s\n' "${pipelines}") <(printf '%s\n' "${tag_pipelines}")
 }
 
 match_gitlab_vars() {
@@ -471,6 +532,7 @@ write_state() {
         printf 'refresh=%q\n' "${refresh}"
         printf 'action=%q\n' "${action}"
         printf 'ref=%q\n' "${ref}"
+        printf 'tag_limit=%q\n' "${tag_limit}"
         printf 'source=%q\n' "${source}"
         printf 'grep_pattern=%q\n' "${grep_pattern}"
         printf 'per_page=%q\n' "${per_page}"
@@ -535,6 +597,9 @@ cmd_search() {
     [ "${TRUNCATED}" -eq 1 ] \
         && warning "Hit the ${per_page}-result page limit; more pipelines may match. Use -a/--all or raise -n/--limit."
 
+    # merge before filtering, so --var/--grep apply to the tag pipelines as well
+    pipelines="$(merge_tag_pipelines "${pipelines}")"
+
     [ -n "${grep_pattern}" ] && echo "Searching job logs (this may take a while)..." 1>&2
 
     while IFS= read -r pid; do
@@ -566,6 +631,7 @@ github_repo_selector=""
 github_api_args=()
 ref=""
 all_refs=0
+tag_limit="${TAG_LIMIT_DEFAULT}"
 source=""
 grep_pattern=""
 output="txt"
@@ -604,6 +670,16 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --all-refs)
             all_refs=1
+            ;;
+        --tags)
+            shift
+            [ -z "${1:-}" ] && error "Missing tags argument" && usage
+            ! [[ "${1}" =~ ^[0-9]+$ ]] && error "Invalid tags count: ${1}" && usage
+            [ "${1}" -gt 100 ] && error "Tags count must be between 0 and 100" && usage
+            tag_limit="${1}"
+            ;;
+        --no-tags)
+            tag_limit=0
             ;;
         -q|--query)
             shift
