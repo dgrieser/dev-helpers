@@ -23,8 +23,8 @@ LOG_KEYS="ctrl-c,ctrl-d,ctrl-o,alt-p,alt-r,alt-b,esc,enter"
 LOG_KEY_DESCS="enter:files,ctrl-c:copy hash,ctrl-d:diff,ctrl-o:open,alt-p:patch,alt-r:revert,alt-b:revert on branch"
 
 FILES_HEADER=$'STATUS\t+\t-\tPATH'
-FILES_KEYS="ctrl-c,alt-v,alt-p,alt-r,esc,bspace,enter"
-FILES_KEY_DESCS="enter:diff,ctrl-c:copy path,alt-v:vimdiff,alt-p:patch,alt-r:revert file,esc:back,bspace:back"
+FILES_KEYS="ctrl-c,ctrl-e,alt-v,alt-p,alt-r,esc,bspace,enter"
+FILES_KEY_DESCS="enter:diff,ctrl-c:copy path,ctrl-e:edit,alt-v:vimdiff,alt-p:patch,alt-r:revert file,esc:back,bspace:back"
 
 key_help() {
     printf '%s' "${1}" | tr ',' '\n' | awk -F':' '{ printf "  %-8s %s\n", $1, $2 }'
@@ -353,6 +353,28 @@ revert_branch() {
     fi
 }
 
+# open the working tree version of the file at the first change of the commit;
+# the hunk header names the first context line, the change itself follows the
+# three lines of context
+edit_file() {
+    local path="${1}"
+    local file lineno
+
+    need_cmd vim
+    file="${repo_root_dir}/${path}"
+    [ -f "${file}" ] || fail "Not a file in the working tree: ${path}"
+
+    lineno="$(git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" "${commit}" -- "${path}" 2>/dev/null \
+        | awk '/^@@/ { if (match($0, /\+[0-9]+/)) { print substr($0, RSTART + 1, RLENGTH - 1); exit } }')"
+    if [[ "${lineno}" =~ ^[0-9]+$ ]]; then
+        lineno=$((lineno + 3))
+    else
+        lineno=1
+    fi
+
+    vim "+${lineno}" "${file}"
+}
+
 vimdiff_file() {
     local path="${1}"
     local parent tmp_root old new
@@ -490,6 +512,10 @@ handle_files_key() {
             need_cmd clip
             printf '%s' "${path}" | clip
             exit 1
+            ;;
+        ctrl-e)
+            edit_file "${path}"
+            exit 0
             ;;
         alt-v)
             vimdiff_file "${path}"
