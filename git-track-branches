@@ -57,5 +57,5 @@ while read -r branch committer_date; do
 done <<< "${remote_branches}"
 if [ "${clear_local_branches}" -eq 1 ]; then
     LC_ALL=C git fetch --prune
-    LC_ALL=C git branch -vv | awk '/: gone]/{print $1}' | LC_ALL=C xargs git branch -D
+    LC_ALL=C git branch -vv | awk '/^[^*].*: gone]/{print $1}' | LC_ALL=C xargs -r git branch -D
 fi
