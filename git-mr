@@ -1283,7 +1283,9 @@ exit_code=0
 if [ "${action}" = "create" ]; then
     create_request
     exit_code="${?}"
-elif [ "${mode}" = "print" ] || { [ ! -t 1 ] && [ -z "${number}" ]; }; then
+# a piped run without an action prints the list; with an action the picker still
+# opens on the terminal and its output is what gets piped
+elif [ "${mode}" = "print" ] || { [ ! -t 1 ] && [ -z "${number}" ] && [ -z "${action}" ]; }; then
     need_cmd toage
     list_print
     exit_code="${?}"
