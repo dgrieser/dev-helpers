@@ -235,7 +235,7 @@ Show GitLab CI or GitHub Actions pipeline status for a ref, or search pipelines 
 
 Alongside the pipelines of the selected ref, the pipelines of the 3 most recent tags are shown (`--tags <N>` changes the number of tags, `--no-tags` turns them off). Each tag costs one API request, so a large `N` makes the lookup - and every `--watch` reload - slower.
 
-Results open in an interactive picker with the pipeline's jobs in the preview: `enter` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs. The picker reloads once 3 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. Use `-p` or `-o json` for non-interactive output.
+Results open in an interactive picker with the pipeline's jobs in the preview: `enter` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs. The picker reloads once 10 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. A manual refresh (`ctrl-r`) refetches even after that, and if it brings up a running pipeline the auto-reloading resumes. Use `-p` or `-o json` for non-interactive output.
 ```bash
 git-pipe status [-r <project>] [--ref <ref>] [--tags <N>|--no-tags] [-q <query>] [-w <seconds>] \
                 [-p] [-o txt|json]

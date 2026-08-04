@@ -27,7 +27,8 @@ recent tags are included (see --tags/--no-tags).
 
 Results are shown in an interactive picker (keys: ${KEY_DESCS_HELP}).
 The picker reloads once ${WATCH_FIRST_DELAY} seconds after it opened, then keeps reloading
-as long as pipelines are still running.
+as long as pipelines are still running. Once it stopped, a manual refresh
+(ctrl-r) that brings up a running pipeline resumes the auto-reloading.
 
 COMMAND
     status                  show CI pipeline status for a ref
@@ -804,7 +805,8 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
             pipelines=""
             # every reload refetches, so a pipeline that started after the picker
             # opened shows up; the watcher stops on its own once nothing runs
-            # anymore, a manual refresh still picks up new pipelines
+            # anymore, a manual refresh still refetches and its result is what
+            # lets the watcher pick the watching back up
             if [ "${refresh:-0}" -eq 1 ]; then
                 pipelines="$(fetch_pipelines 2>/dev/null)"
                 [ -n "${pipelines}" ] && printf '%s\n' "${pipelines}" > "${JSON_FILE}"
