@@ -552,8 +552,7 @@ approve_and_merge() {
     json="$(item_json "${n}")"
     [ -n "${json}" ] && print_item_summary "${json}"
     echo 1>&2
-    prompt-continue "Approve and merge $(item_ref "${n}")?" \
-        || { echo "Abort." 1>&2; return 2; }
+    prompt-yes-no "Approve and merge '$(item_ref "${n}")'?" || { echo "Abort." 1>&2; return 2; }
     approve_item "${n}" || return 1
     merge_item "${n}"
 }

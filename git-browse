@@ -278,11 +278,14 @@ list_paths() {
 
     # a ref that is not in this clone, e.g. a branch that only exists on the
     # remote, has no tree to list, so the working tree stands in for it;
-    # quotePath would hand out "dir/\303\274.txt" instead of the real name
+    # quotePath would hand out "dir/\303\274.txt" instead of the real name;
+    # both commands list the current directory only and name their paths
+    # relative to it, so they run in the repository root to hand out the
+    # repo-relative paths the callers expect
     if ref_exists "${ref}"; then
-        git -c core.quotePath=false ls-tree -r --name-only "${ref}"
+        git -C "${repo_root_dir}" -c core.quotePath=false ls-tree -r --name-only "${ref}"
     else
-        git -c core.quotePath=false ls-files
+        git -C "${repo_root_dir}" -c core.quotePath=false ls-files
     fi
 }
 

@@ -1,9 +1,15 @@
 #!/bin/bash
 
 NL=$'\n'
+
+git_dir="$(git rev-parse --show-toplevel)" || { echo "ERROR: Not a git repo?" 1>&2; exit 1; }
+
+# the whole working tree is reset, so the list and the commands below run in the
+# repository root: started from a subdirectory, "git status" would name its
+# paths relative to that directory and "checkout"/"clean" would only touch it
 #list all files which will be reset and or cleaned
-changed="$(git status --porcelain | cut -c4-)"
-changed="${changed}${NL}$(git diff --name-only)"
+changed="$(git -C "${git_dir}" status --porcelain | cut -c4-)"
+changed="${changed}${NL}$(git -C "${git_dir}" diff --name-only)"
 changed="$(echo "${changed}" | grep -v '^$' | sort -u)"
 changed_count="$(echo -n "${changed}" | wc -l)"
 if [ "${changed_count}" -gt 0 ]; then
@@ -13,4 +19,7 @@ if [ "${changed_count}" -gt 0 ]; then
     echo
 fi
 prompt-continue "Are you sure you want to reset all files? [y/N]" || exit 1
-LC_ALL=C git reset && LC_ALL=C git checkout -- . && LC_ALL=C git clean -ffd && echo "Done"
+LC_ALL=C git -C "${git_dir}" reset \
+    && LC_ALL=C git -C "${git_dir}" checkout -- . \
+    && LC_ALL=C git -C "${git_dir}" clean -ffd \
+    && echo "Done"

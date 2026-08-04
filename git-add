@@ -73,18 +73,21 @@ edit_file() {
     fi
     echo "vim" > "${POST_COMMAND_FILE}"
     echo "+${lineno}" >> "${POST_COMMAND_FILE}"
-    echo "${path}" >> "${POST_COMMAND_FILE}"
+    # git reports repo-relative paths, but the post command runs in the
+    # directory this script was started from, which may be a subdirectory.
+    echo "${GIT_DIR}/${path}" >> "${POST_COMMAND_FILE}"
     cat "${POST_COMMAND_FILE}" | tr '\n' ' ' | sed -E 's/^/+ /g ; s/ $/\n/' 1>&2
 }
 
 vimdiff_file() {
     local path="${1}"; shift
-    # git-diff resolves the path against the repo root and handles the readonly
-    # side (HEAD version, or an empty file for untracked files).
+    # git-diff handles the readonly side (HEAD version, or an empty file for
+    # untracked files). Pass an absolute path because the post command runs in
+    # the directory this script was started from, which may be a subdirectory.
     echo "git-diff" > "${POST_COMMAND_FILE}"
     echo "--vim" >> "${POST_COMMAND_FILE}"
     echo "--path" >> "${POST_COMMAND_FILE}"
-    echo "${path}" >> "${POST_COMMAND_FILE}"
+    echo "${GIT_DIR}/${path}" >> "${POST_COMMAND_FILE}"
     cat "${POST_COMMAND_FILE}" | tr '\n' ' ' | sed -E 's/^/+ /g ; s/ $/\n/' 1>&2
 }
 
@@ -344,7 +347,12 @@ if [ -n "${reset_path}" ]; then
 fi
 
 if [ -n "${ignore_path}" ]; then
-    ${IGNORE_CMD} "${ignore_path}"
+    # .gitignore entries must stay repo-relative, so run in the repo root
+    # instead of passing an absolute path.
+    (
+        cd "${GIT_DIR}"
+        ${IGNORE_CMD} "${ignore_path}"
+    )
     [ -n "${key_result}" ] && echo -e "ignore\n${ignore_path}" > "${PREVIOUS_UPDATE_FILE}"
 fi
 

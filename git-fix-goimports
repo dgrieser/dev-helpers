@@ -18,8 +18,13 @@ fail() {
     exit 1
 }
 
+# "make" and "find ." below cover the whole repository, so run in its root
+# instead of the directory this was started from
+git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
+cd "${git_dir}" || fail "Failed to change to: ${git_dir}"
+
 git-track-branches || exit 1
-git checkout master || fail "Not a git repo?" 
+git checkout master || fail "Failed to checkout branch master"
 branches="$(git branch --list --format="%(refname:short)" --sort=-committerdate | head -n 10)"
 choice="$(printf '%s\n' "${branches}" | prompt-select -p "Choose branch:")" || abort
 git checkout "${choice}" || fail "Failed to checkout branch ${choice}"
