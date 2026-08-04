@@ -1001,10 +1001,6 @@ handle_list_key() {
             exit 0
             ;;
     esac
-    if [ "${key}" = "enter" ] && [ "${action}" = "feedback" ]; then
-        run_action feedback "${n}"
-        exit 0
-    fi
 
     case "${key}" in
         enter)  run_action "${action}" "${n}" ;;
