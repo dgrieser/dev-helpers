@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 APP_NAME="$(basename "${0}")"
 
 PER_PAGE_DEFAULT=20

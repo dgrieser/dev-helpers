@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 usage() {
     echo "usage: $(basename "${0}") [<tag>] [-d|--delete] [-r|--recreate] [-y|--yes]" 1>&2
     exit 1

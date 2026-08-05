@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 APP="$(basename "${0}")"
 
 NL=$'\n'
@@ -230,7 +232,7 @@ create_patch() {
     # format-patch skips merges, so those are written as a plain diff instead
     if is_merge "${rev}"; then
         out="${output_dir}/$(git rev-parse --short "${rev}").patch"
-        git show -m --first-parent --patch "${rev}" -- "${paths[@]}" > "${out}" \
+        git show -m --first-parent --no-color --patch "${rev}" -- "${paths[@]}" > "${out}" \
             || fail "Failed to create a patch for ${rev}"
         [ -s "${out}" ] || { rm -f "${out}"; fail "Nothing to patch in ${rev}"; }
     else
@@ -248,7 +250,7 @@ create_file_patch() {
     [ -d "${output_dir}" ] || fail "No such directory: ${output_dir}"
     short="$(git rev-parse --short "${commit}")"
     out="${output_dir}/$(basename "${path}").${short}.patch"
-    git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" "${commit}" -- "${path}" > "${out}" \
+    git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" --no-color "${commit}" -- "${path}" > "${out}" \
         || fail "Failed to create a patch for ${path}"
     [ -s "${out}" ] || { rm -f "${out}"; fail "Nothing to patch for ${path} in ${short}"; }
     printf '%s\n' "${out}"

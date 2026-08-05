@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 APP_NAME="$(basename "${0}")"
 ROOT_MODE=0
 GITIGNORE_FILE=".gitignore"

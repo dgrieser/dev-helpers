@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 APP="$(basename "${0}")"
 
 NL=$'\n'
@@ -282,7 +284,7 @@ create_patch() {
     [ -d "${output_dir}" ] || fail "No such directory: ${output_dir}"
     short="$(git_repo rev-parse --short "${sha}")"
     out="${output_dir}/$(basename "${file}").${short}.patch"
-    git_repo show "${SHOW_ARGS[@]}" "${sha}" -- "${file}" > "${out}" \
+    git_repo show "${SHOW_ARGS[@]}" --no-color "${sha}" -- "${file}" > "${out}" \
         || fail "Failed to create a patch for ${file}"
     [ -s "${out}" ] || { rm -f "${out}"; fail "Nothing to patch for ${file} in ${short}"; }
     printf '%s\n' "${out}"

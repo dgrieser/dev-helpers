@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 function retrieve_tag() {
     local level=$1
     if [ ${level} -eq 0 ]; then

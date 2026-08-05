@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 APP_NAME="$(basename "${0}")"
 GIT_METADATA_FOLDER="${HOME}/.git-metadata"
 

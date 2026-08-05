@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 APP_NAME="$(basename "${0}")"
 
 usage() {
@@ -350,9 +352,9 @@ move_to_main() {
     move_untracked_tar="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.untracked.XXXXXX.tar")" ||
         move_fail "Cannot create temp file"
 
-    git -C "${source_mirror_worktree}" diff --cached --binary > "${move_staged_patch}" ||
+    git -C "${source_mirror_worktree}" diff --no-color --cached --binary > "${move_staged_patch}" ||
         move_fail "Cannot generate staged diff"
-    git -C "${source_mirror_worktree}" diff --binary > "${move_unstaged_patch}" ||
+    git -C "${source_mirror_worktree}" diff --no-color --binary > "${move_unstaged_patch}" ||
         move_fail "Cannot generate unstaged diff"
     git -C "${source_mirror_worktree}" ls-files --others --exclude-standard -z > "${move_untracked_list}" ||
         move_fail "Cannot list untracked files"

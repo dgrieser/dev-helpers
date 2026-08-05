@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git() { command git -c color.ui=always "$@"; }
+
 usage() {
     cat <<EOF 1>&2
 usage: $(basename "${0}") [OPTIONS]
@@ -33,7 +35,7 @@ if [ "${force}" -eq 0 ]; then
 fi
 
 default_branch="$(git-default)" || exit 1
-local_branches="$(git branch | grep -v "${default_branch}")"
-[ -n "${local_branches}" ] && echo "${local_branches}" | xargs git branch -D
+local_branches="$(git -c color.ui=false branch | grep -v "${default_branch}")"
+[ -n "${local_branches}" ] && echo "${local_branches}" | xargs env git -c color.ui=always branch -D
 
 exit 0
