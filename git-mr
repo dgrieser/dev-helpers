@@ -18,6 +18,9 @@ LIST_HEADER=$'ID\tSTATE\tUPDATED\tAUTHOR\tBRANCHES\tTITLE'
 
 LIST_KEYS="enter,esc,ctrl-q,ctrl-s,ctrl-d,ctrl-o,ctrl-y,ctrl-f,alt-a,alt-m,alt-i,alt-c,alt-x"
 
+# an approval the provider refuses because the request is the user's own
+RC_SELF_APPROVE=3
+
 JQ_STATE_COLOR='
     def statecolor:
         if . == "open" or . == "opened" then "\u001b[32m"
@@ -88,6 +91,11 @@ requests themselves are listed in a picker with the request and its diff in the
 preview:
 
 $(key_help "enter:the chosen action (approve + merge by default),ctrl-s:show the request,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the feedback,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
+
+When the provider refuses the approval because the request is your own, the
+approve + merge action asks whether to merge it without that approval (on
+GitHub bypassing the branch protection rules with --admin, which needs the
+permission to do so).
 
 Actions:
   -c, --create            create a request from the current branch
@@ -525,36 +533,71 @@ copy_message() {
 
 approve_item() {
     local n="${1}"
+    local out rc=0
 
     if [ "${provider}" = "github" ]; then
-        gh pr review "${n}" --repo "${github_repo_selector}" --approve \
-            || { error "Failed to approve $(item_ref "${n}")"; return 1; }
+        out="$(gh pr review "${n}" --repo "${github_repo_selector}" --approve 2>&1)" || rc=1
     else
-        glab mr approve "${n}" || { error "Failed to approve $(item_ref "${n}")"; return 1; }
+        out="$(glab mr approve "${n}" 2>&1)" || rc=1
     fi
+    [ -n "${out}" ] && printf '%s\n' "${out}" 1>&2
+    [ "${rc}" -eq 0 ] && return 0
+    # both providers refuse a self approval; the merge itself may still be
+    # allowed, so that case gets its own return code
+    if grep -qiE "approve (your|their) own|own (pull|merge) request" <<< "${out}"; then
+        error "Cannot approve your own $(item_ref "${n}")"
+        return "${RC_SELF_APPROVE}"
+    fi
+    error "Failed to approve $(item_ref "${n}")"
+    return 1
 }
 
 merge_item() {
     local n="${1}"
+    local bypass="${2:-0}"
+    local merge_args=()
 
     if [ "${provider}" = "github" ]; then
-        gh pr merge "${n}" --repo "${github_repo_selector}" \
+        # --admin merges through the branch protection rules, so a missing
+        # approval does not block the merge
+        [ "${bypass}" -eq 1 ] && merge_args+=("--admin")
+        gh pr merge "${n}" --repo "${github_repo_selector}" "${merge_args[@]}" \
             || { error "Failed to merge $(item_ref "${n}")"; return 1; }
     else
+        # glab has no bypass flag; the merge goes through unless the project
+        # makes the missing approval mandatory
         glab mr merge "${n}" || { error "Failed to merge $(item_ref "${n}")"; return 1; }
+    fi
+}
+
+# a refused self approval falls back to asking whether to merge without it
+merge_without_approval() {
+    local n="${1}"
+
+    if [ "${provider}" = "github" ]; then
+        prompt-no-yes "Merge $(item_ref "${n}") anyway, bypassing the branch protection rules (--admin)?" \
+            || { echo "Abort." 1>&2; return 2; }
+        merge_item "${n}" 1
+    else
+        prompt-no-yes "Merge $(item_ref "${n}") anyway, without an approval?" \
+            || { echo "Abort." 1>&2; return 2; }
+        merge_item "${n}"
     fi
 }
 
 approve_and_merge() {
     local n="${1}"
-    local json
+    local json rc
 
     json="$(item_json "${n}")"
     [ -n "${json}" ] && print_item_summary "${json}"
     echo 1>&2
     prompt-yes-no "Approve and merge '$(item_ref "${n}")'?" || { echo "Abort." 1>&2; return 2; }
-    approve_item "${n}" || return 1
-    merge_item "${n}"
+    approve_item "${n}"
+    rc=$?
+    [ "${rc}" -eq 0 ] && { merge_item "${n}"; return "${?}"; }
+    [ "${rc}" -ne "${RC_SELF_APPROVE}" ] && return 1
+    merge_without_approval "${n}"
 }
 
 # the remote the requests belong to; the branch of a request lives there
@@ -924,10 +967,17 @@ action_label() {
 run_action() {
     local act="${1}"
     local n="${2}"
+    local rc
 
     case "${act}" in
         review)   approve_and_merge "${n}" ;;
-        approve)  approve_item "${n}" ;;
+        approve)
+            approve_item "${n}"
+            rc=$?
+            # on its own the approve action has no merge to fall back to
+            [ "${rc}" -eq "${RC_SELF_APPROVE}" ] && rc=1
+            return "${rc}"
+            ;;
         merge)    merge_item "${n}" ;;
         close)    close_item "${n}" ;;
         delete)   delete_item "${n}" ;;
