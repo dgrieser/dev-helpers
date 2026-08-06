@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 usage() {
     echo "usage: $(basename "${0}") <branch>" 1>&2
@@ -50,7 +51,7 @@ default_branch="$(git-default)"
 reset_hash_default_branch=""
 if [ "${current_branch}" == "${default_branch}" ] && [[ "$(git -C "${git_dir}" rev-list --count @{u}..HEAD 2>/dev/null)" -gt 0 ]]; then
     warning "You have unpushed commits"
-    git log --oneline @{u}..HEAD
+    git-color log --oneline @{u}..HEAD
     echo
     prompt-no-yes "Move those commits to new branch?"; exit_code=$?
     [ ${exit_code} -eq 0 ] && reset_hash_default_branch="$(git -C "${git_dir}" merge-base HEAD @{u})"
@@ -86,7 +87,7 @@ echo "Branch: ${branch}" 1>&2
 
 
 prompt-continue-yes "Create branch \"${branch}\"?" || abort
-if ! git -C "${git_dir}" branch "${branch}"; then
+if ! git-color -C "${git_dir}" branch "${branch}"; then
     error "Failed to create branch \"${branch}\"."
     if git -C "${git_dir}" rev-parse --verify --quiet "${branch}" 1>/dev/null; then
         prompt-yes-no "Use existing branch \"${branch}\"?" || abort
@@ -96,15 +97,15 @@ if ! git -C "${git_dir}" branch "${branch}"; then
 fi
 
 if [ -n "${reset_hash_default_branch}" ]; then
-    git -C "${git_dir}" reset --hard "${reset_hash_default_branch}"
+    git-color -C "${git_dir}" reset --hard "${reset_hash_default_branch}"
 fi
-git -C "${git_dir}" switch "${branch}" || abort
-git -C "${git_dir}" init
+git-color -C "${git_dir}" switch "${branch}" || abort
+git-color -C "${git_dir}" init
 if [ "${anychanges}" -gt 0 ]; then
     git-add || abort
-    git -C "${git_dir}" commit || abort
+    git-color -C "${git_dir}" commit || abort
 fi
-git -C "${git_dir}" push -u origin ${branch} || fail "Failed to push branch \"${branch}\"."
+git-color -C "${git_dir}" push -u origin ${branch} || fail "Failed to push branch \"${branch}\"."
 git_host="$(git-browse --print --host-only)"
 if [ "${git_host}" == "github.com" ]; then
     git-pr -c || abort

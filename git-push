@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 usage() {
     echo "usage: $(basename "${0}") [-p|--push-only] [-F|--force-with-lease] [<branch>]" 1>&2
@@ -65,14 +66,14 @@ message="Commit and push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_ONLY}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\" (force with lease)?"
 prompt-yes-no "${message}" || abort
-git -C "${git_dir}" init
+git-color -C "${git_dir}" init
 ok=1
 if [ "${PUSH_ONLY}" -eq 0 ]; then
     ok=0
     if git-add; then
         changes="$(git -C "${git_dir}" status --porcelain)"
         if [ -n "${changes}" ]; then
-            git -C "${git_dir}" commit && ok=1
+            git-color -C "${git_dir}" commit && ok=1
         else
             echo "No changes to commit."
             ok=1
@@ -92,9 +93,9 @@ if [ "${PUSH_FORCE_WITH_LEASE}" -eq 0 ]; then
     fi
 fi
 if [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ]; then
-    git -C "${git_dir}" push --force-with-lease origin "${BRANCH}"
+    git-color -C "${git_dir}" push --force-with-lease origin "${BRANCH}"
 else
-    git -C "${git_dir}" push -u origin "${BRANCH}"
+    git-color -C "${git_dir}" push -u origin "${BRANCH}"
 fi
 
 git-pipe status

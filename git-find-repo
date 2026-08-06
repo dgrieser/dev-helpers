@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 usage() {
     cat <<EOF 1>&2
@@ -378,7 +379,7 @@ checkout_requested_ref() {
     (
         cd "${repo_path}" || fail "Unable to change directory to: ${repo_path}"
         git-checkout 1>&2 || fail "Unable to checkout default branch"
-        git pull 1>&2 || fail "Unable to pull default branch"
+        git-color pull 1>&2 || fail "Unable to pull default branch"
         branch="${checkout_source_branch}"
         if [ -n "${checkout_mr_id}" ]; then
             branch="$(glab mr view "${checkout_mr_id}" -F json | jq -r '.source_branch')"
@@ -387,7 +388,7 @@ checkout_requested_ref() {
             note "Switching to source branch: ${branch}"
         fi
         git-checkout "${branch}" 1>&2 || fail "Unable to switch to source branch: ${branch}"
-        git pull 1>&2 || fail "Unable to pull source branch: ${branch}"
+        git-color pull 1>&2 || fail "Unable to pull source branch: ${branch}"
     ) || exit 1
 }
 

@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 usage() {
     echo "usage: $(basename "${0}") [<tag>] [-d|--delete] [-r|--recreate] [-y|--yes]" 1>&2
@@ -79,7 +80,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-git fetch --all || fail "No git repo? Abort."
+git-color fetch --all || fail "No git repo? Abort."
 recent_tags="$(git tag --sort=-v:refname | head -n 10 | tac)"
 last_tag="$(echo "${recent_tags}" | tail -n 1)"
 next_tag=""
@@ -119,7 +120,7 @@ if [ "${delete}" -eq 1 ] && [ "${create}" -eq 1 ]; then
     if [ "${yes}" -eq 0 ]; then
         # the candidates are bare hashes, so the subjects go on screen instead
         echo && echo -e "\e[1mRecent commits\e[0m:"
-        git log -n 10 --format='%h %s'
+        git-color log -n 10 --format='%h %s'
         echo
         commit="$(commit_candidates "${tag_commit}" \
             | prompt-complete --default "${default_commit}" --prompt "Commit to tag:")"
@@ -150,13 +151,13 @@ if [ "${delete}" -eq 1 ]; then
     fi
     echo -e "\e[1m${tag}\e[0m -> \e[1m✗\e[0m" && echo
     fq_tag="$(get_fq_tag "${tag}")"
-    if ! git tag -d "${tag}"; then
+    if ! git-color tag -d "${tag}"; then
         echo && error "$(echo -e "Failed to delete tag locally \e[1m${tag}\e[0m")"
         if [ "${yes}" -eq 0 ]; then
             prompt-continue || abort
         fi
     fi
-    git push --delete origin "${fq_tag}"
+    git-color push --delete origin "${fq_tag}"
 fi
 
 if [ "${create}" -eq 1 ]; then
@@ -170,7 +171,7 @@ if [ "${create}" -eq 1 ]; then
     fi
     echo -e "\e[1m${target}\e[0m -> \e[1m${tag}\e[0m" && echo
     fq_tag="$(get_fq_tag "${tag}")"
-    git tag -f "${tag}" "${commit}" && git push origin "${fq_tag}"
+    git-color tag -f "${tag}" "${commit}" && git-color push origin "${fq_tag}"
     [ $? -ne 0 ] && abort
 
     url=$(git config --get remote.origin.url)

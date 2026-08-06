@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 APP_NAME="$(basename "${0}")"
 
@@ -328,7 +329,7 @@ delete_worktree() {
 
     [ -n "${target}" ] || fail "Worktree target is empty"
     [ -d "${target}" ] || fail "Worktree does not exist: ${target}"
-    git -C "${workdir}" worktree remove "${target}" ||
+    git-color -C "${workdir}" worktree remove "${target}" ||
         fail "git worktree remove failed"
     echo "Deleted worktree: ${target}" 1>&2
     echo "${workdir}"
@@ -362,14 +363,14 @@ move_to_main() {
     if [ -s "${move_staged_patch}" ]; then
         git -C "${workdir}" apply --check --index "${move_staged_patch}" ||
             move_fail "Cannot apply staged changes to main tree"
-        git -C "${workdir}" apply --index "${move_staged_patch}" ||
+        git-color -C "${workdir}" apply --index "${move_staged_patch}" ||
             move_fail "Cannot apply staged changes to main tree"
     fi
 
     if [ -s "${move_unstaged_patch}" ]; then
         git -C "${workdir}" apply --check "${move_unstaged_patch}" ||
             rollback_move_fail "Cannot apply unstaged changes to main tree"
-        git -C "${workdir}" apply "${move_unstaged_patch}" ||
+        git-color -C "${workdir}" apply "${move_unstaged_patch}" ||
             rollback_move_fail "Cannot apply unstaged changes to main tree"
     fi
 

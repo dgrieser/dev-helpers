@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 APP="$(basename "${0}")"
 
@@ -217,11 +218,11 @@ preview_file() {
 }
 
 show_diff() {
-    git show -m --first-parent --color=always --stat --patch "${1}" -- "${paths[@]}" | pager
+    git-color show -m --first-parent --stat --patch "${1}" -- "${paths[@]}" | pager
 }
 
 show_file_diff() {
-    git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" --color=always "${commit}" -- "${1}" | pager
+    git-color -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" "${commit}" -- "${1}" | pager
 }
 
 create_patch() {
@@ -262,7 +263,7 @@ revert_commit() {
 
     # reverting a merge needs to know which side to keep
     is_merge "${rev}" && revert_args+=(--mainline 1)
-    if ! git revert "${revert_args[@]}" "${rev}"; then
+    if ! git-color revert "${revert_args[@]}" "${rev}"; then
         error "Reverting ${rev} did not apply cleanly."
         error "Resolve the conflicts and commit, or run 'git revert --abort'."
         return 1
@@ -336,8 +337,8 @@ revert_branch() {
     [ -z "${branch}" ] && abort
 
     is_merge "${rev}" && revert_args+=(--mainline 1)
-    git switch -c "${branch}" || fail "Failed to create branch ${branch}"
-    if ! git revert "${revert_args[@]}" "${rev}"; then
+    git-color switch -c "${branch}" || fail "Failed to create branch ${branch}"
+    if ! git-color revert "${revert_args[@]}" "${rev}"; then
         error "Reverting ${short} did not apply cleanly."
         error "Resolve the conflicts, then run 'git revert --continue'."
         return 1

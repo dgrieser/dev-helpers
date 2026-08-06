@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 APP_NAME="$(basename "${0}")"
 GIT_METADATA_FOLDER="${HOME}/.git-metadata"
@@ -61,4 +62,4 @@ if [ "${branch}" = "-" ]; then
     [ -n "${previous_branch}" ] && branch="$(echo "${previous_branch}" | cut -f2-)" || branch="${default_branch}"
 fi
 
-git -C "${git_dir}" checkout "${branch}" && echo -e "$(date +%s)\t${branch}" >> "${checkout_history}"
+git-color -C "${git_dir}" checkout "${branch}" && echo -e "$(date +%s)\t${branch}" >> "${checkout_history}"

@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 APP_NAME="$(basename "${0}")"
 
@@ -40,14 +41,14 @@ abort() {
 }
 
 print_worktree_diff() {
-    git -C "${git_dir}" --no-pager diff HEAD -- "${paths[@]}"
+    git-color --pager=never -C "${git_dir}" diff HEAD -- "${paths[@]}"
 
     readarray -t untracked < <(git -C "${git_dir}" ls-files --others --exclude-standard -- "${paths[@]}")
     print_header=1
     for f in "${untracked[@]}"; do
         if [ -e "${git_dir}/${f}" ]; then
             [ "${print_header}" -eq 1 ] && echo -e "\n\e[1;31mUNTRACKED\e[0m\n" && print_header=0
-            git -C "${git_dir}" --no-pager diff --no-index /dev/null "${f}"
+            git-color --pager=never -C "${git_dir}" diff --no-index /dev/null "${f}"
         fi
     done
 }
@@ -146,6 +147,6 @@ else
         readarray -t changed < <(git -C "${git_dir}" diff --name-only "${merge_base}" HEAD -- "${paths[@]}")
         vimdiff_files "${merge_base}" "${changed[@]}"
     else
-        git -C "${git_dir}" --no-pager diff "${compare_branch}...HEAD" -- "${paths[@]}"
+        git-color --pager=never -C "${git_dir}" diff "${compare_branch}...HEAD" -- "${paths[@]}"
     fi
 fi

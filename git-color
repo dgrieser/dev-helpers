@@ -8,11 +8,11 @@
 #
 # Every argument is handed to git unchanged. git's own coloring is turned off
 # (and any escape sequence that still shows up is stripped), so the whole
-# output is repainted from one palette: paths and refs are drawn as inline code
-# blocks the way glow renders `code` and the way the cli-helpers prompt draws
-# quoted spans, hashes, URLs, commit messages, statistics and status words each
-# get their own color, arrows become real arrows and the punctuation between
-# them fades back.
+# output is repainted from one palette: paths and refs, hashes, URLs, commit
+# messages, statistics and status words each get their own color, arrows become
+# real arrows and the punctuation between them fades back. The text itself is
+# only ever rewritten where it costs no column: the arrow glyphs, the bar of a
+# diffstat, and the subject of a commit summary, which moves to its own line.
 #
 # The palette is resolved per role from GIT_COLOR_<ROLE>, then from the shared
 # COLOR_* theme variables of cli-helpers, then from the built-in default, so a
@@ -78,7 +78,8 @@ ROLES = {
     'prose':     ('255',        'COLOR_TEXT_DEFAULT'),
     'section':   ('255:bold',   'COLOR_TEXT_BOLD'),
     'label':     ('74',         None),
-    'code':      ('203:bg=236', 'COLOR_TEXT_CODE'),
+    'ref':       ('141',        None),
+    'path':      ('111',        None),
     'hash':      ('221',        None),
     'url':       ('81',         None),
     'message':   ('189:italic', None),
@@ -105,13 +106,32 @@ ROLES = {
     'graph':     ('245',        'COLOR_TEXT_FADED'),
     'mark':      ('40:bold',    None),
     'codeplain': ('250',        None),
+    'msgtype':   ('114:italic', None),
+    'msgscope':  ('153:italic', None),
+    'msgpunct':  ('245:italic', None),
 }
 
-CODE = 'code'
-# A path or ref inside dimmed advice text: no block, no padding, and a grey
-# that is a shade brighter than the advice around it. Upright next to the
-# italic text is what sets it apart, so it does not need to be white.
+# A ref and a path are told apart wherever the line says which one it is, and
+# guessed by their shape where it does not
+REF = 'ref'
+PATH = 'path'
+# A path or ref inside dimmed advice text: a grey that is a shade brighter than
+# the advice around it. Upright next to the italic text is what sets it apart,
+# so it does not need a color of its own.
 CODE_QUIET = 'codeplain'
+
+# what reads as a ref even though it carries slashes like a path
+RE_REF_LIKE = re.compile(r'^(?:refs/|(?:origin|upstream)/|HEAD\b)')
+
+# A conventional commit subject is taken apart, so the type and what it touched
+# stand out of the summary. The type has to be one of the known ones, otherwise
+# any "name(args):" of a diff context line would pass for a subject.
+CONVENTIONAL_TYPES = (
+    'build', 'chore', 'ci', 'docs', 'feat', 'fix', 'perf', 'refactor', 'revert',
+    'style', 'test', 'wip',
+)
+RE_SUBJECT = re.compile(r'(' + '|'.join(CONVENTIONAL_TYPES) + r')'
+                        r'(?:(\()([^()]*)(\)))?(!?)(:)(?=\s|$)')
 
 ARROWS = {
     '->': '→',
@@ -146,6 +166,7 @@ LOG_CMDS = {'log', 'reflog', 'shortlog', 'show', 'stash', 'whatchanged', 'rev-li
 # commands printing one ref or path per line, and the options that turn any
 # other command into such a listing
 LIST_CMDS = {'branch', 'tag', 'ls-files', 'ls-tree'}
+REF_LIST_CMDS = {'branch', 'tag'}
 LISTING_FLAGS = {'--name-only'}
 
 # commands that may open an editor, so their editor is reconnected to the
@@ -226,6 +247,19 @@ UNIT_WORDS = (
 )
 # words that read as the unit of the number behind them
 UNIT_PREFIXES = r'delta|reused|pack-reused|from|of|up\ to'
+
+# a unit that names what happened to the files it counts is painted like the
+# status word for it, so "insertions" is the green of a new file and "deletions"
+# the red of a deleted one
+UNIT_ROLES = {
+    'changed': 'mod',
+    'change': 'mod',
+    'changes': 'mod',
+    'insertion': 'add',
+    'insertions': 'add',
+    'deletion': 'del',
+    'deletions': 'del',
+}
 
 # line-leading "<label>: <rest>" labels of progress and transfer output
 PROGRESS_LABELS = (
@@ -320,8 +354,23 @@ def sp(text, role=None):
     return Span(text, role)
 
 
-def code(text):
-    return Span(text, CODE)
+def ref(text):
+    return Span(text, REF)
+
+
+def path(text):
+    return Span(text, PATH)
+
+
+def code_span(text):
+    # Where the line does not say whether a name is a ref or a path, the shape
+    # decides: a ref namespace or a remote prefix is a ref, a file extension or
+    # anything with a directory in it a path, and a bare word a ref.
+    if RE_REF_LIKE.match(text):
+        return ref(text)
+    if '/' in text or re.search(r'\.[A-Za-z][\w]*$', text):
+        return path(text)
+    return ref(text)
 
 
 def apply_rule(spans, pattern, handler):
@@ -349,11 +398,63 @@ def inline(text, rules=None):
     return spans
 
 
+def name_spans(text, role):
+    # a name field can hold a rename, i.e. "old -> new" or "dir/{a => b}/file"
+    out = []
+    for index, part in enumerate(re.split(r'\s*(->|=>|→|⇒)\s*', text)):
+        if index % 2:
+            out.extend([sp(' '), sp(ARROWS[part], 'arrow'), sp(' ')])
+        elif part:
+            out.append(Span(part, role))
+    return out
+
+
+def path_spans(text):
+    return name_spans(text, PATH)
+
+
+def ref_spans(text):
+    # "(none)" is git's placeholder for a ref that does not exist
+    if text == '(none)':
+        return [sp(text, 'punct')]
+    return name_spans(text, REF)
+
+
+def message_spans(text):
+    # "feat(scope): what changed", where everything stays italic and only the
+    # type and the scope step out of the subject
+    lead = re.match(r'^\s*', text).group(0)
+    match = RE_SUBJECT.match(text, len(lead))
+    if not match:
+        return [sp(text, 'message')]
+    out = [sp(lead), sp(match.group(1), 'msgtype')]
+    if match.group(2):
+        out.extend([sp(match.group(2), 'msgpunct'), sp(match.group(3), 'msgscope'),
+                    sp(match.group(4), 'msgpunct')])
+    if match.group(5):
+        # the breaking change marker
+        out.append(sp(match.group(5), 'msgtype'))
+    out.extend([sp(match.group(6), 'msgpunct'), sp(text[match.end():], 'message')])
+    return out
+
+
+def unit_spans(text):
+    out = []
+    for part in re.split(r'(\s+)', text):
+        if not part:
+            continue
+        if not part.strip():
+            out.append(sp(part))
+            continue
+        out.append(sp(part, UNIT_ROLES.get(part.lower(), 'unit')))
+    return out
+
+
 def dim(spans, role='hint'):
     # dimmed text, e.g. the advice git prints under a status section: what is
     # left over is grey and the code spans inside it drop their block
     for span in spans:
-        if span.role == CODE:
+        if span.role in (REF, PATH):
             span.role = CODE_QUIET
         elif span.role is None:
             span.role = role
@@ -369,29 +470,11 @@ def advice_spans(text):
     return inline(match.group(1)) + dim(inline(match.group(2)))
 
 
-def path_spans(text):
-    # a path field can hold a rename, i.e. "old -> new" or "dir/{a => b}/file"
-    out = []
-    for index, part in enumerate(re.split(r'\s*(->|=>|→|⇒)\s*', text)):
-        if index % 2:
-            out.extend([sp(' '), sp(ARROWS[part], 'arrow'), sp(' ')])
-        elif part:
-            out.append(code(part))
-    return out
-
-
-def ref_spans(text):
-    # "(none)" is git's placeholder for a ref that does not exist
-    if text == '(none)':
-        return [sp(text, 'punct')]
-    return path_spans(text)
-
-
 def bracket_ref_spans(text):
     # "[origin/main]", "[origin/main: ahead 1]", "[main]" behind a worktree
     inner = text[1:-1]
-    ref, separator, rest = inner.partition(': ')
-    out = [sp('[', 'punct')] + path_spans(ref)
+    name, separator, rest = inner.partition(': ')
+    out = [sp('[', 'punct')] + ref_spans(name)
     if separator:
         out.extend([sp(separator, 'punct')] + inline(rest))
     return out + [sp(']', 'punct')]
@@ -410,9 +493,9 @@ def decoration_spans(text):
         tag = re.match(r'^(tag|refs/tags|HEAD):\s*(.*)$', item)
         if tag:
             out.extend([sp(tag.group(1), 'label'), sp(': ', 'punct')])
-            out.extend(path_spans(tag.group(2)))
+            out.extend(ref_spans(tag.group(2)))
             continue
-        out.extend(path_spans(item))
+        out.extend(ref_spans(item))
     return out
 
 
@@ -481,7 +564,7 @@ def _hash(match):
 
 
 def _quoted(match):
-    return [code(match.group(2))]
+    return [code_span(match.group(2))]
 
 
 def _stash(match):
@@ -501,7 +584,7 @@ def _ratio(match):
 
 
 def _code(match):
-    return [code(match.group(0))]
+    return [code_span(match.group(0))]
 
 
 def _sign(match):
@@ -518,7 +601,7 @@ def _unit_pre(match):
 def _num(match):
     out = [sp(match.group(1), 'num')]
     if match.group(2):
-        out.append(sp(match.group(2), 'unit'))
+        out.extend(unit_spans(match.group(2)))
     return out
 
 
@@ -610,12 +693,12 @@ def _parenthesized(match, painter):
 @rule(r'^(Reinitialized existing|Initialized empty) (Git repository in) (.+)$')
 def _init(match, painter):
     return [sp(match.group(1), 'section'), sp(' '), sp(match.group(2)),
-            sp(' '), code(match.group(3))]
+            sp(' '), path(match.group(3))]
 
 
 @rule(r"^(Cloning into) '(.+)'(\.{3})$")
 def _cloning(match, painter):
-    return [sp(match.group(1), 'section'), sp(' '), code(match.group(2)),
+    return [sp(match.group(1), 'section'), sp(' '), path(match.group(2)),
             sp(match.group(3), 'punct')]
 
 
@@ -623,7 +706,7 @@ def _cloning(match, painter):
 
 @rule(r'^(On branch) (\S+)$')
 def _on_branch(match, painter):
-    return [sp(match.group(1), 'section'), sp(' '), code(match.group(2))]
+    return [sp(match.group(1), 'section'), sp(' '), ref(match.group(2))]
 
 
 @rule(r'^(HEAD detached (?:at|from)) (\S+)$')
@@ -671,9 +754,9 @@ def _no_changes(match, painter):
 
 @rule(r'^(##) (\S+?)(?:(\.{3})(\S+))?( \[.+\])?$')
 def _short_branch(match, painter):
-    out = [sp(match.group(1), 'punct'), sp(' '), code(match.group(2))]
+    out = [sp(match.group(1), 'punct'), sp(' '), ref(match.group(2))]
     if match.group(3):
-        out.extend([sp(match.group(3), 'punct'), code(match.group(4))])
+        out.extend([sp(match.group(3), 'punct'), ref(match.group(4))])
     if match.group(5):
         out.extend(inline(match.group(5)))
     return out
@@ -703,21 +786,23 @@ def _name_status(match, painter):
 
 # --- commit ----------------------------------------------------------------
 
-@rule(r'^\[(?P<ref>.+?)(?: \((?P<kind>[^)]+)\))? (?P<hash>[0-9a-f]{7,40})\] (?P<msg>.*)$')
+@rule(r'^\[(?P<ref>.+?)(?: \((?P<kind>[^)]+)\))? +(?P<hash>[0-9a-f]{7,40})\] (?P<msg>.*)$')
 def _commit_summary(match, painter):
-    out = [sp('[', 'punct'), code(match.group('ref'))]
+    out = [sp('[', 'punct'), ref(match.group('ref'))]
     if match.group('kind'):
         out.extend([sp(' (', 'punct'), sp(match.group('kind'), 'label'),
                     sp(')', 'punct')])
+    # the ref and the hash carry enough on their own, so the subject gets a
+    # line of its own instead of trailing a long branch name
     out.extend([sp(' '), sp(match.group('hash'), 'hash'), sp(']', 'punct'),
-                sp(' '), sp(match.group('msg'), 'message')])
-    return out
+                sp('\n')])
+    return out + message_spans(match.group('msg'))
 
 
 @rule(r'^ (\d+) (files? changed)(.*)$')
 def _commit_stat(match, painter):
-    return [sp(' '), sp(match.group(1), 'num'), sp(' '),
-            sp(match.group(2), 'unit')] + inline(match.group(3))
+    return [sp(' '), sp(match.group(1), 'num'), sp(' ')] \
+        + unit_spans(match.group(2)) + inline(match.group(3))
 
 
 @rule(r'^ (create|delete) (mode) (\d+) (.+)$')
@@ -801,10 +886,17 @@ def _total(match, painter):
     return [sp(match.group(1), 'label'), sp(' ')] + inline(match.group(2))
 
 
+@rule(r'^(Deleted (?:remote-tracking )?branch) (\S+) (\(was )([0-9a-f]{7,40})(\)\.)$')
+def _deleted_branch(match, painter):
+    return [sp(match.group(1), 'del'), sp(' '), ref(match.group(2)),
+            sp(' ('), sp('was ', 'prose'), sp(match.group(4), 'hash'),
+            sp(')', 'punct'), sp('.', 'prose')]
+
+
 @rule(r"^(branch|Branch) '(.+)' (set up to track) '(.+)'(\.)$")
 def _tracking(match, painter):
-    return [sp(match.group(1), 'label'), sp(' '), code(match.group(2)),
-            sp(' '), sp(match.group(3)), sp(' '), code(match.group(4)),
+    return [sp(match.group(1), 'label'), sp(' '), ref(match.group(2)),
+            sp(' '), sp(match.group(3)), sp(' '), ref(match.group(4)),
             sp(match.group(5), 'punct')]
 
 
@@ -817,13 +909,13 @@ def _up_to_date(match, painter):
 
 @rule(r"^(Switched to a new branch|Switched to branch|Already on) '(.+)'$")
 def _switched(match, painter):
-    return [sp(match.group(1), 'section'), sp(' '), code(match.group(2))]
+    return [sp(match.group(1), 'section'), sp(' '), ref(match.group(2))]
 
 
 @rule(r'^(HEAD is now at|Previous HEAD position was) ([0-9a-f]{7,40})(.*)$')
 def _head_at(match, painter):
     return [sp(match.group(1), 'section'), sp(' '),
-            sp(match.group(2), 'hash'), sp(match.group(3), 'message')]
+            sp(match.group(2), 'hash')] + message_spans(match.group(3))
 
 
 @rule(r'^(Updating) ([0-9a-f]{4,40})(\.{2,3})([0-9a-f]{4,40})$')
@@ -839,7 +931,7 @@ def _fast_forward(match, painter):
 
 @rule(r"^(Merge made by the) '(.+)' (strategy\.)$")
 def _merge_made(match, painter):
-    return [sp(match.group(1), 'section'), sp(' '), code(match.group(2)),
+    return [sp(match.group(1), 'section'), sp(' '), sp(match.group(2), 'label'),
             sp(' '), sp(match.group(3))]
 
 
@@ -863,8 +955,8 @@ def _touching(match, painter):
 
 @rule(r'^(Applying|Rebasing)(:) (.*)$')
 def _applying(match, painter):
-    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct'), sp(' '),
-            sp(match.group(3), 'message')]
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct'),
+            sp(' ')] + message_spans(match.group(3))
 
 
 @rule(r'^(Successfully rebased.*|Current branch .+ is up to date\.?)$')
@@ -874,7 +966,7 @@ def _rebase_ok(match, painter):
 
 @rule(r"^(rm) '(.+)'$")
 def _rm(match, painter):
-    return [sp(match.group(1), 'del'), sp(' '), code(match.group(2))]
+    return [sp(match.group(1), 'del'), sp(' '), path(match.group(2))]
 
 
 # --- log, show -------------------------------------------------------------
@@ -1006,17 +1098,17 @@ def _stash_entry(match, painter):
 
 @rule(r'^((?:WIP on|On) )([^:]+)(:)( )([0-9a-f]{7,40})?(.*)$')
 def _stash_wip(match, painter):
-    out = [sp(match.group(1), 'label'), code(match.group(2)),
+    out = [sp(match.group(1), 'label'), ref(match.group(2)),
            sp(match.group(3), 'punct'), sp(match.group(4))]
     if match.group(5):
         out.append(sp(match.group(5), 'hash'))
-    out.append(sp(match.group(6), 'message'))
+    out.extend(message_spans(match.group(6)))
     return out
 
 
 @rule(r'^(\S+)\t(\S+) \((fetch|push)\)$')
 def _remote_verbose(match, painter):
-    return [code(match.group(1)), sp('\t')] + inline(match.group(2)) \
+    return [ref(match.group(1)), sp('\t')] + inline(match.group(2)) \
         + [sp(' (', 'punct'), sp(match.group(3), 'label'), sp(')', 'punct')]
 
 
@@ -1102,7 +1194,7 @@ class Painter:
             if spans is not None:
                 return spans
         if self.listing and re.fullmatch(r'\S+', text):
-            return [code(text)]
+            return [ref(text) if self.cmd in REF_LIST_CMDS else path(text)]
         if self.cmd in LOG_CMDS:
             match = re.match(r'^([*|\\/_ ]*)([0-9a-f]{7,40})\b(.*)$', text)
             if match and (not match.group(1) or match.group(1).strip()):
@@ -1121,12 +1213,12 @@ class Painter:
         # the separator in front of the line number
         match = re.match(r'^(\S+?)([:\-])(\d+)([:\-])(.*)$', text)
         if match:
-            return [code(match.group(1)), sp(match.group(2), 'punct'),
+            return [path(match.group(1)), sp(match.group(2), 'punct'),
                     sp(match.group(3), 'num'), sp(match.group(4), 'punct'),
                     sp(match.group(5), 'prose')]
         match = re.match(r'^([^\s:]+)(:)(.*)$', text)
         if match:
-            return [code(match.group(1)), sp(match.group(2), 'punct'),
+            return [path(match.group(1)), sp(match.group(2), 'punct'),
                     sp(match.group(3), 'prose')]
         return None
 
@@ -1152,17 +1244,17 @@ class Painter:
         match = re.match(r'^([*+]?) +(\S+)(?: +-> +(\S+))?$', text)
         if match:
             out = [sp(match.group(1) or ' ', 'mark'), sp(' '),
-                   code(match.group(2))]
+                   ref(match.group(2))]
             if match.group(3):
                 out.extend([sp(' '), sp('→', 'arrow'), sp(' '),
-                            code(match.group(3))])
+                            ref(match.group(3))])
             return out
         # the verbose listing, e.g. "* main 0101cb2 [origin/main: ahead 1] msg"
         match = re.match(r'^([*+]?) +(\S+)( +)([0-9a-f]{7,40})( \[[^\]]+\])?'
                          r'( .*)?$', text)
         if match:
             out = [sp(match.group(1) or ' ', 'mark'), sp(' '),
-                   code(match.group(2)), sp(match.group(3)),
+                   ref(match.group(2)), sp(match.group(3)),
                    sp(match.group(4), 'hash')]
             if match.group(5):
                 out.append(sp(' '))
@@ -1200,13 +1292,13 @@ class Painter:
             out.append(sp(')', 'punct'))
             text = match.group(2)
         if text:
-            out.append(sp(text, 'message'))
+            out.extend(message_spans(text))
         return out
 
     def fallback_spans(self, text):
         # a log message body is indented by four spaces
         if self.in_log and re.match(r'^ {4}\S', text):
-            return [sp(text, 'message')]
+            return message_spans(text)
         return inline(text)
 
 
@@ -1214,21 +1306,15 @@ def render(theme, spans, base='prose'):
     spans = [span for span in spans if span.text]
     merged = []
     for span in spans:
-        if not span.text:
-            continue
-        if merged and merged[-1].role != CODE and span.role != CODE \
-                and (merged[-1].role or base) == (span.role or base):
+        if merged and (merged[-1].role or base) == (span.role or base):
             merged[-1].text += span.text
             continue
         merged.append(span)
     out = []
     for span in merged:
-        if span.role == CODE:
-            # drawn the way glow draws `code`: a block with a space of padding
-            # on each side, and the text around it keeps its own spacing
-            out.append(theme.paint(CODE, ' ' + span.text + ' '))
-        elif not span.text.strip():
-            # whitespace carries no color, so it stays as it is
+        if not span.text.strip():
+            # whitespace carries no color, so it stays as it is and the layout
+            # of the output is the one git printed
             out.append(span.text)
         else:
             out.append(theme.paint(span.role or base, span.text))
@@ -1270,10 +1356,9 @@ Run a git command and paint its output.
 
 Every argument is passed to git unchanged, so {APP_NAME} is used like git
 itself, e.g. "{APP_NAME} status" or "{APP_NAME} push". git's own coloring is
-turned off and the output is repainted from one palette: paths and refs become
-inline code blocks, hashes, URLs, commit messages, statistics and status words
-get their own color, arrows become real arrows and the punctuation between them
-fades back.
+turned off and the output is repainted from one palette: paths and refs,
+hashes, URLs, commit messages, statistics and status words get their own color,
+arrows become real arrows and the punctuation between them fades back.
 
 Options:
   --color WHEN     auto (default), always or never
@@ -1437,8 +1522,14 @@ def main():
 
     cmd, cmd_args = git_subcommand(args)
 
-    if opts['raw'] or wants_terminal(cmd, cmd_args) \
+    if opts['raw']:
+        # the escape hatch hands the command over as it is
+        os.execvp('git', ['git'] + args)
+    if wants_terminal(cmd, cmd_args) \
             or not colors_enabled(opts['color'], sys.stdout):
+        # nothing to paint, but the output stays the one the rules are written
+        # for, so a command reads the same whether or not it gets painted
+        os.environ['LC_ALL'] = 'C'
         os.execvp('git', ['git'] + args)
 
     env = os.environ.copy()

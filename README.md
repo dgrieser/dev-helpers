@@ -117,17 +117,33 @@ Run a git command and paint its output.
 
 Every argument is passed to git unchanged, so it is used like git itself. git's
 own coloring is turned off (and any escape sequence that still arrives is
-stripped), so the whole output is repainted from one palette: paths and refs
-become inline code blocks the way [glow](https://github.com/charmbracelet/glow)
-renders `` `code` `` and the way the `prompt` of
-[cli-helpers](https://github.com/dgrieser/cli-helpers) draws quoted spans,
-commit hashes, URLs, commit messages and file modes each get their own color,
-`->` becomes `→`, statistics are green with a darker green unit, `(+)` and `(-)`
-are green and red, status words are colored by what happened to the file, and
-the punctuation that is not part of a path or a ref fades back. Inside the
-dimmed advice git appends to its output, e.g. `(use "git add <file>..." to
-include in what will be committed)`, a code span drops its block and is drawn as
-plain text instead, so the hint stays a hint.
+stripped), so the whole output is repainted from one palette: refs are purple
+and paths blue, commit hashes, URLs, commit messages and file modes each get
+their own color, `->` becomes `→`, statistics are green with a darker green unit
+while `changed`, `insertions` and `deletions` take the color of the status word
+they count, `(+)` and `(-)` are green and red, status words are colored by what
+happened to the file, and the punctuation that is not part of a path or a ref
+fades back.
+
+A commit subject stays italic throughout, and a conventional one is taken apart:
+in `feat(references): add a tool for cross references` the type and the scope get
+a color each, the brackets, the `!` of a breaking change and the colon fade back,
+and the text behind the colon keeps the subject color. The type has to be one of
+the conventional ones (`build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`,
+`refactor`, `revert`, `style`, `test`, `wip`), so any other subject is left as
+one span.
+
+Which of the two a name is comes from the line it stands in. Where the line does
+not say, the shape decides: a ref namespace like `refs/` or a remote prefix like
+`origin/` reads as a ref, a file extension or a directory as a path, and a bare
+word as a ref. Inside the dimmed advice git appends to its output, e.g. `(use
+"git add <file>..." to include in what will be committed)`, both stay grey and
+only step a shade out of the advice around them, so the hint stays a hint.
+
+The text itself is only rewritten where it costs no column, so everything git
+lined up stays lined up: the arrow glyphs, the `|` of a diffstat, which becomes
+`│`, and the subject of a commit summary, which moves below the `[branch hash]`
+it would otherwise trail.
 
 Both output streams are painted, because git splits its output between them,
 e.g. push reports its progress on stderr. Commands that page their output are
@@ -139,6 +155,14 @@ commands that drive the terminal themselves (`git add -p`, `git mergetool`,
 The palette is resolved per role from `GIT_COLOR_<ROLE>`, then from the shared
 `COLOR_*` theme of cli-helpers, then from the built-in default, so a themed
 shell stays in charge of the look. `--help` lists the roles.
+
+The other commands here route the git output they show through it, so their
+`git` calls stay plain wherever the output is read back and parsed. Each script
+wraps it the same way it wraps `git`, i.e. with the color forced on:
+
+```bash
+git-color() { command git-color --color=always "$@"; }
+```
 ```bash
 git-color [--color auto|always|never] [--pager auto|always|never] [--raw] \
           [--] <git-command> [<args>...]

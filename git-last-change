@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 function retrieve_tag() {
     local level=$1
@@ -29,4 +30,4 @@ echo
 echo -e "Showing diff of \033[31;1m${previous_tag}\033[0m and \033[32;1m${last_tag}\033[0m"
 echo
 
-git diff ${previous_tag} ${last_tag} 2>/dev/null
+git-color diff ${previous_tag} ${last_tag} 2>/dev/null

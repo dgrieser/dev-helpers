@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 usage() {
     echo "usage: $(basename "${0}") [<tag>]" 1>&2
@@ -53,7 +54,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-git fetch --all || fail "No git repo? Abort."
+git-color fetch --all || fail "No git repo? Abort."
 recent_tags="$(git tag --sort=-v:refname | head -n 15 | tac)"
 last_tag="$(echo "${recent_tags}" | tail -n 1)"
 echo -e "\e[1mRecent tags\e[0m:" && echo "${recent_tags}" && echo
@@ -72,5 +73,5 @@ message="Branch name"
 new_branch="$(prompt-input "${message}:" --default "${new_branch}")"
 [ -z "${new_branch}" ] && abort
 
-git checkout -b "${new_branch}" "$(get_fq_tag "${tag}")"
-prompt-no-yes "Push?" && git push --set-upstream origin "${new_branch}"
+git-color checkout -b "${new_branch}" "$(get_fq_tag "${tag}")"
+prompt-no-yes "Push?" && git-color push --set-upstream origin "${new_branch}"

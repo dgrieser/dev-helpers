@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 abort() {
     echo "Abort." 1>&2
@@ -26,10 +27,10 @@ git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
 cd "${git_dir}" || fail "Failed to change to: ${git_dir}"
 
 git-track-branches || exit 1
-git checkout master || fail "Failed to checkout branch master"
+git-color checkout master || fail "Failed to checkout branch master"
 branches="$(git branch --list --format="%(refname:short)" --sort=-committerdate | head -n 10)"
 choice="$(printf '%s\n' "${branches}" | prompt-select -p "Choose branch:")" || abort
-git checkout "${choice}" || fail "Failed to checkout branch ${choice}"
+git-color checkout "${choice}" || fail "Failed to checkout branch ${choice}"
 echo; echo "Running make imports..." 1>&2
 make imports && echo "Done." 1>&2 || warning "Failed to run make imports"
 echo; echo "Running goimports..."

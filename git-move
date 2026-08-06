@@ -1,6 +1,7 @@
 #!/bin/bash
 
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
 
 APP_NAME="$(basename "${0}")"
 
@@ -80,9 +81,9 @@ stash_ref_of() {
 apply_stash() {
     local sha="${1}"
     if [ "${had_staged}" -eq 1 ]; then
-        git -C "${git_dir}" stash apply --index "${sha}"
+        git-color -C "${git_dir}" stash apply --index "${sha}"
     else
-        git -C "${git_dir}" stash apply "${sha}"
+        git-color -C "${git_dir}" stash apply "${sha}"
     fi
 }
 
@@ -206,7 +207,7 @@ fi
 if [ "${move_commits}" -eq -1 ]; then
     if [ "${unpushed_count}" -gt 0 ]; then
         warning "\"${source_name}\" has ${unpushed_count} commit(s) not in \"${unpushed_base}\""
-        git -C "${git_dir}" log --oneline "${unpushed_base}..HEAD"
+        git-color -C "${git_dir}" log --oneline "${unpushed_base}..HEAD"
         echo
         if [ "${assume_yes}" -eq 1 ]; then
             move_commits=0
@@ -268,7 +269,7 @@ fi
 
 echo "Source: ${source_name}" 1>&2
 echo "Target: ${branch} ($(git -C "${git_dir}" log -1 --format='%h %s' "${target_sha}"))" 1>&2
-[ "${has_changes}" -eq 1 ] && git -C "${git_dir}" status --short 1>&2
+[ "${has_changes}" -eq 1 ] && git-color -C "${git_dir}" status --short 1>&2
 echo 1>&2
 
 message="Move local changes to \"${branch}\"?"
@@ -301,7 +302,7 @@ if [ "${need_stash}" -eq 1 ]; then
 fi
 
 if [ "${use_existing}" -eq 0 ]; then
-    if ! git -C "${git_dir}" branch "${branch}" "${target_sha}"; then
+    if ! git-color -C "${git_dir}" branch "${branch}" "${target_sha}"; then
         error "Failed to create branch \"${branch}\"."
         rollback
         exit 1
@@ -319,7 +320,7 @@ if [ "${move_commits}" -eq 1 ]; then
     echo "Reset \"${source_name}\" to $(git -C "${git_dir}" log -1 --format='%h %s' "${reset_point}")" 1>&2
 fi
 
-if ! git -C "${git_dir}" switch "${branch}"; then
+if ! git-color -C "${git_dir}" switch "${branch}"; then
     error "Failed to switch to branch \"${branch}\"."
     rollback
     exit 1
@@ -344,4 +345,4 @@ fi
 
 echo 1>&2
 echo "Moved local changes to \"${branch}\"." 1>&2
-git -C "${git_dir}" status --short --branch 1>&2
+git-color -C "${git_dir}" status --short --branch 1>&2
