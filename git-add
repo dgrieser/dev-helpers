@@ -1,6 +1,6 @@
 #!/bin/bash
 
-git() { command git -c color.ui=always "$@"; }
+git() { LC_ALL=C command git -c color.ui=always "$@"; }
 
 APP="$(basename "${0}")"
 
@@ -147,7 +147,7 @@ is_conflict() {
 
 has_conflict_markers() {
     local path="${1}"; shift
-    LC_ALL=C git -C "${GIT_DIR}" diff --no-color --check -- "${path}" | grep -q 'leftover conflict marker'
+    git -C "${GIT_DIR}" diff --no-color --check -- "${path}" | grep -q 'leftover conflict marker'
 }
 
 paths=()

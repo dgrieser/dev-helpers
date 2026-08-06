@@ -33,25 +33,25 @@ __dh_register_aliases()
 
 __dh_local_branches()
 {
-    git branch --list --format='%(refname:short)' 2>/dev/null
+    LC_ALL=C git branch --list --format='%(refname:short)' 2>/dev/null
 }
 
 __dh_all_branches()
 {
     {
-        git branch --list --format='%(refname:short)'
-        git branch --list --remotes --format='%(refname:lstrip=2)' | grep -v 'HEAD' | sed 's|^origin/||'
+        LC_ALL=C git branch --list --format='%(refname:short)'
+        LC_ALL=C git branch --list --remotes --format='%(refname:lstrip=2)' | grep -v 'HEAD' | sed 's|^origin/||'
     } 2>/dev/null | sort -u
 }
 
 __dh_tags()
 {
-    git tag --sort=-v:refname 2>/dev/null
+    LC_ALL=C git tag --sort=-v:refname 2>/dev/null
 }
 
 __dh_commits()
 {
-    git log --max-count=50 --pretty=format:'%h' 2>/dev/null
+    LC_ALL=C git log --max-count=50 --pretty=format:'%h' 2>/dev/null
 }
 
 __dh_projects()
@@ -61,7 +61,7 @@ __dh_projects()
 
 __dh_changed_files()
 {
-    git status --porcelain 2>/dev/null | cut -c4-
+    LC_ALL=C git status --porcelain 2>/dev/null | cut -c4-
 }
 
 __dh_compgen()
@@ -456,7 +456,7 @@ _git-tag()
     if [[ "${cur}" == -* ]]; then
         __dh_compgen "-d --delete -r --recreate -y --yes -h --help"
     else
-        __dh_compgen "$(git fetch --all &>/dev/null; __dh_tags)"
+        __dh_compgen "$(LC_ALL=C git fetch --all &>/dev/null; __dh_tags)"
     fi
     return 0
 }

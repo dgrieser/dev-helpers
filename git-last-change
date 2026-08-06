@@ -1,6 +1,6 @@
 #!/bin/bash
 
-git() { command git -c color.ui=always "$@"; }
+git() { LC_ALL=C command git -c color.ui=always "$@"; }
 
 function retrieve_tag() {
     local level=$1

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-git() { command git -c color.ui=always "$@"; }
+git() { LC_ALL=C command git -c color.ui=always "$@"; }
 
 APP_NAME="$(basename "${0}")"
 MAX_AGE_DEFAULT=30
@@ -49,17 +49,17 @@ done
 cutoff=0
 [ "${max_age}" -gt 0 ] && cutoff=$(( $(date +%s) - max_age * 86400 ))
 
-LC_ALL=C git pull --all || fail "No git repo?"
-remote_branches="$(LC_ALL=C git branch --list --remotes --format="%(refname:lstrip=2) %(committerdate:unix)" | grep -v "^origin/HEAD ")"
+git pull --all || fail "No git repo?"
+remote_branches="$(git branch --list --remotes --format="%(refname:lstrip=2) %(committerdate:unix)" | grep -v "^origin/HEAD ")"
 while read -r branch committer_date; do
     [ -z "${branch}" ] && continue
     [ "${cutoff}" -gt 0 ] && [ "${committer_date}" -lt "${cutoff}" ] && continue
-    [ -n "$(LC_ALL=C git branch --list "${branch#origin/}")" ] && continue
-    LC_ALL=C git branch --track "${branch#origin/}" "${branch}"
+    [ -n "$(git branch --list "${branch#origin/}")" ] && continue
+    git branch --track "${branch#origin/}" "${branch}"
 done <<< "${remote_branches}"
 if [ "${clear_local_branches}" -eq 1 ]; then
-    LC_ALL=C git fetch --prune
-    LC_ALL=C git -c color.ui=false branch -vv \
+    git fetch --prune
+    git -c color.ui=false branch -vv \
         | awk '/^[^*].*: gone]/{print $1}' \
-        | LC_ALL=C xargs -r env git -c color.ui=always branch -D
+        | xargs -r env LC_ALL=C git -c color.ui=always branch -D
 fi

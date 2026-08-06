@@ -1,6 +1,6 @@
 #!/bin/bash
 
-git() { command git -c color.ui=always "$@"; }
+git() { LC_ALL=C command git -c color.ui=always "$@"; }
 
 NL=$'\n'
 
@@ -21,7 +21,7 @@ if [ "${changed_count}" -gt 0 ]; then
     echo
 fi
 prompt-continue "Are you sure you want to reset all files? [y/N]" || exit 1
-LC_ALL=C git -C "${git_dir}" reset \
-    && LC_ALL=C git -C "${git_dir}" checkout -- . \
-    && LC_ALL=C git -C "${git_dir}" clean -ffd \
+git -C "${git_dir}" reset \
+    && git -C "${git_dir}" checkout -- . \
+    && git -C "${git_dir}" clean -ffd \
     && echo "Done"

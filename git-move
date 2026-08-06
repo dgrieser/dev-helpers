@@ -1,6 +1,6 @@
 #!/bin/bash
 
-git() { command git -c color.ui=always "$@"; }
+git() { LC_ALL=C command git -c color.ui=always "$@"; }
 
 APP_NAME="$(basename "${0}")"
 
