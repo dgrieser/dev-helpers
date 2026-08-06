@@ -13,7 +13,12 @@
 __dh_complete_alias()
 {
     declare -F "_${2}" >/dev/null || return 1
-    complete -F "_${2}" "${1}"
+    # git-color hands over to git's own completion, which needs the same
+    # complete options git registers itself
+    case "${2}" in
+        git-color) complete -o bashdefault -o default -o nospace -F "_${2}" "${1}" ;;
+        *) complete -F "_${2}" "${1}" ;;
+    esac
 }
 
 # Register completions for all defined aliases whose expansion starts with a
@@ -62,6 +67,78 @@ __dh_projects()
 __dh_changed_files()
 {
     LC_ALL=C git status --porcelain 2>/dev/null | cut -c4-
+}
+
+__dh_git_commands()
+{
+    LC_ALL=C git --list-cmds=list-mainporcelain,others 2>/dev/null \
+        || LC_ALL=C git help -a 2>/dev/null | awk '/^   [a-z]/{print $1}'
+}
+
+# Load git's own completion, which bash-completion only lazy-loads once "git"
+# itself was completed. Returns non-zero when there is none to load.
+__dh_load_git_completion()
+{
+    declare -F __git_main >/dev/null && return 0
+    declare -F _git >/dev/null && return 0
+    # the loaders return 124 to ask bash for a retry, which is none of our
+    # business here, so the status is dropped
+    if declare -F _comp_load >/dev/null; then
+        _comp_load git
+    elif declare -F __load_completion >/dev/null; then
+        __load_completion git
+    elif declare -F _completion_loader >/dev/null; then
+        _completion_loader git
+    fi
+    if ! declare -F __git_main >/dev/null && ! declare -F _git >/dev/null; then
+        local candidate
+        for candidate in /usr/share/bash-completion/completions/git \
+                         /usr/local/share/bash-completion/completions/git \
+                         /usr/share/git/completion/git-completion.bash \
+                         /etc/bash_completion.d/git; do
+            [ -r "${candidate}" ] && . "${candidate}" && break
+        done
+    fi
+    declare -F __git_main >/dev/null || declare -F _git >/dev/null
+}
+
+# Complete the git command line that starts at word INDEX with git's own
+# completion: git-color takes a git command line, so everything behind its own
+# options is git's business. git's completion ignores the name it was invoked
+# under, so as long as INDEX is 1 the line can be handed over as it is.
+__dh_git_delegate()
+{
+    local index="${1}"
+    __dh_load_git_completion || return 1
+    local -a saved_words=( "${COMP_WORDS[@]}" )
+    local saved_cword="${COMP_CWORD}"
+    local saved_line="${COMP_LINE}" saved_point="${COMP_POINT}"
+    if [ "${index}" -gt 1 ]; then
+        # git-color's own options have to leave the line as well, and not only
+        # the word list: bash-completion reads the word under the cursor off
+        # COMP_LINE and COMP_POINT
+        local offset=0 i
+        for (( i = 0; i < index; i++ )); do
+            while [ "${COMP_LINE:offset:1}" = " " ]; do offset=$(( offset + 1 )); done
+            offset=$(( offset + ${#saved_words[i]} ))
+        done
+        COMP_WORDS=( git "${saved_words[@]:index}" )
+        COMP_CWORD=$(( saved_cword - index + 1 ))
+        COMP_LINE="git${COMP_LINE:offset}"
+        COMP_POINT=$(( saved_point - offset + 3 ))
+    fi
+    if declare -F __git_func_wrap >/dev/null && declare -F __git_main >/dev/null; then
+        __git_func_wrap __git_main
+    elif declare -F __git_wrap__git_main >/dev/null; then
+        __git_wrap__git_main
+    else
+        _git
+    fi
+    COMP_WORDS=( "${saved_words[@]}" )
+    COMP_CWORD="${saved_cword}"
+    COMP_LINE="${saved_line}"
+    COMP_POINT="${saved_point}"
+    return 0
 }
 
 __dh_compgen()
@@ -209,6 +286,43 @@ _git-checkout()
     return 0
 }
 complete -F _git-checkout git-checkout
+
+_git-color()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        --color|--pager)
+            compopt +o nospace 2>/dev/null
+            __dh_compgen "auto always never"
+            return 0 ;;
+    esac
+    # walk over git-color's own options to find where the git command line begins
+    local index=1
+    while [ "${index}" -lt "${COMP_CWORD}" ]; do
+        case "${COMP_WORDS[index]}" in
+            --color|--pager) index=$(( index + 2 )) ;;
+            --color=*|--pager=*|--raw|-h|--help) index=$(( index + 1 )) ;;
+            --) index=$(( index + 1 )); break ;;
+            *) break ;;
+        esac
+    done
+    if [ "${index}" -ge "${COMP_CWORD}" ] && [[ "${cur}" == -* ]]; then
+        compopt +o nospace 2>/dev/null
+        __dh_compgen "--color --pager --raw -h --help"
+        return 0
+    fi
+    __dh_git_delegate "${index}" && return 0
+    # no git completion installed, so complete at least the command itself
+    compopt +o nospace 2>/dev/null
+    if [ "${index}" -eq "${COMP_CWORD}" ]; then
+        __dh_compgen "$(__dh_git_commands)"
+    else
+        __dh_compgen "$(__dh_all_branches) $(__dh_changed_files)"
+    fi
+    return 0
+}
+complete -o bashdefault -o default -o nospace -F _git-color git-color
 
 _git-container()
 {

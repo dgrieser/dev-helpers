@@ -1,0 +1,1500 @@
+#!/usr/bin/env python3
+
+# Run a git command and paint its output.
+#
+#   git-color status
+#   git-color push
+#   git-color log --oneline -20
+#
+# Every argument is handed to git unchanged. git's own coloring is turned off
+# (and any escape sequence that still shows up is stripped), so the whole
+# output is repainted from one palette: paths and refs are drawn as inline code
+# blocks the way glow renders `code` and the way the cli-helpers prompt draws
+# quoted spans, hashes, URLs, commit messages, statistics and status words each
+# get their own color, arrows become real arrows and the punctuation between
+# them fades back.
+#
+# The palette is resolved per role from GIT_COLOR_<ROLE>, then from the shared
+# COLOR_* theme variables of cli-helpers, then from the built-in default, so a
+# themed shell stays in charge of the look.
+
+import os
+import re
+import selectors
+import subprocess
+import sys
+
+APP_NAME = os.path.basename(sys.argv[0])
+
+RESET = '\033[0m'
+
+# CSI and OSC sequences: git is asked not to color at all, but hooks, remotes
+# and aliases can still emit escapes and those must not survive into a span
+RE_ANSI = re.compile(r'\033\[[0-9;:?]*[ -/]*[@-~]|\033\][^\007\033]*(?:\007|\033\\)')
+
+STYLES = {
+    'bold': '1',
+    'b': '1',
+    'faint': '2',
+    'fuzzy': '2',
+    'dim': '2',
+    'italic': '3',
+    'i': '3',
+    'underline': '4',
+    'u': '4',
+    'blink': '5',
+    'reverse': '7',
+    'invert': '7',
+    'hidden': '8',
+    'strikethrough': '9',
+}
+
+COLOR_MAP = {
+    'black': 30,
+    'red': 31,
+    'green': 32,
+    'brown': 33,
+    'yellow': 33,
+    'blue': 34,
+    'magenta': 35,
+    'purple': 35,
+    'cyan': 36,
+    'white': 37,
+    'grey': 37,
+    'gray': 37,
+    'darkgrey': 90,
+    'darkgray': 90,
+    'lightred': 91,
+    'lightgreen': 92,
+    'lightyellow': 93,
+    'lightblue': 94,
+    'lightmagenta': 95,
+    'lightcyan': 96,
+    'lightwhite': 97,
+}
+
+# role: (built-in spec, COLOR_* theme variable that overrides it, if any)
+ROLES = {
+    'prose':     ('255',        'COLOR_TEXT_DEFAULT'),
+    'section':   ('255:bold',   'COLOR_TEXT_BOLD'),
+    'label':     ('74',         None),
+    'code':      ('203:bg=236', 'COLOR_TEXT_CODE'),
+    'hash':      ('221',        None),
+    'url':       ('81',         None),
+    'message':   ('189:italic', None),
+    'arrow':     ('170',        None),
+    'punct':     ('245',        'COLOR_TEXT_FADED'),
+    'num':       ('40',         'COLOR_TEXT_NUMERIC_LIGHT'),
+    'unit':      ('34',         'COLOR_TEXT_SUCCESS_LIGHT'),
+    'add':       ('40',         'COLOR_TEXT_SUCCESS'),
+    'del':       ('167',        None),
+    'mod':       ('214',        None),
+    'move':      ('75',         None),
+    'untracked': ('176',        None),
+    'conflict':  ('197:bold',   'COLOR_TEXT_ERROR_STRONG'),
+    'ok':        ('40',         'COLOR_TEXT_SUCCESS'),
+    'error':     ('160:bold',   'COLOR_TEXT_ERROR'),
+    'warning':   ('202:italic', 'COLOR_TEXT_WARNING'),
+    'hint':      ('245:italic', None),
+    'remote':    ('104',        None),
+    'author':    ('75',         None),
+    'email':     ('68',         None),
+    'date':      ('73',         None),
+    'mode':      ('240',        None),
+    'hunk':      ('44',         None),
+    'graph':     ('245',        'COLOR_TEXT_FADED'),
+    'mark':      ('40:bold',    None),
+    'codeplain': ('250',        None),
+}
+
+CODE = 'code'
+# A path or ref inside dimmed advice text: no block, no padding, and a grey
+# that is a shade brighter than the advice around it. Upright next to the
+# italic text is what sets it apart, so it does not need to be white.
+CODE_QUIET = 'codeplain'
+
+ARROWS = {
+    '->': '→',
+    '-->': '→',
+    '=>': '⇒',
+    '==>': '⇒',
+    '<-': '←',
+    '<--': '←',
+    '<=': '⇐',
+    '<==': '⇐',
+    '<->': '↔',
+    '<=>': '⇔',
+    '→': '→',
+    '←': '←',
+    '⇒': '⇒',
+    '⇐': '⇐',
+    '↔': '↔',
+    '⇔': '⇔',
+}
+
+# git subcommands that page their own output, so git-color pages the same ones
+PAGER_CMDS = {
+    'annotate', 'blame', 'branch', 'config', 'diff', 'grep', 'help', 'log',
+    'ls-files', 'ls-remote', 'ls-tree', 'reflog', 'rev-list', 'shortlog',
+    'show', 'stash', 'tag', 'whatchanged',
+}
+
+# commands whose output is a commit listing, i.e. where a bare
+# "<hash> <subject>" line is a commit and not a coincidence
+LOG_CMDS = {'log', 'reflog', 'shortlog', 'show', 'stash', 'whatchanged', 'rev-list'}
+
+# commands printing one ref or path per line, and the options that turn any
+# other command into such a listing
+LIST_CMDS = {'branch', 'tag', 'ls-files', 'ls-tree'}
+LISTING_FLAGS = {'--name-only'}
+
+# commands that may open an editor, so their editor is reconnected to the
+# terminal before the output is piped through the painter
+EDITOR_CMDS = {
+    'commit', 'merge', 'notes', 'rebase', 'revert', 'cherry-pick', 'tag', 'am',
+    'config',
+}
+
+# commands that drive the terminal themselves; painting would swallow their
+# prompts, so they are handed over to git untouched
+RAW_CMDS = {
+    'citool', 'difftool', 'gitk', 'gui', 'instaweb', 'mergetool', 'p4',
+    'send-email', 'svn',
+}
+PATCH_CMDS = {
+    'add', 'checkout', 'cherry-pick', 'commit', 'reset', 'restore', 'revert',
+    'stash',
+}
+PATCH_FLAGS = {'-p', '--patch', '-i', '--interactive'}
+
+# git global options that take a separate value, skipped while looking for the
+# subcommand
+GLOBAL_VALUE_OPTS = {
+    '-c', '-C', '--git-dir', '--work-tree', '--namespace', '--exec-path',
+    '--config-env', '--super-prefix', '--attr-source',
+}
+
+# the words git and the other dev-helpers use to label a changed file
+STATUS_WORDS = {
+    'new file': 'add',
+    'added': 'add',
+    'staged': 'add',
+    'copied': 'move',
+    'renamed': 'move',
+    'moved': 'move',
+    'modified': 'mod',
+    'changed': 'mod',
+    'unstaged': 'mod',
+    'typechange': 'mod',
+    'deleted': 'del',
+    'removed': 'del',
+    'unmerged': 'conflict',
+    'conflict': 'conflict',
+    'both modified': 'conflict',
+    'both added': 'conflict',
+    'both deleted': 'conflict',
+    'added by us': 'conflict',
+    'added by them': 'conflict',
+    'deleted by us': 'conflict',
+    'deleted by them': 'conflict',
+    'untracked': 'untracked',
+    'ignored': 'punct',
+}
+
+# the section a "git status" file list belongs to decides the color of the
+# entries that carry no label of their own
+SECTIONS = {
+    'Changes to be committed': 'add',
+    'Changes not staged for commit': 'mod',
+    'Unmerged paths': 'conflict',
+    'Untracked files': 'untracked',
+    'Ignored files': 'punct',
+}
+
+# short-status letters, as printed by "git status -s" and "git diff --name-status"
+STATUS_LETTERS = {
+    'A': 'add', 'M': 'mod', 'T': 'mod', 'R': 'move', 'C': 'move', 'D': 'del',
+    'U': 'conflict', '?': 'untracked', '!': 'punct', ' ': 'punct',
+}
+
+# words that read as the unit of the number in front of them
+UNIT_WORDS = (
+    r'local\ objects|files?\ changed|files?|insertions?|deletions?|objects?|'
+    r'threads?|deltas?|commits?|bytes?|lines?|refs?|branches?|tags?|packs?|'
+    r'hunks?|changes?|paths?|seconds?|minutes?|hours?|days?|weeks?|months?|'
+    r'years?|times?'
+)
+# words that read as the unit of the number behind them
+UNIT_PREFIXES = r'delta|reused|pack-reused|from|of|up\ to'
+
+# line-leading "<label>: <rest>" labels of progress and transfer output
+PROGRESS_LABELS = (
+    'Checking connectivity', 'Checking out files', 'Checking patch',
+    'Compressing objects', 'Counting objects', 'Enumerating objects',
+    'Filtering content', 'Indexing objects', 'Receiving objects',
+    'Resolving deltas', 'Sending objects', 'Submodule path',
+    'Unpacking objects', 'Updating files', 'Writing objects',
+)
+
+
+def alternation(words):
+    # longest first, so "Changes not staged for commit" wins over a prefix of it
+    return '|'.join(re.escape(word)
+                    for word in sorted(words, key=len, reverse=True))
+
+
+def color_codes(value, background=False):
+    offset = 10 if background else 0
+    base = '48' if background else '38'
+    low = value.lower()
+    if low in COLOR_MAP:
+        return [str(COLOR_MAP[low] + offset)]
+    if re.fullmatch(r'\d{1,3}', value) and int(value) <= 255:
+        return [base, '5', value]
+    hex_match = re.fullmatch(r'(?:#|0x)?([0-9a-fA-F]{6})', value)
+    if hex_match:
+        digits = hex_match.group(1)
+        return [base, '2', str(int(digits[0:2], 16)),
+                str(int(digits[2:4], 16)), str(int(digits[4:6], 16))]
+    return []
+
+
+def ansi(spec):
+    # "203:bg=236", "green:bold", "#c0ffee" - the spec syntax of color-parse
+    if not spec:
+        return ''
+    codes = []
+    for token in str(spec).split(':'):
+        token = token.strip()
+        if not token:
+            continue
+        low = token.lower()
+        if low in STYLES:
+            codes.append(STYLES[low])
+            continue
+        background = False
+        if low.startswith('fg='):
+            token = token[3:]
+        elif low.startswith('bg='):
+            token = token[3:]
+            background = True
+        codes.extend(color_codes(token, background))
+    if not codes:
+        return ''
+    return '\033[' + ';'.join(codes) + 'm'
+
+
+class Theme:
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.codes = {}
+        for role, (default, theme_var) in ROLES.items():
+            spec = os.environ.get('GIT_COLOR_' + role.upper())
+            if not spec and theme_var:
+                spec = os.environ.get(theme_var)
+            if not spec:
+                spec = default
+            self.codes[role] = ansi(spec)
+
+    def paint(self, role, text):
+        if not self.enabled or not text:
+            return text
+        code = self.codes.get(role, '')
+        if not code:
+            return text
+        return code + text + RESET
+
+
+class Span:
+    # open spans are still up for grabs by the rules that run later, closed
+    # ones carry their final role
+    __slots__ = ('text', 'role', 'open')
+
+    def __init__(self, text, role=None, is_open=False):
+        self.text = text
+        self.role = role
+        self.open = is_open
+
+
+def sp(text, role=None):
+    return Span(text, role)
+
+
+def code(text):
+    return Span(text, CODE)
+
+
+def apply_rule(spans, pattern, handler):
+    out = []
+    for span in spans:
+        if not span.open:
+            out.append(span)
+            continue
+        text = span.text
+        position = 0
+        for match in pattern.finditer(text):
+            if match.start() > position:
+                out.append(Span(text[position:match.start()], span.role, True))
+            out.extend(handler(match))
+            position = match.end()
+        if position < len(text):
+            out.append(Span(text[position:], span.role, True))
+    return out
+
+
+def inline(text, rules=None):
+    spans = [Span(text, None, True)]
+    for pattern, handler in (GENERIC_RULES if rules is None else rules):
+        spans = apply_rule(spans, pattern, handler)
+    return spans
+
+
+def dim(spans, role='hint'):
+    # dimmed text, e.g. the advice git prints under a status section: what is
+    # left over is grey and the code spans inside it drop their block
+    for span in spans:
+        if span.role == CODE:
+            span.role = CODE_QUIET
+        elif span.role is None:
+            span.role = role
+        span.open = False
+    return spans
+
+
+def advice_spans(text):
+    # a trailing "(use ...)" is advice, whatever it is appended to
+    match = re.match(r'^(.*?)(\(use .*\))$', text)
+    if not match:
+        return inline(text)
+    return inline(match.group(1)) + dim(inline(match.group(2)))
+
+
+def path_spans(text):
+    # a path field can hold a rename, i.e. "old -> new" or "dir/{a => b}/file"
+    out = []
+    for index, part in enumerate(re.split(r'\s*(->|=>|→|⇒)\s*', text)):
+        if index % 2:
+            out.extend([sp(' '), sp(ARROWS[part], 'arrow'), sp(' ')])
+        elif part:
+            out.append(code(part))
+    return out
+
+
+def ref_spans(text):
+    # "(none)" is git's placeholder for a ref that does not exist
+    if text == '(none)':
+        return [sp(text, 'punct')]
+    return path_spans(text)
+
+
+def bracket_ref_spans(text):
+    # "[origin/main]", "[origin/main: ahead 1]", "[main]" behind a worktree
+    inner = text[1:-1]
+    ref, separator, rest = inner.partition(': ')
+    out = [sp('[', 'punct')] + path_spans(ref)
+    if separator:
+        out.extend([sp(separator, 'punct')] + inline(rest))
+    return out + [sp(']', 'punct')]
+
+
+def decoration_spans(text):
+    # "HEAD -> main, origin/main, tag: v1.0"
+    out = []
+    for index, part in enumerate(re.split(r'(,\s*)', text)):
+        if index % 2:
+            out.append(sp(part, 'punct'))
+            continue
+        item = part.strip()
+        if not item:
+            continue
+        tag = re.match(r'^(tag|refs/tags|HEAD):\s*(.*)$', item)
+        if tag:
+            out.extend([sp(tag.group(1), 'label'), sp(': ', 'punct')])
+            out.extend(path_spans(tag.group(2)))
+            continue
+        out.extend(path_spans(item))
+    return out
+
+
+# --- generic inline rules, applied to whatever a line rule left open --------
+
+RE_URL = re.compile(r'''
+      [a-zA-Z][a-zA-Z0-9+.\-]*://[^\s'"<>,;)\]]+                 # scheme://host/path
+    | [\w.\-]+@[\w.\-]+\.[\w\-]+:[A-Za-z~/_.][^\s'"<>,;)\]]*     # git@host:path
+    | [\w\-]+(?:\.[\w\-]+)+:[A-Za-z~/_.][^\s'"<>,;)\]]*          # host.tld:path
+''', re.X)
+
+RE_HASH_RANGE = re.compile(
+    r'(?<![\w/.])([0-9a-f]{4,40})(\.{2,3})([0-9a-f]{4,40})(?![\w/])')
+
+RE_HASH = re.compile(r'(?<![\w/.])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\w/])')
+
+# a quoted span reads as an inline code snippet; the quote has to open after a
+# space or an opening bracket and close before a space or punctuation, so an
+# apostrophe inside a word is left alone
+RE_QUOTED = re.compile(
+    r'''(?<![^\s([{<])(["'`])(?!\s)((?:(?!\1).)+?)(?<!\s)\1(?![^\s)\]}>,.;:!?])''')
+
+RE_STASH = re.compile(r'\b(stash|refs/stash)(@)(\{)(\d+)(\})')
+
+RE_SIZE = re.compile(
+    r'(?<![\w.])(\d+(?:[.,]\d+)?)( ?)(%|[KMGTP]i?B/s|B/s|[KMGTP]i?B)(?![\w])')
+
+# a counter like "(57/57)" is two numbers, not a path
+RE_RATIO = re.compile(r'(?<![\w.])(\d+)(/)(\d+)(?![\w])')
+
+# a path keeps its globs, so a refspec like "+refs/heads/*" stays in one piece
+RE_PATH = re.compile(r'(?<![\w@:/.\-])(?:\.{1,2}/|~/|/)?(?:[\w.@+\-*]+/)+[\w.@+\-*]*')
+
+RE_FILE = re.compile(r'''(?<![\w@:/.\-])
+    (?: \.[A-Za-z][\w\-]{1,20}                            # .gitignore
+      | [\w@+\-]+(?:\.[\w@+\-]+)*\.[A-Za-z][\w]{0,7} )    # README.md
+    (?![\w./])''', re.X)
+
+RE_SIGN = re.compile(r'(\()([+\-])(\))')
+
+RE_UNIT_PRE = re.compile(r'(?i)\b(' + UNIT_PREFIXES + r')( )(\d+)\b')
+
+# a third group of digits behind a dot makes it a version, not a statistic
+RE_NUM = re.compile(
+    r'(?<![\w.])(\d+(?:[.,]\d+)?)( (?:' + UNIT_WORDS + r'))?(?![\w])(?!\.\d)')
+
+RE_ARROW = re.compile(r'<=>|<->|<==|==>|<--|-->|<=|=>|<-|->|→|←|⇒|⇐|↔|⇔')
+
+RE_DONE = re.compile(r'(?i)\b(done|up to date|up-to-date|working tree clean|'
+                     r'nothing to commit|fast-forward|success)\b')
+
+RE_PUNCT = re.compile(r'[(){}\[\]<>:;,|/\\=]+|\.{2,3}')
+
+
+def _url(match):
+    return [sp(match.group(0), 'url')]
+
+
+def _hash_range(match):
+    return [sp(match.group(1), 'hash'), sp(match.group(2), 'punct'),
+            sp(match.group(3), 'hash')]
+
+
+def _hash(match):
+    return [sp(match.group(0), 'hash')]
+
+
+def _quoted(match):
+    return [code(match.group(2))]
+
+
+def _stash(match):
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct'),
+            sp(match.group(3), 'punct'), sp(match.group(4), 'num'),
+            sp(match.group(5), 'punct')]
+
+
+def _size(match):
+    return [sp(match.group(1), 'num'), sp(match.group(2)),
+            sp(match.group(3), 'unit')]
+
+
+def _ratio(match):
+    return [sp(match.group(1), 'num'), sp(match.group(2), 'punct'),
+            sp(match.group(3), 'num')]
+
+
+def _code(match):
+    return [code(match.group(0))]
+
+
+def _sign(match):
+    return [sp(match.group(1), 'punct'),
+            sp(match.group(2), 'add' if match.group(2) == '+' else 'del'),
+            sp(match.group(3), 'punct')]
+
+
+def _unit_pre(match):
+    return [sp(match.group(1), 'unit'), sp(match.group(2)),
+            sp(match.group(3), 'num')]
+
+
+def _num(match):
+    out = [sp(match.group(1), 'num')]
+    if match.group(2):
+        out.append(sp(match.group(2), 'unit'))
+    return out
+
+
+def _arrow(match):
+    return [sp(ARROWS[match.group(0)], 'arrow')]
+
+
+def _done(match):
+    return [sp(match.group(0), 'ok')]
+
+
+def _punct(match):
+    return [sp(match.group(0), 'punct')]
+
+
+GENERIC_RULES = [
+    (RE_URL, _url),
+    (RE_HASH_RANGE, _hash_range),
+    (RE_HASH, _hash),
+    (RE_QUOTED, _quoted),
+    (RE_STASH, _stash),
+    (RE_SIZE, _size),          # before the path rules, so "MiB/s" stays a unit
+    (RE_RATIO, _ratio),        # and so "(57/57)" does not become a path either
+    (RE_PATH, _code),
+    (RE_FILE, _code),
+    (RE_SIGN, _sign),
+    (RE_UNIT_PRE, _unit_pre),
+    (RE_NUM, _num),
+    (RE_ARROW, _arrow),
+    (RE_DONE, _done),
+    (RE_PUNCT, _punct),
+]
+
+# the same set without the path rules, for fields that are known to be prose
+PROSE_RULES = [entry for entry in GENERIC_RULES if entry[1] is not _code]
+
+
+# --- line rules ------------------------------------------------------------
+#
+# Each entry is (pattern, handler, base role). The first pattern that matches
+# a whole line wins; its handler turns the match into spans and hands
+# everything it does not know about to inline(). The base role paints what is
+# still open once the generic rules ran. A handler returning None passes the
+# line on to the rules behind it.
+
+LINE_RULES = []
+
+
+def rule(pattern, base='prose'):
+    def register(handler):
+        LINE_RULES.append((re.compile(pattern), handler, base))
+        return handler
+    return register
+
+
+@rule(r'^(remote:)( *)(.*)$')
+def _remote(match, painter):
+    # what the other side said, painted by the same rules as local output
+    return [sp(match.group(1), 'remote'), sp(match.group(2))] \
+        + painter.spans(match.group(3))
+
+
+@rule(r'^(fatal|error|usage)(:)(.*)$', 'error')
+def _fatal(match, painter):
+    return [sp(match.group(1), 'error'), sp(match.group(2), 'punct')] \
+        + inline(match.group(3))
+
+
+@rule(r'^(warning)(:)(.*)$', 'warning')
+def _warning(match, painter):
+    return [sp(match.group(1), 'warning'), sp(match.group(2), 'punct')] \
+        + inline(match.group(3))
+
+
+@rule(r'^(hint|note|Note|Nothing specified)(:)(.*)$', 'hint')
+def _hint(match, painter):
+    return [sp(match.group(1), 'hint'), sp(match.group(2), 'punct')] \
+        + dim(inline(match.group(3)))
+
+
+@rule(r'^(\s*)(\(.*\))$', 'hint')
+def _parenthesized(match, painter):
+    # the "(use "git ..." to ...)" advice under a status section
+    return [sp(match.group(1))] + dim(inline(match.group(2)))
+
+
+# --- init, clone -----------------------------------------------------------
+
+@rule(r'^(Reinitialized existing|Initialized empty) (Git repository in) (.+)$')
+def _init(match, painter):
+    return [sp(match.group(1), 'section'), sp(' '), sp(match.group(2)),
+            sp(' '), code(match.group(3))]
+
+
+@rule(r"^(Cloning into) '(.+)'(\.{3})$")
+def _cloning(match, painter):
+    return [sp(match.group(1), 'section'), sp(' '), code(match.group(2)),
+            sp(match.group(3), 'punct')]
+
+
+# --- status ----------------------------------------------------------------
+
+@rule(r'^(On branch) (\S+)$')
+def _on_branch(match, painter):
+    return [sp(match.group(1), 'section'), sp(' '), code(match.group(2))]
+
+
+@rule(r'^(HEAD detached (?:at|from)) (\S+)$')
+def _detached(match, painter):
+    return [sp(match.group(1), 'warning'), sp(' ')] + inline(match.group(2))
+
+
+@rule(r'^(' + alternation(SECTIONS) + r')(:)$')
+def _section(match, painter):
+    painter.section = SECTIONS[match.group(1)]
+    return [sp(match.group(1), 'section'), sp(match.group(2), 'punct')]
+
+
+@rule(r'^(\t)(' + alternation(STATUS_WORDS) + r')(:)(\s*)(.+)$')
+def _status_entry(match, painter):
+    role = STATUS_WORDS[match.group(2).lower()]
+    return [sp(match.group(1)), sp(match.group(2), role),
+            sp(match.group(3), 'punct'), sp(match.group(4))] \
+        + path_spans(match.group(5))
+
+
+@rule(r'^(' + alternation(STATUS_WORDS) + r')( {2,})(\S.*)$')
+def _labelled_path(match, painter):
+    # how the other dev-helpers list a file, e.g. "staged    completions/x"
+    role = STATUS_WORDS[match.group(1).lower()]
+    return [sp(match.group(1), role), sp(match.group(2))] \
+        + path_spans(match.group(3))
+
+
+@rule(r'^\t(\S.*)$')
+def _status_path(match, painter):
+    # an entry without a label of its own, e.g. under "Untracked files"
+    return [sp('\t')] + path_spans(match.group(1))
+
+
+@rule(r'^(nothing to commit|nothing added to commit)(.*)$')
+def _nothing(match, painter):
+    return [sp(match.group(1), 'ok')] + advice_spans(match.group(2))
+
+
+@rule(r'^(no changes added to commit)(.*)$')
+def _no_changes(match, painter):
+    return [sp(match.group(1), 'warning')] + advice_spans(match.group(2))
+
+
+@rule(r'^(##) (\S+?)(?:(\.{3})(\S+))?( \[.+\])?$')
+def _short_branch(match, painter):
+    out = [sp(match.group(1), 'punct'), sp(' '), code(match.group(2))]
+    if match.group(3):
+        out.extend([sp(match.group(3), 'punct'), code(match.group(4))])
+    if match.group(5):
+        out.extend(inline(match.group(5)))
+    return out
+
+
+@rule(r'^([ MADRCUT?!])([ MADRCUT?!]) (\S.*)$')
+def _short_status(match, painter):
+    index, work = match.group(1), match.group(2)
+    pair = index + work
+    # "??" and "!!" are the only pairs those two letters appear in, and a pair
+    # of spaces is no status at all - anything else here is a push or fetch
+    # line, which the refspec rule knows better
+    if pair == '  ' or ('?' in pair and pair != '??') \
+            or ('!' in pair and pair != '!!'):
+        return None
+    return [sp(index, STATUS_LETTERS.get(index, 'prose')),
+            sp(work, STATUS_LETTERS.get(work, 'prose')), sp(' ')] \
+        + path_spans(match.group(3))
+
+
+@rule(r'^([MADRCUT])\t(\S.*)$')
+def _name_status(match, painter):
+    # "git diff --name-status" and the file list git checkout prints
+    return [sp(match.group(1), STATUS_LETTERS.get(match.group(1), 'prose')),
+            sp('\t')] + path_spans(match.group(2))
+
+
+# --- commit ----------------------------------------------------------------
+
+@rule(r'^\[(?P<ref>.+?)(?: \((?P<kind>[^)]+)\))? (?P<hash>[0-9a-f]{7,40})\] (?P<msg>.*)$')
+def _commit_summary(match, painter):
+    out = [sp('[', 'punct'), code(match.group('ref'))]
+    if match.group('kind'):
+        out.extend([sp(' (', 'punct'), sp(match.group('kind'), 'label'),
+                    sp(')', 'punct')])
+    out.extend([sp(' '), sp(match.group('hash'), 'hash'), sp(']', 'punct'),
+                sp(' '), sp(match.group('msg'), 'message')])
+    return out
+
+
+@rule(r'^ (\d+) (files? changed)(.*)$')
+def _commit_stat(match, painter):
+    return [sp(' '), sp(match.group(1), 'num'), sp(' '),
+            sp(match.group(2), 'unit')] + inline(match.group(3))
+
+
+@rule(r'^ (create|delete) (mode) (\d+) (.+)$')
+def _mode_line(match, painter):
+    role = 'add' if match.group(1) == 'create' else 'del'
+    return [sp(' '), sp(match.group(1), role), sp(' '),
+            sp(match.group(2), 'unit'), sp(' '), sp(match.group(3), 'mode'),
+            sp(' ')] + path_spans(match.group(4))
+
+
+@rule(r'^ (mode change) (\d+) => (\d+) (.+)$')
+def _mode_change(match, painter):
+    return [sp(' '), sp(match.group(1), 'mod'), sp(' '),
+            sp(match.group(2), 'mode'), sp(' '), sp(ARROWS['=>'], 'arrow'),
+            sp(' '), sp(match.group(3), 'mode'), sp(' ')] \
+        + path_spans(match.group(4))
+
+
+@rule(r'^ (rename|copy|rewrite) (.+?) \((\d+)(%)\)$')
+def _rename_line(match, painter):
+    return [sp(' '), sp(match.group(1), 'move'), sp(' ')] \
+        + path_spans(match.group(2)) \
+        + [sp(' '), sp('(', 'punct'), sp(match.group(3), 'num'),
+           sp(match.group(4), 'unit'), sp(')', 'punct')]
+
+
+# --- transfer, push, fetch -------------------------------------------------
+
+@rule(r'^(To|From) (.+)$')
+def _to_from(match, painter):
+    return [sp(match.group(1), 'section'), sp(' ')] + inline(match.group(2))
+
+
+@rule(r'^ ([ +\-*!=]) (\[[^\]]*\]|\S+)(\s+)(\S+)\s+(?:->|→)\s+(\S+)(\s+\(.+\))?$')
+def _refspec(match, painter):
+    flag = match.group(1)
+    flag_roles = {' ': 'punct', '+': 'mod', '-': 'del', '*': 'add',
+                  '!': 'error', '=': 'punct'}
+    out = [sp(' '), sp(flag, flag_roles.get(flag, 'prose')), sp(' ')]
+    summary = match.group(2)
+    if summary.startswith('['):
+        out.extend(_summary_spans(summary))
+    else:
+        out.extend(inline(summary))
+    out.append(sp(match.group(3)))
+    out.extend(ref_spans(match.group(4)))
+    out.extend([sp(' '), sp('→', 'arrow'), sp(' ')])
+    out.extend(ref_spans(match.group(5)))
+    if match.group(6):
+        out.extend(inline(match.group(6), PROSE_RULES))
+    return out
+
+
+def _summary_spans(text):
+    # "[new branch]", "[rejected]", "[up to date]", ...
+    word = text[1:-1]
+    roles = {
+        'new branch': 'add', 'new tag': 'add', 'new reference': 'add',
+        'deleted': 'del', 'rejected': 'error', 'remote rejected': 'error',
+        'remote failure': 'error', 'no match': 'error', 'up to date': 'ok',
+        'tag update': 'mod', 'forced update': 'mod',
+    }
+    return [sp('[', 'punct'), sp(word, roles.get(word, 'prose')),
+            sp(']', 'punct')]
+
+
+@rule(r'^(Delta compression using up to) (\d+) (threads?)$')
+def _delta_compression(match, painter):
+    return [sp(match.group(1), 'label'), sp(' '), sp(match.group(2), 'num'),
+            sp(' '), sp(match.group(3), 'unit')]
+
+
+@rule(r'^(' + alternation(PROGRESS_LABELS) + r')(:)(.*)$')
+def _progress(match, painter):
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct')] \
+        + inline(match.group(3))
+
+
+@rule(r'^(Total) (.*)$')
+def _total(match, painter):
+    return [sp(match.group(1), 'label'), sp(' ')] + inline(match.group(2))
+
+
+@rule(r"^(branch|Branch) '(.+)' (set up to track) '(.+)'(\.)$")
+def _tracking(match, painter):
+    return [sp(match.group(1), 'label'), sp(' '), code(match.group(2)),
+            sp(' '), sp(match.group(3)), sp(' '), code(match.group(4)),
+            sp(match.group(5), 'punct')]
+
+
+@rule(r'^(Everything up-to-date|Already up to date\.?|Already up-to-date\.?)$')
+def _up_to_date(match, painter):
+    return [sp(match.group(1), 'ok')]
+
+
+# --- checkout, switch, merge, rebase --------------------------------------
+
+@rule(r"^(Switched to a new branch|Switched to branch|Already on) '(.+)'$")
+def _switched(match, painter):
+    return [sp(match.group(1), 'section'), sp(' '), code(match.group(2))]
+
+
+@rule(r'^(HEAD is now at|Previous HEAD position was) ([0-9a-f]{7,40})(.*)$')
+def _head_at(match, painter):
+    return [sp(match.group(1), 'section'), sp(' '),
+            sp(match.group(2), 'hash'), sp(match.group(3), 'message')]
+
+
+@rule(r'^(Updating) ([0-9a-f]{4,40})(\.{2,3})([0-9a-f]{4,40})$')
+def _updating(match, painter):
+    return [sp(match.group(1), 'label'), sp(' '), sp(match.group(2), 'hash'),
+            sp(match.group(3), 'punct'), sp(match.group(4), 'hash')]
+
+
+@rule(r'^(Fast-forward|Fast forward)$')
+def _fast_forward(match, painter):
+    return [sp(match.group(1), 'ok')]
+
+
+@rule(r"^(Merge made by the) '(.+)' (strategy\.)$")
+def _merge_made(match, painter):
+    return [sp(match.group(1), 'section'), sp(' '), code(match.group(2)),
+            sp(' '), sp(match.group(3))]
+
+
+@rule(r'^(CONFLICT) (\([^)]*\))(:) (.*)$')
+def _conflict(match, painter):
+    return [sp(match.group(1), 'conflict'), sp(' ')] \
+        + inline(match.group(2), PROSE_RULES) \
+        + [sp(match.group(3), 'punct'), sp(' ')] + inline(match.group(4))
+
+
+@rule(r'^(Automatic merge failed.*|.*fix conflicts.*|.*could not apply.*)$',
+      'warning')
+def _merge_failed(match, painter):
+    return inline(match.group(1))
+
+
+@rule(r'^(Auto-merging|Removing|Adding|Unstaged|Dropped) (.+)$')
+def _touching(match, painter):
+    return [sp(match.group(1), 'label'), sp(' ')] + inline(match.group(2))
+
+
+@rule(r'^(Applying|Rebasing)(:) (.*)$')
+def _applying(match, painter):
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct'), sp(' '),
+            sp(match.group(3), 'message')]
+
+
+@rule(r'^(Successfully rebased.*|Current branch .+ is up to date\.?)$')
+def _rebase_ok(match, painter):
+    return inline(match.group(1))
+
+
+@rule(r"^(rm) '(.+)'$")
+def _rm(match, painter):
+    return [sp(match.group(1), 'del'), sp(' '), code(match.group(2))]
+
+
+# --- log, show -------------------------------------------------------------
+
+@rule(r'^(commit|tag) ([0-9a-f]{7,40}|\S+)(?: \((.+)\))?$')
+def _log_commit(match, painter):
+    painter.in_log = True
+    painter.in_diff = False
+    out = [sp(match.group(1), 'section'), sp(' ')]
+    out.extend(inline(match.group(2)))
+    if match.group(3):
+        out.append(sp(' (', 'punct'))
+        out.extend(decoration_spans(match.group(3)))
+        out.append(sp(')', 'punct'))
+    return out
+
+
+@rule(r'^(Author|Commit|Tagger)(:)(\s+)(.*?)(?: (<[^>]*>))?$')
+def _log_author(match, painter):
+    out = [sp(match.group(1), 'label'), sp(match.group(2), 'punct'),
+           sp(match.group(3)), sp(match.group(4), 'author')]
+    if match.group(5):
+        out.extend([sp(' <', 'punct'), sp(match.group(5)[1:-1], 'email'),
+                    sp('>', 'punct')])
+    return out
+
+
+@rule(r'^(Date|AuthorDate|CommitDate|TaggerDate)(:)(\s+)(.*)$')
+def _log_date(match, painter):
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct'),
+            sp(match.group(3)), sp(match.group(4), 'date')]
+
+
+@rule(r'^(Merge|Notes)(:)(\s+)(.*)$')
+def _log_merge(match, painter):
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct'),
+            sp(match.group(3))] + inline(match.group(4))
+
+
+# --- diff ------------------------------------------------------------------
+
+@rule(r'^(diff --\S+) (.*)$')
+def _diff_header(match, painter):
+    painter.in_diff = True
+    out = [sp(match.group(1), 'section')]
+    for field in match.group(2).split(' '):
+        out.extend([sp(' ')] + path_spans(field))
+    return out
+
+
+@rule(r'^(index) ([0-9a-f]+)(\.{2})([0-9a-f]+)( \d+)?$')
+def _diff_index(match, painter):
+    out = [sp(match.group(1), 'label'), sp(' '), sp(match.group(2), 'hash'),
+           sp(match.group(3), 'punct'), sp(match.group(4), 'hash')]
+    if match.group(5):
+        out.append(sp(match.group(5), 'mode'))
+    return out
+
+
+@rule(r'^((?:new file|deleted file|old|new) mode) (\d+)$')
+def _diff_mode(match, painter):
+    return [sp(match.group(1), 'label'), sp(' '), sp(match.group(2), 'mode')]
+
+
+@rule(r'^((?:dis)?similarity index) (\d+)(%)$')
+def _diff_similarity(match, painter):
+    return [sp(match.group(1), 'label'), sp(' '), sp(match.group(2), 'num'),
+            sp(match.group(3), 'unit')]
+
+
+@rule(r'^((?:rename|copy) (?:from|to)) (.+)$')
+def _diff_rename(match, painter):
+    return [sp(match.group(1), 'label'), sp(' ')] + path_spans(match.group(2))
+
+
+@rule(r'^(---|\+\+\+) (.+)$')
+def _diff_file(match, painter):
+    role = 'del' if match.group(1) == '---' else 'add'
+    return [sp(match.group(1), role), sp(' ')] + path_spans(match.group(2))
+
+
+@rule(r'^(@@+[^@]*@@+)(.*)$')
+def _diff_hunk(match, painter):
+    painter.in_diff = True
+    return [sp(match.group(1), 'hunk'), sp(match.group(2), 'message')]
+
+
+@rule(r'^(Binary files) (.+) (differ)$')
+def _diff_binary(match, painter):
+    return [sp(match.group(1), 'label'), sp(' ')] + path_spans(match.group(2)) \
+        + [sp(' '), sp(match.group(3), 'label')]
+
+
+@rule(r'^(\\ No newline at end of file)$', 'hint')
+def _diff_no_newline(match, painter):
+    return [sp(match.group(1), 'hint')]
+
+
+@rule(r'^(\s*)(\S.*?)(\s+)\|(\s+)(Bin\b.*?|\d+)(\s*)([+\-]*)(\s*)$')
+def _diff_stat(match, painter):
+    out = [sp(match.group(1))] + path_spans(match.group(2))
+    out.extend([sp(match.group(3)), sp('│', 'punct'), sp(match.group(4))])
+    amount = match.group(5)
+    if amount.startswith('Bin'):
+        out.append(sp('Bin', 'unit'))
+        out.extend(inline(amount[3:]))
+    else:
+        out.append(sp(amount, 'num'))
+    out.append(sp(match.group(6)))
+    for run in re.findall(r'\++|-+', match.group(7)):
+        out.append(sp(run, 'add' if run[0] == '+' else 'del'))
+    out.append(sp(match.group(8)))
+    return out
+
+
+# --- stash, remote, config -------------------------------------------------
+
+@rule(r'^(Saved working directory and index state) (.*)$')
+def _stash_saved(match, painter):
+    return [sp(match.group(1), 'section'), sp(' ')] + painter.spans(match.group(2))
+
+
+@rule(r'^((?:refs/)?stash@\{)(\d+)(\})(:)( *)(.*)$')
+def _stash_entry(match, painter):
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'num'),
+            sp(match.group(3), 'label'), sp(match.group(4), 'punct'),
+            sp(match.group(5))] + painter.spans(match.group(6))
+
+
+@rule(r'^((?:WIP on|On) )([^:]+)(:)( )([0-9a-f]{7,40})?(.*)$')
+def _stash_wip(match, painter):
+    out = [sp(match.group(1), 'label'), code(match.group(2)),
+           sp(match.group(3), 'punct'), sp(match.group(4))]
+    if match.group(5):
+        out.append(sp(match.group(5), 'hash'))
+    out.append(sp(match.group(6), 'message'))
+    return out
+
+
+@rule(r'^(\S+)\t(\S+) \((fetch|push)\)$')
+def _remote_verbose(match, painter):
+    return [code(match.group(1)), sp('\t')] + inline(match.group(2)) \
+        + [sp(' (', 'punct'), sp(match.group(3), 'label'), sp(')', 'punct')]
+
+
+@rule(r'^([\w\-]+(?:\.[\w\-.]+)+)(=)(.*)$')
+def _config_entry(match, painter):
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct')] \
+        + inline(match.group(3))
+
+
+@rule(r'^([A-Z][a-z]+(?: [a-z][\w\-]+){0,3})(:)( .*)$')
+def _labelled_line(match, painter):
+    # the progress and transfer lines that are not listed above, and whatever
+    # else introduces itself with "Some words: ..."
+    return [sp(match.group(1), 'label'), sp(match.group(2), 'punct')] \
+        + inline(match.group(3))
+
+
+class Painter:
+    def __init__(self, theme, cmd='', listing=False):
+        self.theme = theme
+        self.cmd = cmd
+        self.listing = listing or cmd in LIST_CMDS
+        self.base = 'prose'
+        self.section = None
+        self.in_log = cmd in LOG_CMDS
+        self.in_diff = False
+
+    def line(self, text):
+        text = RE_ANSI.sub('', text)
+        if not text.strip():
+            return text
+        spans = self.spans(text)
+        return render(self.theme, spans, self.base)
+
+    def spans(self, text):
+        self.base = 'prose'
+        spans = self.diff_body_spans(text)
+        if spans is None:
+            spans = self.command_spans(text)
+        if spans is None:
+            for pattern, handler, base in LINE_RULES:
+                match = pattern.match(text)
+                if not match:
+                    continue
+                spans = handler(match, self)
+                if spans is not None:
+                    self.base = base
+                    break
+        if spans is None:
+            spans = self.fallback_spans(text)
+        return spans
+
+    def diff_body_spans(self, text):
+        # inside a diff the body is source code, so it is painted as a whole
+        # instead of being picked apart. Only a line behind a diff header counts,
+        # so a "+refs/heads/*" of some other output stays what it is.
+        if not self.in_diff:
+            return None
+        if text.startswith('+') and not text.startswith('+++'):
+            return [sp(text, 'add')]
+        if text.startswith('-') and not text.startswith('---'):
+            return [sp(text, 'del')]
+        if text.startswith(' '):
+            return [sp(text, 'prose')]
+        return None
+
+    def command_spans(self, text):
+        # rules that only make sense for the command that was run
+        if self.cmd == 'branch':
+            spans = self.branch_spans(text)
+            if spans is not None:
+                return spans
+        if self.cmd in ('blame', 'annotate'):
+            spans = self.blame_spans(text)
+            if spans is not None:
+                return spans
+        if self.cmd == 'grep':
+            spans = self.grep_spans(text)
+            if spans is not None:
+                return spans
+        if self.cmd == 'worktree':
+            spans = self.worktree_spans(text)
+            if spans is not None:
+                return spans
+        if self.listing and re.fullmatch(r'\S+', text):
+            return [code(text)]
+        if self.cmd in LOG_CMDS:
+            match = re.match(r'^([*|\\/_ ]*)([0-9a-f]{7,40})\b(.*)$', text)
+            if match and (not match.group(1) or match.group(1).strip()):
+                return [sp(match.group(1), 'graph'), sp(match.group(2), 'hash')] \
+                    + self.subject_spans(match.group(3))
+            if re.fullmatch(r'[*|\\/_ ]+', text):
+                return [sp(text, 'graph')]
+        return None
+
+    def grep_spans(self, text):
+        # "<path>:<line>:<match>", or "-" instead of ":" on a context line, and
+        # the matched line itself is code, so it is left alone
+        if text == '--':
+            return [sp(text, 'punct')]
+        # the path is matched lazily, so a "-" in a file name does not pass for
+        # the separator in front of the line number
+        match = re.match(r'^(\S+?)([:\-])(\d+)([:\-])(.*)$', text)
+        if match:
+            return [code(match.group(1)), sp(match.group(2), 'punct'),
+                    sp(match.group(3), 'num'), sp(match.group(4), 'punct'),
+                    sp(match.group(5), 'prose')]
+        match = re.match(r'^([^\s:]+)(:)(.*)$', text)
+        if match:
+            return [code(match.group(1)), sp(match.group(2), 'punct'),
+                    sp(match.group(3), 'prose')]
+        return None
+
+    def blame_spans(self, text):
+        # "^ef85b6f path/to/file (Author 2026-08-06 09:21:00 +0200  12) code",
+        # where the caret marks a line no commit reaches behind
+        match = re.match(r'^(\^?)([0-9a-f]{7,40})( \S+)?( *\()(.+?)( +)'
+                         r'(\d{4}-\d\d-\d\d [\d:]+ [+\-]\d{4})( +)(\d+)(\) )(.*)$',
+                         text)
+        if not match:
+            return None
+        out = [sp(match.group(1), 'mark'), sp(match.group(2), 'hash')]
+        if match.group(3):
+            out.extend([sp(' ')] + path_spans(match.group(3).strip()))
+        out.extend([sp(match.group(4)[:-1]), sp('(', 'punct'),
+                    sp(match.group(5), 'author'), sp(match.group(6)),
+                    sp(match.group(7), 'date'), sp(match.group(8)),
+                    sp(match.group(9), 'num'), sp(')', 'punct'), sp(' '),
+                    sp(match.group(11), 'prose')])
+        return out
+
+    def branch_spans(self, text):
+        match = re.match(r'^([*+]?) +(\S+)(?: +-> +(\S+))?$', text)
+        if match:
+            out = [sp(match.group(1) or ' ', 'mark'), sp(' '),
+                   code(match.group(2))]
+            if match.group(3):
+                out.extend([sp(' '), sp('→', 'arrow'), sp(' '),
+                            code(match.group(3))])
+            return out
+        # the verbose listing, e.g. "* main 0101cb2 [origin/main: ahead 1] msg"
+        match = re.match(r'^([*+]?) +(\S+)( +)([0-9a-f]{7,40})( \[[^\]]+\])?'
+                         r'( .*)?$', text)
+        if match:
+            out = [sp(match.group(1) or ' ', 'mark'), sp(' '),
+                   code(match.group(2)), sp(match.group(3)),
+                   sp(match.group(4), 'hash')]
+            if match.group(5):
+                out.append(sp(' '))
+                out.extend(bracket_ref_spans(match.group(5).strip()))
+            if match.group(6):
+                out.append(sp(match.group(6), 'message'))
+            return out
+        match = re.match(r'^([*+]?) +(\(.+\))$', text)
+        if match:
+            return [sp(match.group(1) or ' ', 'mark'), sp(' ')] \
+                + inline(match.group(2))
+        return None
+
+    def worktree_spans(self, text):
+        # "<path>  <hash> [<branch>]", or "(bare)"/"(detached HEAD)" at the end
+        match = re.match(r'^(\S+)( +)([0-9a-f]{7,40}|\(bare\))( )(\[.+\]|\(.+\))$',
+                         text)
+        if not match:
+            return None
+        out = path_spans(match.group(1)) + [sp(match.group(2))]
+        out.extend(inline(match.group(3)) + [sp(match.group(4))])
+        if match.group(5).startswith('['):
+            out.extend(bracket_ref_spans(match.group(5)))
+        else:
+            out.extend(inline(match.group(5), PROSE_RULES))
+        return out
+
+    def subject_spans(self, text):
+        # " (HEAD -> main, tag: v1.0) fix: keep the pager quiet"
+        out = []
+        match = re.match(r'^ \((.+?)\)(.*)$', text)
+        if match:
+            out.append(sp(' (', 'punct'))
+            out.extend(decoration_spans(match.group(1)))
+            out.append(sp(')', 'punct'))
+            text = match.group(2)
+        if text:
+            out.append(sp(text, 'message'))
+        return out
+
+    def fallback_spans(self, text):
+        # a log message body is indented by four spaces
+        if self.in_log and re.match(r'^ {4}\S', text):
+            return [sp(text, 'message')]
+        return inline(text)
+
+
+def render(theme, spans, base='prose'):
+    spans = [span for span in spans if span.text]
+    merged = []
+    for span in spans:
+        if not span.text:
+            continue
+        if merged and merged[-1].role != CODE and span.role != CODE \
+                and (merged[-1].role or base) == (span.role or base):
+            merged[-1].text += span.text
+            continue
+        merged.append(span)
+    out = []
+    for span in merged:
+        if span.role == CODE:
+            # drawn the way glow draws `code`: a block with a space of padding
+            # on each side, and the text around it keeps its own spacing
+            out.append(theme.paint(CODE, ' ' + span.text + ' '))
+        elif not span.text.strip():
+            # whitespace carries no color, so it stays as it is
+            out.append(span.text)
+        else:
+            out.append(theme.paint(span.role or base, span.text))
+    return ''.join(out)
+
+
+class LineWriter:
+    # Paints whole lines as they arrive and passes the line terminator through
+    # untouched, so output that overwrites itself keeps working.
+    SPLIT = re.compile(rb'(\r\n|\n|\r)')
+
+    def __init__(self, sink, painter):
+        self.sink = sink
+        self.painter = painter
+        self.buffer = b''
+
+    def feed(self, data):
+        self.buffer += data
+        parts = self.SPLIT.split(self.buffer)
+        self.buffer = parts.pop()
+        for index in range(0, len(parts), 2):
+            self.write(parts[index], parts[index + 1])
+
+    def close(self):
+        if self.buffer:
+            self.write(self.buffer, b'')
+            self.buffer = b''
+
+    def write(self, line, terminator):
+        text = self.painter.line(line.decode('utf-8', 'replace'))
+        self.sink.write(text.encode('utf-8', 'replace') + terminator)
+        self.sink.flush()
+
+
+def usage(stream=sys.stderr, status=1):
+    print(f"""usage: {APP_NAME} [OPTIONS] [--] <git-command> [<args>...]
+
+Run a git command and paint its output.
+
+Every argument is passed to git unchanged, so {APP_NAME} is used like git
+itself, e.g. "{APP_NAME} status" or "{APP_NAME} push". git's own coloring is
+turned off and the output is repainted from one palette: paths and refs become
+inline code blocks, hashes, URLs, commit messages, statistics and status words
+get their own color, arrows become real arrows and the punctuation between them
+fades back.
+
+Options:
+  --color WHEN     auto (default), always or never
+  --pager WHEN     auto (default), always or never
+  --raw            hand the command to git without painting it
+  -h, --help       show this help message and exit
+
+Environment:
+  GIT_COLOR_<ROLE> override a single role, e.g. GIT_COLOR_HASH=214
+  COLOR_TEXT_*     the shared cli-helpers theme, used for the roles that have
+                   no GIT_COLOR_* variable set
+  NO_COLOR         hand the command to git without painting it
+
+Roles: {', '.join(sorted(ROLES))}""", file=stream)
+    sys.exit(status)
+
+
+def parse_options(argv):
+    opts = {'color': 'auto', 'pager': 'auto', 'raw': False}
+    rest = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == '--':
+            rest.extend(argv[index + 1:])
+            break
+        if arg in ('-h', '--help'):
+            usage(sys.stdout, 0)
+        elif arg in ('--color', '--pager'):
+            if index + 1 >= len(argv):
+                print(f'ERROR: Missing argument for {arg}', file=sys.stderr)
+                usage()
+            opts[arg[2:]] = argv[index + 1]
+            index += 1
+        elif arg.startswith('--color=') or arg.startswith('--pager='):
+            key, value = arg[2:].split('=', 1)
+            opts[key] = value
+        elif arg == '--raw':
+            opts['raw'] = True
+        elif arg == '--no-pager':
+            opts['pager'] = 'never'
+        else:
+            rest.extend(argv[index:])
+            break
+        index += 1
+    for key in ('color', 'pager'):
+        if opts[key] not in ('auto', 'always', 'never'):
+            print(f'ERROR: Invalid value for --{key}: {opts[key]}', file=sys.stderr)
+            usage()
+    return opts, rest
+
+
+def git_subcommand(args):
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in GLOBAL_VALUE_OPTS:
+            index += 2
+            continue
+        if arg.startswith('-'):
+            index += 1
+            continue
+        return arg, args[index + 1:]
+    return '', []
+
+
+def wants_terminal(cmd, cmd_args):
+    if cmd in RAW_CMDS:
+        return True
+    if cmd == 'rebase' and {'-i', '--interactive'} & set(cmd_args):
+        return True
+    if cmd in PATCH_CMDS and PATCH_FLAGS & set(cmd_args):
+        return True
+    return False
+
+
+def colors_enabled(when, stream):
+    if when == 'always':
+        return True
+    if when == 'never':
+        return False
+    if os.environ.get('NO_COLOR') is not None:
+        return False
+    if os.environ.get('TERM', '') in ('', 'dumb'):
+        return False
+    try:
+        return stream.isatty()
+    except (OSError, ValueError):
+        return False
+
+
+def tty_editor(env):
+    # git hands its own stdout down to the editor, and that stdout is a pipe
+    # here. Reconnecting the editor to the terminal keeps "git-color commit"
+    # usable while the summary git prints afterwards still gets painted.
+    try:
+        os.close(os.open('/dev/tty', os.O_WRONLY))
+    except OSError:
+        return
+    for name in ('GIT_EDITOR', 'GIT_SEQUENCE_EDITOR'):
+        if env.get(name, '').startswith('exec </dev/tty'):
+            continue
+        try:
+            editor = subprocess.run(['git', 'var', name], check=True,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL,
+                                    text=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        if editor:
+            env[name] = f'exec </dev/tty >/dev/tty 2>/dev/tty; {editor}'
+
+
+def start_pager():
+    command = os.environ.get('GIT_PAGER') or os.environ.get('PAGER') or 'less'
+    if command in ('', 'cat'):
+        return None
+    env = os.environ.copy()
+    # -F quits right away when the output fits on one screen, so short output
+    # behaves as if there were no pager at all
+    env.setdefault('LESS', 'FRX')
+    env.setdefault('LV', '-c')
+    try:
+        return subprocess.Popen(command, shell=True, stdin=subprocess.PIPE,
+                                env=env)
+    except OSError:
+        return None
+
+
+def pump(process, writers):
+    # both streams are painted, because git splits its output between them:
+    # push and fetch report progress on stderr, everything else on stdout
+    selector = selectors.DefaultSelector()
+    for pipe in writers:
+        selector.register(pipe, selectors.EVENT_READ)
+    broken = [False]
+    try:
+        while selector.get_map() and not broken[0]:
+            for key, _ in selector.select():
+                data = os.read(key.fileobj.fileno(), 65536)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    writers[key.fileobj].close()
+                    continue
+                try:
+                    writers[key.fileobj].feed(data)
+                except BrokenPipeError:
+                    # the pager was quit, so there is nothing left to paint
+                    broken[0] = True
+                    process.terminate()
+                    break
+    finally:
+        selector.close()
+    return broken[0]
+
+
+def main():
+    opts, args = parse_options(sys.argv[1:])
+    if not args:
+        usage()
+
+    cmd, cmd_args = git_subcommand(args)
+
+    if opts['raw'] or wants_terminal(cmd, cmd_args) \
+            or not colors_enabled(opts['color'], sys.stdout):
+        os.execvp('git', ['git'] + args)
+
+    env = os.environ.copy()
+    # the rules match git's English output, and the wrappers of this repo pin
+    # the locale the same way
+    env['LC_ALL'] = 'C'
+    env['GIT_PAGER'] = 'cat'
+    if cmd in EDITOR_CMDS:
+        tty_editor(env)
+
+    pager = None
+    if opts['pager'] == 'always' or (opts['pager'] == 'auto'
+                                     and cmd in PAGER_CMDS
+                                     and sys.stdout.isatty()):
+        pager = start_pager()
+
+    try:
+        process = subprocess.Popen(
+            ['git', '--no-pager', '-c', 'color.ui=never'] + args,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    except OSError as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        return 1
+
+    theme = Theme(True)
+    # "--name-only" and friends turn any command into a plain path listing
+    listing = bool(LISTING_FLAGS & set(cmd_args))
+    writers = {
+        process.stdout: LineWriter(pager.stdin if pager else sys.stdout.buffer,
+                                   Painter(theme, cmd, listing)),
+        process.stderr: LineWriter(sys.stderr.buffer, Painter(theme, cmd)),
+    }
+    broken = pump(process, writers)
+
+    status = process.wait()
+    process.stdout.close()
+    process.stderr.close()
+    if pager:
+        try:
+            pager.stdin.close()
+        except BrokenPipeError:
+            pass
+        pager.wait()
+    if broken:
+        # nothing reads the other end anymore, so whatever is still buffered is
+        # dropped instead of failing again while the interpreter shuts down
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        # the same status git reports once its pager is gone
+        return 141
+    return 128 - status if status < 0 else status
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os._exit(141)

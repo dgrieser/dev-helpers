@@ -16,6 +16,8 @@ Bash completions (`completions/dev-helpers`) are installed to
 `/usr/local/share/bash-completion/completions`, one entry per command, so
 bash-completion lazy-loads them on first tab. Flags, subcommands, and
 contextual values (branches, tags, projects, changed files) are completed.
+[git-color](#git-color) takes a git command line, so behind its own options it
+hands over to git's own completion (loading it if the shell has not yet).
 
 Aliases and wrapper functions don't trigger lazy loading, so to complete them
 source the stable-named copy from your shell rc after defining the aliases:
@@ -108,6 +110,38 @@ git-checkout [BRANCH]
 Clone a repo; reads URL from arg, clipboard, or prompt.
 ```bash
 git-clone <git url>
+```
+
+### git-color
+Run a git command and paint its output.
+
+Every argument is passed to git unchanged, so it is used like git itself. git's
+own coloring is turned off (and any escape sequence that still arrives is
+stripped), so the whole output is repainted from one palette: paths and refs
+become inline code blocks the way [glow](https://github.com/charmbracelet/glow)
+renders `` `code` `` and the way the `prompt` of
+[cli-helpers](https://github.com/dgrieser/cli-helpers) draws quoted spans,
+commit hashes, URLs, commit messages and file modes each get their own color,
+`->` becomes `→`, statistics are green with a darker green unit, `(+)` and `(-)`
+are green and red, status words are colored by what happened to the file, and
+the punctuation that is not part of a path or a ref fades back. Inside the
+dimmed advice git appends to its output, e.g. `(use "git add <file>..." to
+include in what will be committed)`, a code span drops its block and is drawn as
+plain text instead, so the hint stays a hint.
+
+Both output streams are painted, because git splits its output between them,
+e.g. push reports its progress on stderr. Commands that page their output are
+paged the same way git pages them (`less` by default, `$GIT_PAGER`/`$PAGER`
+otherwise), an editor a command opens is reconnected to the terminal, and
+commands that drive the terminal themselves (`git add -p`, `git mergetool`,
+`git rebase -i`, ...) are handed to git untouched.
+
+The palette is resolved per role from `GIT_COLOR_<ROLE>`, then from the shared
+`COLOR_*` theme of cli-helpers, then from the built-in default, so a themed
+shell stays in charge of the look. `--help` lists the roles.
+```bash
+git-color [--color auto|always|never] [--pager auto|always|never] [--raw] \
+          [--] <git-command> [<args>...]
 ```
 
 ### git-container
