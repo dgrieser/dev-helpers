@@ -23,7 +23,13 @@ If COMMAND is omitted, add is used.
 
 Options:
   -b, --branch BRANCH    Branch to add/delete; defaults to current workspace branch
+  -B, --base REF         Start point for a branch that has to be created;
+                         asked interactively when omitted, defaulting to the
+                         default remote branch
   -w, --workdir DIR      Workspace repo dir; defaults to current dir
+      --fetch            Fetch the base before creating the branch
+      --no-fetch         Do not fetch the base before creating the branch
+                         (asked interactively when neither is given)
   -h, --help             Show this help message and exit
 
 Environment:
@@ -175,6 +181,108 @@ branch_exists() {
     git -C "${workdir}" show-ref --verify --quiet "refs/heads/${1}"
 }
 
+branch_checked_out() {
+    git -C "${workdir}" worktree list --porcelain 2>/dev/null |
+        grep -Fqx "branch refs/heads/${1}"
+}
+
+default_base() {
+    (cd "${workdir}" && git-default 2>/dev/null) || current_branch "${workdir}"
+}
+
+resolve_base() {
+    if [ -n "${base_arg}" ]; then
+        base="${base_arg}"
+    else
+        base="$(prompt-input -p "Base:" -d "$(default_base)")" || fail "Base is required"
+    fi
+    [ -n "${base}" ] || fail "Base is required"
+}
+
+resolve_fetch() {
+    case "${fetch_arg}" in
+        yes)
+            do_fetch=1
+            return 0
+            ;;
+        no)
+            do_fetch=0
+            return 0
+            ;;
+    esac
+
+    prompt-yes-no "Fetch ${base} before creating ${branch}?"
+    case "${?}" in
+        0)
+            do_fetch=1
+            ;;
+        1)
+            do_fetch=0
+            ;;
+        *)
+            abort
+            ;;
+    esac
+}
+
+resolve_base_remote() {
+    base_remote=""
+    base_remote_ref=""
+    base_is_local=1
+
+    remote_candidate="${base%%/*}"
+    if [ "${remote_candidate}" != "${base}" ] &&
+        git -C "${workdir}" remote get-url "${remote_candidate}" >/dev/null 2>&1; then
+        base_remote="${remote_candidate}"
+        base_remote_ref="${base#*/}"
+        base_is_local=0
+        return 0
+    fi
+
+    if branch_exists "${base}"; then
+        base_remote="$(git -C "${workdir}" config --get "branch.${base}.remote" 2>/dev/null)"
+        base_remote_ref="$(git -C "${workdir}" config --get "branch.${base}.merge" 2>/dev/null)"
+        base_remote_ref="${base_remote_ref#refs/heads/}"
+    fi
+
+    if [ -z "${base_remote}" ]; then
+        for remote_name in $(git -C "${workdir}" remote); do
+            if git -C "${workdir}" show-ref --verify --quiet "refs/remotes/${remote_name}/${base}"; then
+                base_remote="${remote_name}"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "${base_remote}" ]; then
+        if git -C "${workdir}" rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            warning "No remote branch found for base ${base}, skipping fetch"
+            return 1
+        fi
+        git -C "${workdir}" remote get-url origin >/dev/null 2>&1 ||
+            { warning "No remote configured, skipping fetch"; return 1; }
+        base_remote="origin"
+    fi
+
+    [ -n "${base_remote_ref}" ] || base_remote_ref="${base}"
+}
+
+fetch_base() {
+    resolve_base_remote || return 0
+
+    if [ "${base_is_local}" = "1" ] && ! branch_checked_out "${base}"; then
+        git-color -C "${workdir}" fetch "${base_remote}" "${base_remote_ref}:${base}" 1>&2 ||
+            fail "git fetch failed: ${base_remote} ${base_remote_ref}:${base}"
+        return 0
+    fi
+
+    git-color -C "${workdir}" fetch "${base_remote}" "${base_remote_ref}" 1>&2 ||
+        fail "git fetch failed: ${base_remote} ${base_remote_ref}"
+    if [ "${base_is_local}" = "1" ]; then
+        warning "Base ${base} is checked out elsewhere, only ${base_remote}/${base_remote_ref} was updated"
+    fi
+}
+
 resolve_branch() {
     if [ -n "${branch_arg}" ]; then
         branch="${branch_arg}"
@@ -277,12 +385,20 @@ add_worktree() {
     if ! branch_exists "${branch}"; then
         prompt-yes-no "Branch ${branch} does not exist. Create it?" || abort
         create_branch=1
+        resolve_base
+        resolve_fetch
+        [ "${do_fetch}" = "1" ] && fetch_base
+        git -C "${workdir}" rev-parse --verify --quiet "${base}^{commit}" >/dev/null ||
+            fail "Base is not a valid commit-ish: ${base}"
+    else
+        [ -z "${base_arg}" ] || warning "Branch ${branch} already exists, ignoring --base"
+        [ -z "${fetch_arg}" ] || warning "Branch ${branch} already exists, ignoring --fetch/--no-fetch"
     fi
 
     mkdir -p "$(dirname "${target}")" ||
         fail "Cannot create parent dir for target: ${target}"
     if [ "${create_branch}" = "1" ]; then
-        git -C "${workdir}" worktree add --force --quiet -b "${branch}" "${target}" >/dev/null ||
+        git -C "${workdir}" worktree add --force --quiet -b "${branch}" "${target}" "${base}" >/dev/null ||
             fail "git worktree add failed"
     else
         git -C "${workdir}" worktree add --force --quiet "${target}" "${branch}" >/dev/null ||
@@ -394,6 +510,10 @@ RM_CMD="$(command -v trash 2>/dev/null || command -v rm 2>/dev/null)"
 mode="add"
 command_seen=0
 branch_arg=""
+base_arg=""
+base=""
+fetch_arg=""
+do_fetch=0
 workdir_arg=""
 
 while [ "${#}" -gt 0 ]; do
@@ -405,6 +525,17 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             branch_arg="${1}"
+            ;;
+        -B|--base)
+            shift
+            [ -z "${1}" ] && usage
+            base_arg="${1}"
+            ;;
+        --fetch)
+            fetch_arg="yes"
+            ;;
+        --no-fetch)
+            fetch_arg="no"
             ;;
         -w|--workdir)
             shift
@@ -445,6 +576,11 @@ else
 fi
 
 require_git_repo "${workdir}"
+
+if [ "${mode}" != "add" ]; then
+    [ -z "${base_arg}" ] || fail "--base can only be used with add"
+    [ -z "${fetch_arg}" ] || fail "--fetch/--no-fetch can only be used with add"
+fi
 
 case "${mode}" in
     add)

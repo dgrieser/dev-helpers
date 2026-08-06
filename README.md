@@ -349,5 +349,9 @@ git-track-branches [-C|--clear]
 ### git-worktree
 Manage mirrored git worktrees under `$WORKSPACE_WORKTREE`.
 ```bash
-git-worktree [add|list|delete|move-to-main] [-b <branch>] [-w <dir>]
+git-worktree [add|list|delete|move-to-main] [-b <branch>] [-B <base>] [--fetch|--no-fetch] [-w <dir>]
 ```
+When `add` has to create the branch, the start point is taken from `-B/--base`
+(asked interactively when omitted, defaulting to the default remote branch) and
+the base can be fetched beforehand (asked interactively when neither `--fetch`
+nor `--no-fetch` is given).

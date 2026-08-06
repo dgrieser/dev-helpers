@@ -603,12 +603,15 @@ _git-worktree()
         -b|--branch)
             __dh_compgen "$(__dh_local_branches)"
             return 0 ;;
+        -B|--base)
+            __dh_compgen "$(__dh_all_branches)"
+            return 0 ;;
         -w|--workdir)
             __dh_dirs
             return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-b --branch -w --workdir -h --help"
+        __dh_compgen "-b --branch -B --base --fetch --no-fetch -w --workdir -h --help"
     elif [ "${COMP_CWORD}" -eq 1 ]; then
         __dh_compgen "add list delete move-to-main"
     fi
