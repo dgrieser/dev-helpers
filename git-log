@@ -9,6 +9,10 @@ NL=$'\n'
 
 MAX_COUNT_DEFAULT=500
 
+# the picker has no horizontal scrolling, so the author column is shortened
+# there; the printed list keeps the value git reports
+AUTHOR_MAX=16
+
 C_HASH=$'\033[33m'
 C_AGE=$'\033[38;5;6m'
 C_AUTHOR=$'\033[38;5;33m'
@@ -150,19 +154,27 @@ resolve_commit() {
 }
 
 print_log() {
-    local rows
+    local rows shorten="${1:-0}"
 
     rows="$(git log --pretty=format:"%h%x09%cI%x09%al%x09%D%x09%s" \
                 "${log_args[@]}" -- "${paths[@]}" 2>/dev/null \
         | toage \
         | awk -F'\t' -v OFS='\t' -v crefs="${C_REFS}" -v chash="${C_HASH}" \
-              -v cage="${C_AGE}" -v cauthor="${C_AUTHOR}" -v reset="${C_RESET}" '
+              -v cage="${C_AGE}" -v cauthor="${C_AUTHOR}" -v reset="${C_RESET}" \
+              -v shorten="${shorten}" -v amax="${AUTHOR_MAX}" '
             {
+                author = $3
+                if (shorten) {
+                    # the noreply addresses of GitHub and GitLab carry the
+                    # numeric account id in front of the user name
+                    sub(/^[0-9]+\+/, "", author)
+                    if (length(author) > amax) author = substr(author, 1, amax - 1) "…"
+                }
                 msg = $5
                 for (i = 6; i <= NF; i++) msg = msg " " $i
                 gsub(/[ \t]+/, " ", msg)
                 if ($4 != "") msg = crefs "(" $4 ")" reset " " msg
-                print chash $1 reset, cage $2 reset, cauthor $3 reset, msg
+                print chash $1 reset, cage $2 reset, cauthor author reset, msg
             }')"
 
     if [ -z "${rows}" ]; then
@@ -676,7 +688,9 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
     cd "${start_dir}" || fail "Failed to enter ${start_dir}"
     case "${mode}" in
         print)
-            print_log
+            # only the picker reaches this, so this is where the author is
+            # shortened
+            print_log 1
             exit 0
             ;;
         files-print)
