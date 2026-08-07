@@ -11,7 +11,7 @@ MAX_COUNT_DEFAULT=500
 
 # the picker has no horizontal scrolling, so the author column is shortened
 # there; the printed list keeps the value git reports
-AUTHOR_MAX=16
+AUTHOR_MAX=10
 
 C_HASH=$'\033[33m'
 C_AGE=$'\033[38;5;6m'
