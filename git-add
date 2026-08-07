@@ -40,7 +40,11 @@ MAGENTA='\e[35m'
 NC='\e[0m'
 
 HEADER="KEY\tTYPE\tPATH"
-KEYS="alt-+,alt--,alt-d,alt-r,alt-i,alt-v,ctrl-d,ctrl-e,esc,ctrl-c,enter,del,insert,+,-"
+# all keys but the ones that end the picker run inside it: the ones that change
+# the working tree silently, the editor and vimdiff with the terminal handed over
+RELOAD_KEYS="alt-+,alt--,alt-d,alt-r,alt-i,del,insert,+,-"
+EXEC_RELOAD_KEYS="ctrl-e,alt-v"
+EXPECT_KEYS="ctrl-d,esc,ctrl-c,enter"
 KEY_DESCS="+:stage,-:unstage,alt-d:delete,alt-r:reset,alt-i:ignore,alt-v:vimdiff,ctrl-d:diff,ctrl-e:edit,del:unstage,insert:stage"
 
 print_diff() {
@@ -73,24 +77,16 @@ edit_file() {
     else
         lineno=1
     fi
-    echo "vim" > "${POST_COMMAND_FILE}"
-    echo "+${lineno}" >> "${POST_COMMAND_FILE}"
-    # git reports repo-relative paths, but the post command runs in the
-    # directory this script was started from, which may be a subdirectory.
-    echo "${GIT_DIR}/${path}" >> "${POST_COMMAND_FILE}"
-    cat "${POST_COMMAND_FILE}" | tr '\n' ' ' | sed -E 's/^/+ /g ; s/ $/\n/' 1>&2
+    # git reports repo-relative paths, but the picker may have been started in a
+    # subdirectory of the repo, so the editor gets an absolute one
+    vim "+${lineno}" "${GIT_DIR}/${path}"
 }
 
 vimdiff_file() {
     local path="${1}"; shift
     # git-diff handles the readonly side (HEAD version, or an empty file for
-    # untracked files). Pass an absolute path because the post command runs in
-    # the directory this script was started from, which may be a subdirectory.
-    echo "git-diff" > "${POST_COMMAND_FILE}"
-    echo "--vim" >> "${POST_COMMAND_FILE}"
-    echo "--path" >> "${POST_COMMAND_FILE}"
-    echo "${GIT_DIR}/${path}" >> "${POST_COMMAND_FILE}"
-    cat "${POST_COMMAND_FILE}" | tr '\n' ' ' | sed -E 's/^/+ /g ; s/ $/\n/' 1>&2
+    # untracked files)
+    git-diff --vim --path "${GIT_DIR}/${path}"
 }
 
 contains_path() {
@@ -260,7 +256,6 @@ PREVIEW_COMMAND+=' staged) '"${STAGED_DIFF_CMD}"' {3} ;;'
 PREVIEW_COMMAND+=' conflict) '"${CONFLICT_DIFF_CMD}"' {3} ;;'
 PREVIEW_COMMAND+='esac'
 
-POST_COMMAND_FILE="/tmp/${APP}-${id}.post_command"
 PREVIOUS_UPDATE_FILE="/tmp/${APP}-${id}.previous_update"
 
 if [ -n "${key_result}" ]; then
@@ -275,11 +270,11 @@ if [ -n "${key_result}" ]; then
             ;;
         ctrl-e)
             edit_file "${current_state}" "${path}"
-            exit 1
+            exit 0
             ;;
         alt-v)
             vimdiff_file "${path}"
-            exit 1
+            exit 0
             ;;
         alt-+|insert|+)
             stage_path="${path}"
@@ -326,7 +321,6 @@ if [ -n "${unstage_path}" ]; then
     fi
 fi
 if [ -n "${delete_path}" ]; then
-    echo "${delete_path}" 1>&2
     # if staged, unstage AND delete file; if not staged, delete file only
     if is_untracked "${delete_path}"; then
         (
@@ -412,28 +406,16 @@ columns="$(seq -s ',' 2 ${column_count})"
 
 case "${mode}" in
     list)
-        rm -f "${POST_COMMAND_FILE}"
         echo "${result}" | fzf-with-header --key-command "${APP} --id "${id}" --key" \
                                            --key-descriptions "${KEY_DESCS}" \
+                                           --reload-keys "${RELOAD_KEYS}" \
+                                           --exec-reload-keys "${EXEC_RELOAD_KEYS}" \
                                            --columns "${columns}" \
                                            --command "${APP} --id "${id}" --print ${paths[@]}" \
                                            "${query}" \
                                            --preview="${PREVIEW_COMMAND}" \
                                            --preview-window=right:70%,nowrap \
-                                           --expect="${KEYS}"
-        if [ -f "${POST_COMMAND_FILE}" ]; then
-            post_command="$(cat "${POST_COMMAND_FILE}")"
-            # first line is cmd, rest are args
-            rm -f "${POST_COMMAND_FILE}"
-            cmd="$(echo "${post_command}" | head -n 1)"
-            # read line by line into an array
-            readarray -t args < <(echo "${post_command}" | tail -n +2)
-            "${cmd}" "${args[@]}"
-
-            restart_args=()
-            [ -n "${query}" ] && restart_args+=(--query "${query}")
-            exec "${0}" "${restart_args[@]}" -- "${paths[@]}"
-        fi
+                                           --expect="${EXPECT_KEYS}"
         ;;
     print)
         echo "${result}"

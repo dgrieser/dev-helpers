@@ -22,11 +22,19 @@ C_RESET=$'\033[0m'
 SHOW_ARGS=(--format= -m --first-parent)
 
 LOG_HEADER=$'COMMIT\tAGE\tAUTHOR\tMESSAGE'
-LOG_KEYS="ctrl-c,ctrl-d,ctrl-o,alt-p,alt-r,alt-b,esc,enter"
+# a key that only looks at a commit stays in the picker: the pager gets the
+# terminal handed over, the browser is opened silently. The list is history, so
+# none of them reloads it. The rest ends the picker, either because it returns
+# something on stdout or because it leaves the working tree changed.
+LOG_KEYS="ctrl-c,alt-p,alt-r,alt-b,esc,enter"
+LOG_EXEC_KEYS="ctrl-d"
+LOG_SILENT_KEYS="ctrl-o"
 LOG_KEY_DESCS="enter:files,ctrl-c:copy hash,ctrl-d:diff,ctrl-o:open,alt-p:patch,alt-r:revert,alt-b:revert on branch"
 
 FILES_HEADER=$'STATUS\t+\t-\tPATH'
-FILES_KEYS="ctrl-c,ctrl-e,alt-v,alt-p,alt-r,esc,bspace,enter"
+FILES_KEYS="ctrl-c,alt-p,esc,bspace"
+FILES_EXEC_KEYS="enter,ctrl-e,alt-v"
+FILES_SILENT_KEYS="alt-r"
 FILES_KEY_DESCS="enter:diff,ctrl-c:copy path,ctrl-e:edit,alt-v:vimdiff,alt-p:patch,alt-r:revert file,esc:back,bspace:back"
 
 key_help() {
@@ -276,7 +284,8 @@ revert_file() {
     local short
 
     short="$(git rev-parse --short "${commit}")"
-    if ! git -C "${repo_root_dir}" show "${SHOW_ARGS[@]}" "${commit}" -- "${path}" \
+    # the git wrapper of this script forces color on, which apply cannot read
+    if ! git -C "${repo_root_dir}" show --no-color "${SHOW_ARGS[@]}" "${commit}" -- "${path}" \
         | git -C "${repo_root_dir}" apply -R -; then
         error "Reverting ${path} from ${short} did not apply cleanly."
         return 1
@@ -420,6 +429,8 @@ write_state() {
 pick_log() {
     fzf-with-header --key-command "${APP} --id ${id} --key" \
                     --key-descriptions "${LOG_KEY_DESCS}" \
+                    --exec-keys "${LOG_EXEC_KEYS}" \
+                    --silent-keys "${LOG_SILENT_KEYS}" \
                     --command "${APP} --id ${id} --print" \
                     "${query}" \
                     --preview="${APP} --id ${id} --preview {1}" \
@@ -431,6 +442,8 @@ pick_log() {
 pick_files() {
     fzf-with-header --key-command "${APP} --id ${id} --files-key" \
                     --key-descriptions "${FILES_KEY_DESCS}" \
+                    --exec-keys "${FILES_EXEC_KEYS}" \
+                    --silent-keys "${FILES_SILENT_KEYS}" \
                     --command "${APP} --id ${id} --files-print" \
                     --preview="${APP} --id ${id} --file-preview {}" \
                     --preview-window=right:70%,nowrap \
@@ -529,8 +542,9 @@ handle_files_key() {
             exit 1
             ;;
         alt-r)
+            # the picker stays, so several files can be reverted in a row
             revert_file "${path}"
-            exit 1
+            exit 0
             ;;
         *)
             fail "Unknown key: ${key}"

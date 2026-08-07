@@ -19,7 +19,16 @@ C_RESET=$'\033[0m'
 
 LIST_HEADER=$'ID\tSTATE\tUPDATED\tAUTHOR\tBRANCHES\tTITLE'
 
-LIST_KEYS="enter,esc,ctrl-q,ctrl-s,ctrl-d,ctrl-o,ctrl-y,ctrl-f,alt-a,alt-m,alt-i,alt-c,alt-x"
+# the picker stays open for everything but its main action and creating an issue,
+# both of which report something the picker would draw over: reading a detail
+# hands the terminal over to the pager, approving reports through the message
+# above the header, and the prompting actions get the terminal as well. Only the
+# actions that change an item reload the list, since a reload is an API call.
+LIST_KEYS="enter,esc,ctrl-q,alt-i"
+LIST_EXEC_KEYS="ctrl-s,ctrl-d,ctrl-f"
+LIST_SILENT_KEYS="ctrl-o,ctrl-y"
+LIST_RELOAD_KEYS="alt-a"
+LIST_EXEC_RELOAD_KEYS="alt-m,alt-c,alt-x"
 
 # an approval the provider refuses because the request is the user's own
 RC_SELF_APPROVE=3
@@ -1181,6 +1190,10 @@ list_key_descs() {
 pick_list() {
     fzf-with-header --key-command "${APP_NAME} --id ${id} --list-key" \
                     --key-descriptions "$(list_key_descs)" \
+                    --exec-keys "${LIST_EXEC_KEYS}" \
+                    --silent-keys "${LIST_SILENT_KEYS}" \
+                    --reload-keys "${LIST_RELOAD_KEYS}" \
+                    --exec-reload-keys "${LIST_EXEC_RELOAD_KEYS}" \
                     --command "${APP_NAME} --id ${id} --list-print" \
                     "${query}" \
                     --preview="${APP_NAME} --id ${id} --list-preview {1}" \

@@ -18,7 +18,14 @@ C_RESET=$'\033[0m'
 SHOW_ARGS=(--format= -m --first-parent)
 
 BLAME_HEADER=$'LVL\tAGE\tAUTHOR\tLINE\tCODE'
-BLAME_KEYS="ctrl-c,ctrl-s,ctrl-d,ctrl-l,ctrl-o,alt-v,alt-e,alt-p,esc,enter"
+# a key that only looks at the commit of a line stays in the picker without
+# reloading it: the pager and vimdiff get the terminal handed over, the browser
+# is opened silently. Editing writes the file the blame is of, so that one
+# reloads; the cursor is put back by the load binding of the picker.
+BLAME_KEYS="ctrl-c,alt-p,esc,enter"
+BLAME_EXEC_KEYS="ctrl-s,ctrl-d,ctrl-l,alt-v"
+BLAME_EXEC_RELOAD_KEYS="alt-e"
+BLAME_SILENT_KEYS="ctrl-o"
 BLAME_KEY_DESCS="enter:blame before,ctrl-s:show commit,ctrl-d:diff file,ctrl-l:line log,ctrl-c:copy hash,ctrl-o:open,alt-v:vimdiff,alt-e:edit,alt-p:patch"
 
 PICK_HEADER=$'PATH'
@@ -408,6 +415,9 @@ pick_blame() {
 
     fzf-with-header --key-command "${APP} --id ${id} --key" \
                     --key-descriptions "${descs}" \
+                    --exec-keys "${BLAME_EXEC_KEYS}" \
+                    --exec-reload-keys "${BLAME_EXEC_RELOAD_KEYS}" \
+                    --silent-keys "${BLAME_SILENT_KEYS}" \
                     --command "${APP} --id ${id} --print-up" \
                     "${query}" \
                     --preview="${APP} --id ${id} --preview {4}" \

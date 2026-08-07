@@ -38,6 +38,16 @@ git-activity-to-issue
 
 ### git-add
 Interactive fuzzy stager: stage/unstage/delete/reset/ignore files and resolve conflicts via picker.
+
+Every key but `ctrl-d` and `enter` acts inside the picker, so the screen is not torn
+down and rebuilt on every key press: staging, unstaging, deleting, resetting and
+ignoring reload the list in place, `ctrl-e` and `alt-v` hand the terminal to the
+editor or to vimdiff and come back to the same picker. The search query survives,
+so files can be worked through key press by key press, and the cursor returns to
+the first entry, which is where the sort puts whatever is next to act on. A refused
+action, such as staging a file whose conflict markers are still in it, is reported
+above the header until the next key press. `ctrl-d` prints the diff and `enter` the
+selected path, so both end the picker.
 ```bash
 git-add [-p] [<path>...] [-s <path>] [-u <path>] [-d <path>] [-r <path>] [-i <path>] [-q <query>]
 ```
@@ -62,6 +72,12 @@ of that single line (`git log -L`), `ctrl-c` copies the hash, `ctrl-o` opens the
 commit in the browser, `alt-v` opens the file before and after the commit in
 vimdiff, `alt-e` opens the file in the editor at that line, and `alt-p` writes
 the commit's diff for the file as a patch.
+
+All of those but the two that return something on stdout - copying the hash and
+writing a patch - act inside the picker: the pager, vimdiff and the editor get the
+terminal handed over and come back to the same picker, and the browser is opened
+without touching the screen. Only the editor reloads the blame afterwards, since
+it is the only one that writes the file the blame is of.
 ```bash
 git-blame [--print] [-q <query>] [-r <ref>] [-L <range>] [-w] [-M] [-C] \
           [--ignore-rev <rev>] [--ignore-revs-file <file>] [-o <dir>] \
@@ -233,10 +249,19 @@ optionally pushes it and opens a merge/pull request.
 
 `enter` steps into a commit and opens a file picker with the changed files
 plus their churn on the left and the diff of the selected file in the preview:
-`enter` shows the file diff, `ctrl-c` copies the path, `alt-v` opens the before
-and after version in vimdiff, `alt-p` writes the file's diff as a patch, and
-`alt-r` reverts just that file's change. `esc` and `backspace` return to the
-commit list. Merge commits are shown against their first parent.
+`enter` shows the file diff, `ctrl-c` copies the path, `ctrl-e` opens the file in
+the editor, `alt-v` opens the before and after version in vimdiff, `alt-p` writes
+the file's diff as a patch, and `alt-r` reverts just that file's change. `esc` and
+`backspace` return to the commit list. Merge commits are shown against their first
+parent.
+
+Reading a commit or a file acts inside the picker instead of ending it: the pager,
+the editor and vimdiff get the terminal handed over and come back to the same
+picker, the browser is opened without touching the screen at all, and reverting a
+single file stays in the file picker and reports what it did above the header, so
+several files can be reverted in a row. The keys that return something on stdout -
+copying a hash or a path, writing a patch - and the ones that leave the working
+tree changed still end the picker.
 ```bash
 git-log [--print] [-q <query>] [-n <count>] [--ref <rev>] [--all] \
         [--author <pattern>] [--grep <pattern>] [--merges|--no-merges] \
@@ -266,6 +291,13 @@ shows the request, `ctrl-d` its diff, `ctrl-o` opens it in the browser,
 approves, `alt-m` merges, `alt-i` creates an issue from it, `alt-c` closes it,
 `alt-x` deletes it, and `esc` goes back.
 
+All of those but the chosen action and creating an issue - both of which report
+something the picker would draw over - act inside the picker: showing the request,
+its diff or its feedback hands the terminal to the pager, opening the browser and
+copying the message keep the screen and report above the header, and approving,
+merging, closing and deleting reload the list so the new state shows. Only those
+four reload, since a reload is an API call.
+
 By default the requests of the current branch are listed; on the default or
 production branch (`--prod-branch`) requests are filtered by their target
 branch instead. `--feedback` prints the comments and review feedback as
@@ -293,7 +325,7 @@ Show GitLab CI or GitHub Actions pipeline status for a ref, or search pipelines 
 
 Alongside the pipelines of the selected ref, the pipelines of the 3 most recent tags are shown (`--tags <N>` changes the number of tags, `--no-tags` turns them off). Each tag costs one API request, so a large `N` makes the lookup - and every `--watch` reload - slower.
 
-Results open in an interactive picker with the pipeline's jobs in the preview: `enter` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs. The picker reloads once 10 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. A manual refresh (`ctrl-r`) refetches even after that, and if it brings up a running pipeline the auto-reloading resumes. Use `-p` or `-o json` for non-interactive output.
+Results open in an interactive picker with the pipeline's jobs in the preview: `enter` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs. Opening the browser and paging the logs happen inside the picker - the log pager gets the terminal handed over and returns to the same picker - so only `enter` ends it. The picker reloads once 10 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. A manual refresh (`ctrl-r`) refetches even after that, and if it brings up a running pipeline the auto-reloading resumes. Use `-p` or `-o json` for non-interactive output.
 ```bash
 git-pipe status [-r <project>] [--ref <ref>] [--tags <N>|--no-tags] [-q <query>] [-w <seconds>] \
                 [-p] [-o txt|json]

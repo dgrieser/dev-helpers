@@ -14,7 +14,11 @@ TAG_PER_PAGE=20
 
 NL=$'\n'
 HEADER="ID  STATUS  SOURCE  REF  CREATED  URL"
-KEYS="ctrl-o,ctrl-l,esc,ctrl-c,ctrl-d,enter"
+# both actions leave the pipeline list alone, so neither reloads it: the log
+# pager gets the terminal handed over, the browser is opened silently
+KEYS="esc,ctrl-c,ctrl-d,enter"
+EXEC_KEYS="ctrl-l"
+SILENT_KEYS="ctrl-o"
 KEY_DESCS="enter:copy url,ctrl-o:open,ctrl-l:logs"
 KEY_DESCS_HELP="enter copy url, ctrl-o open, ctrl-l logs"
 
@@ -577,6 +581,8 @@ pick_pipelines() {
 
     fzf-with-header --key-command "${APP_NAME} --id ${id} --key" \
                     --key-descriptions "${KEY_DESCS}" \
+                    --exec-keys "${EXEC_KEYS}" \
+                    --silent-keys "${SILENT_KEYS}" \
                     --columns 1,2,3,4,5 \
                     --command "${APP_NAME} --id ${id} --print" \
                     "${watch_args[@]}" \
