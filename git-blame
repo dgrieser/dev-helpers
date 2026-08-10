@@ -187,14 +187,16 @@ print_blame() {
 
     shas="$(awk -F'\t' '{ print $1 }' <<< "${lines}" | grep -v "^0*$" | sort -u)"
     if [ -n "${shas}" ]; then
+        # --min keeps the age column filled for a commit of this second, toage
+        # colors it as well
         ages="$(git_repo log --no-walk --stdin --format='%H%x09%cI%x09%al' \
-                    <<< "${shas}" 2>/dev/null | toage)"
+                    <<< "${shas}" 2>/dev/null | toage --min 1s --color "${C_AGE}")"
     else
         ages=""
     fi
 
     rows="$(awk -F'\t' -v OFS='\t' -v lvl="${level}" -v clevel="${C_LEVEL}" \
-                -v cbound="${C_BOUND}" -v cage="${C_AGE}" -v cauthor="${C_AUTHOR}" \
+                -v cbound="${C_BOUND}" -v cauthor="${C_AUTHOR}" \
                 -v cline="${C_LINE}" -v cdim="${C_DIM}" -v reset="${C_RESET}" '
             NR == FNR { age[$1] = $2; author[$1] = $3; next }
             {
@@ -211,7 +213,6 @@ print_blame() {
                     known = (s in age)
                     a = (known ? age[s] : "-")
                     au = (known ? author[s] : "-")
-                    if (a == "") a = "0s"
                     if (au == "") au = "-"
                     # a line that is not committed yet has no commit to step
                     # into either, its whole row is dimmed
@@ -223,7 +224,7 @@ print_blame() {
                     }
                     printf "%s\t%s\t%s\t%s\t%s\n",
                         clevel lvl reset (bnd[i] ? cbound "^" reset : ""),
-                        cage a reset,
+                        a,
                         cauthor au reset,
                         cline sprintf("%*s", w, lineno[i]) reset,
                         code[i]

@@ -181,9 +181,9 @@ print_log() {
 
     rows="$(git log --pretty=format:"%h%x09%cI%x09%al%x09%D%x09%s" \
                 "${log_args[@]}" -- "${paths[@]}" 2>/dev/null \
-        | toage \
+        | toage --color "${C_AGE}" \
         | awk -F'\t' -v OFS='\t' -v crefs="${C_REFS}" -v chash="${C_HASH}" \
-              -v cage="${C_AGE}" -v cauthor="${C_AUTHOR}" -v reset="${C_RESET}" \
+              -v cauthor="${C_AUTHOR}" -v reset="${C_RESET}" \
               -v picker="${picker}" -v amax="${AUTHOR_MAX}" '
             {
                 author = $3
@@ -197,10 +197,11 @@ print_log() {
                 for (i = 6; i <= NF; i++) msg = msg " " $i
                 gsub(/[ \t]+/, " ", msg)
                 if ($4 != "") msg = crefs "(" $4 ")" reset " " msg
+                # the age comes colored out of toage
                 if (picker)
-                    print cage $2 reset, cauthor author reset, msg, chash $1 reset
+                    print $2, cauthor author reset, msg, chash $1 reset
                 else
-                    print chash $1 reset, cage $2 reset, cauthor author reset, msg
+                    print chash $1 reset, $2, cauthor author reset, msg
             }')"
 
     if [ -z "${rows}" ]; then
