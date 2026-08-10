@@ -73,6 +73,10 @@ EOF
     exit 1
 }
 
+log() {
+    echo "${1}" 1>&2
+}
+
 error() {
     echo "ERROR: ${1}" 1>&2
 }
@@ -873,7 +877,7 @@ exit_code=0
 if [ "${output}" = "json" ]; then
     echo "${pipelines}"
 elif [ "${pipeline_count}" -eq 0 ]; then
-    warning "no pipelines found"
+    log "No pipelines."
 elif [ "${mode}" = "print" ] || [ ! -t 1 ]; then
     need_cmd k-format
     print_pipelines "${pipelines}"
