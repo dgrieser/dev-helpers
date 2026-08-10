@@ -26,6 +26,8 @@ C_RESET=$'\033[0m'
 SHOW_ARGS=(--format= -m --first-parent)
 
 LOG_HEADER=$'COMMIT\tAGE\tAUTHOR\tMESSAGE'
+# the picker carries the hash as the last column instead, see print_log
+LOG_PICKER_HEADER=$'AGE\tAUTHOR\tMESSAGE\tCOMMIT'
 # a key that only looks at a commit stays in the picker: the pager gets the
 # terminal handed over, the browser is opened silently. The list is history, so
 # none of them reloads it. The rest ends the picker, either because it returns
@@ -49,8 +51,9 @@ usage() {
     cat <<EOF 1>&2
 usage: ${APP} [OPTIONS] [--] [<path> ...]
 
-Interactive git log picker. Commits are listed as COMMIT / AGE / AUTHOR /
-MESSAGE and the preview shows the commit with its stat and patch.
+Interactive git log picker. Commits are listed as AGE / AUTHOR / MESSAGE and
+the preview shows the commit with its stat and patch. The commit hash is not
+shown, but the search query still matches it.
 
 Keys:
 $(key_help "${LOG_KEY_DESCS}")
@@ -120,10 +123,12 @@ pager() {
 
 # pad tab separated columns, ANSI aware, so colored cells still line up; the
 # last column stays unpadded and the two space separator doubles as the column
-# delimiter of the picker
+# delimiter of the picker. The optional argument is a comma separated list of
+# minimum widths, one per column, so a column can be padded past its content.
 render_table() {
-    awk -F'\t' '
+    awk -F'\t' -v minw="${1}" '
         function vlen(s) { gsub(/\033\[[0-9;]*m/, "", s); return length(s) }
+        BEGIN { n = split(minw, mw, ","); for (i = 1; i <= n; i++) w[i] = mw[i] + 0 }
         { rows[NR] = $0
           for (i = 1; i <= NF; i++) { l = vlen($i); if (l > w[i]) w[i] = l } }
         END {
@@ -153,18 +158,36 @@ resolve_commit() {
     printf '%s\n' "${rev}"
 }
 
+term_cols() {
+    local cols
+
+    cols="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)"
+    [ -z "${cols}" ] && cols="$(tput cols 2>/dev/null)"
+    [ -z "${cols}" ] && cols="${COLUMNS:-200}"
+    printf '%s\n' "${cols}"
+}
+
+# the picker moves the hash to the last column and pads the message past the
+# width of the terminal, so the hash sits beyond the right edge of the list:
+# fzf still matches it and hands it to the preview and the key command, it only
+# takes no screen space (--no-hscroll keeps it out there while a hash is typed)
 print_log() {
-    local rows shorten="${1:-0}"
+    local rows header="${LOG_HEADER}" picker="${1:-0}" minw=""
+
+    if [ "${picker}" -eq 1 ]; then
+        header="${LOG_PICKER_HEADER}"
+        minw=",,$(term_cols)"
+    fi
 
     rows="$(git log --pretty=format:"%h%x09%cI%x09%al%x09%D%x09%s" \
                 "${log_args[@]}" -- "${paths[@]}" 2>/dev/null \
         | toage \
         | awk -F'\t' -v OFS='\t' -v crefs="${C_REFS}" -v chash="${C_HASH}" \
               -v cage="${C_AGE}" -v cauthor="${C_AUTHOR}" -v reset="${C_RESET}" \
-              -v shorten="${shorten}" -v amax="${AUTHOR_MAX}" '
+              -v picker="${picker}" -v amax="${AUTHOR_MAX}" '
             {
                 author = $3
-                if (shorten) {
+                if (picker) {
                     # the noreply addresses of GitHub and GitLab carry the
                     # numeric account id in front of the user name
                     sub(/^[0-9]+\+/, "", author)
@@ -174,14 +197,17 @@ print_log() {
                 for (i = 6; i <= NF; i++) msg = msg " " $i
                 gsub(/[ \t]+/, " ", msg)
                 if ($4 != "") msg = crefs "(" $4 ")" reset " " msg
-                print chash $1 reset, cage $2 reset, cauthor author reset, msg
+                if (picker)
+                    print cage $2 reset, cauthor author reset, msg, chash $1 reset
+                else
+                    print chash $1 reset, cage $2 reset, cauthor author reset, msg
             }')"
 
     if [ -z "${rows}" ]; then
-        printf '%s\n' "${LOG_HEADER}" | render_table
+        printf '%s\n' "${header}" | render_table "${minw}"
         return 0
     fi
-    printf '%s\n' "${LOG_HEADER}${NL}${rows}" | render_table
+    printf '%s\n' "${header}${NL}${rows}" | render_table "${minw}"
 }
 
 print_files() {
@@ -445,9 +471,11 @@ pick_log() {
                     --silent-keys "${LOG_SILENT_KEYS}" \
                     --command "${APP} --id ${id} --print" \
                     "${query}" \
-                    --preview="${APP} --id ${id} --preview {1}" \
+                    --preview="${APP} --id ${id} --preview {-1}" \
                     --preview-window=right:60%,nowrap \
                     --expect="${LOG_KEYS}" \
+                    --no-hscroll \
+                    --ellipsis= \
                     --no-sort
 }
 
@@ -468,7 +496,9 @@ handle_log_key() {
 
     key="$(head -n 1 <<< "${key_result}")"
     line="$(sed -n '2p' <<< "${key_result}")"
-    rev="$(awk '{print $1}' <<< "${line}")"
+    # the hash is the last column of the commit list, behind the padding that
+    # keeps it off the screen
+    rev="$(awk '{print $NF}' <<< "${line}")"
 
     case "${key}" in
         esc)
@@ -485,7 +515,8 @@ handle_log_key() {
             exit 1
             ;;
         ctrl-c)
-            printf '%s\n' "${line}"
+            # without the padding that hides the hash in the picker
+            sed 's/   */  /g' <<< "${line}"
             need_cmd clip
             printf '%s' "${rev}" | clip
             exit 1
@@ -689,7 +720,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
     case "${mode}" in
         print)
             # only the picker reaches this, so this is where the author is
-            # shortened
+            # shortened and the hash is moved out of the view
             print_log 1
             exit 0
             ;;
