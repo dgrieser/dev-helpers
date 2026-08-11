@@ -30,7 +30,8 @@ LIST_SILENT_KEYS="ctrl-o,ctrl-y"
 LIST_RELOAD_KEYS="alt-a"
 LIST_EXEC_RELOAD_KEYS="alt-m,alt-c,alt-x"
 
-# an approval the provider refuses because the request is the user's own
+# an approval the provider refuses although the token is valid, because the
+# request is the user's own or the approval rights are missing
 RC_SELF_APPROVE=3
 
 JQ_STATE_COLOR='
@@ -104,10 +105,10 @@ preview:
 
 $(key_help "enter:the chosen action (approve + merge by default),ctrl-s:show the request,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the feedback,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
-When the provider refuses the approval because the request is your own, the
-approve + merge action asks whether to merge it without that approval (on
-GitHub bypassing the branch protection rules with --admin, which needs the
-permission to do so).
+When the provider refuses the approval, because the request is your own or the
+approval rights are missing, the approve + merge action asks whether to merge it
+without that approval (on GitHub bypassing the branch protection rules with
+--admin, which needs the permission to do so).
 
 Actions:
   -c, --create            create a request from the current branch
@@ -543,6 +544,25 @@ copy_message() {
     echo "Channel message for $(item_ref "${n}") copied to clipboard." 1>&2
 }
 
+# the account the token belongs to; a valid token is what tells a refused
+# approval apart from an expired one
+current_user() {
+    local user
+
+    if [ -n "${current_user_name}" ]; then
+        printf '%s\n' "${current_user_name}"
+        return 0
+    fi
+    if [ "${provider}" = "github" ]; then
+        user="$(gh api "${github_api_args[@]}" user --jq '.login' 2>/dev/null)" || return 1
+    else
+        user="$(glab api user 2>/dev/null | jq -r '.username // empty')" || return 1
+    fi
+    [ -z "${user}" ] && return 1
+    current_user_name="${user}"
+    printf '%s\n' "${user}"
+}
+
 approve_item() {
     local n="${1}"
     local out rc=0
@@ -552,14 +572,29 @@ approve_item() {
     else
         out="$(glab mr approve "${n}" 2>&1)" || rc=1
     fi
-    [ -n "${out}" ] && printf '%s\n' "${out}" 1>&2
-    [ "${rc}" -eq 0 ] && return 0
+    if [ "${rc}" -eq 0 ]; then
+        [ -n "${out}" ] && printf '%s\n' "${out}" 1>&2
+        return 0
+    fi
     # both providers refuse a self approval; the merge itself may still be
     # allowed, so that case gets its own return code
     if grep -qiE "approve (your|their) own|own (pull|merge) request" <<< "${out}"; then
         error "Cannot approve your own $(item_ref "${n}")"
         return "${RC_SELF_APPROVE}"
     fi
+    # GitLab answers an approval it does not allow, a self approval among them,
+    # with a bare 401, which reads like an expired token. Asking for the current
+    # user tells both apart, since an expired token fails that call as well. The
+    # raw provider output only shows up for a failure that stays unexplained.
+    if grep -qE '\b40[13]\b|Unauthorized|Forbidden' <<< "${out}"; then
+        if current_user >/dev/null 2>&1; then
+            error "Cannot approve $(item_ref "${n}"): ${remote_host} refused the approval, it is either your own ${NOUN} or you may not approve it"
+            return "${RC_SELF_APPROVE}"
+        fi
+        error "Failed to approve $(item_ref "${n}"): the ${remote_host} token is not valid"
+        return 1
+    fi
+    [ -n "${out}" ] && printf '%s\n' "${out}" 1>&2
     error "Failed to approve $(item_ref "${n}")"
     return 1
 }
@@ -1235,6 +1270,7 @@ all=0
 branch=""
 branch_mode="source"
 checkout=0
+current_user_name=""
 github_api_args=()
 github_repository=""
 github_repo_selector=""

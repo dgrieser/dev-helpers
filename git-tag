@@ -174,13 +174,5 @@ if [ "${create}" -eq 1 ]; then
     git-color tag -f "${tag}" "${commit}" && git-color push origin "${fq_tag}"
     [ $? -ne 0 ] && abort
 
-    url=$(git config --get remote.origin.url)
-    [[ "${url}" =~ "github.com" ]] && exit 0
-
-    sleep 2
-    echo
-    ci_count=$(glab ci list -F json | jq 'length' 2>/dev/null | sed 's/^$/0/')
-    if [ "${ci_count}" -gt 0 ]; then
-        glab ci status -l -b "${tag}" || true
-    fi
+    git-pipe status
 fi
