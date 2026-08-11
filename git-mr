@@ -587,11 +587,11 @@ merge_without_approval() {
     local n="${1}"
 
     if [ "${provider}" = "github" ]; then
-        prompt-no-yes "Merge $(item_ref "${n}") anyway, bypassing the branch protection rules (--admin)?" \
+        prompt-no-yes "Merge '$(item_ref "${n}")' anyway, bypassing the branch protection rules (--admin)?" \
             || { echo "Abort." 1>&2; return 2; }
         merge_item "${n}" 1
     else
-        prompt-no-yes "Merge $(item_ref "${n}") anyway, without an approval?" \
+        prompt-no-yes "Merge '$(item_ref "${n}")' anyway, without an approval?" \
             || { echo "Abort." 1>&2; return 2; }
         merge_item "${n}"
     fi
@@ -657,7 +657,7 @@ ask_delete_source_branch() {
     default="$(git-default 2>/dev/null)"
     [ "${source_branch}" = "${default}" ] && return 0
     [ -n "${prod_branch}" ] && [ "${source_branch}" = "${prod_branch}" ] && return 0
-    prompt-no-yes "Delete branch ${source_branch} locally and on ${remote_host}?" || return 0
+    prompt-no-yes "Delete branch '${source_branch}' locally and on '${remote_host}'?" || return 0
     delete_source_branch "${source_branch}"
 }
 
@@ -669,7 +669,7 @@ close_item() {
     [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
     print_item_summary "${json}"
     echo 1>&2
-    prompt-no-yes "Close $(item_ref "${n}")?" || { echo "Abort." 1>&2; return 2; }
+    prompt-no-yes "Close '$(item_ref "${n}")'?" || { echo "Abort." 1>&2; return 2; }
     # gh could delete the branch with --delete-branch, but the branch is asked
     # for afterwards so both providers behave the same
     if [ "${provider}" = "github" ]; then
@@ -694,8 +694,8 @@ delete_item() {
     print_item_summary "${json}"
     echo 1>&2
     warning "Deleting a ${NOUN} can not be undone"
-    prompt-no-yes "Delete $(item_ref "${n}")?" || { echo "Abort." 1>&2; return 2; }
-    glab mr delete "${n}" || { error "Failed to delete $(item_ref "${n}")"; return 1; }
+    prompt-no-yes "Delete '$(item_ref "${n}")'?" || { echo "Abort." 1>&2; return 2; }
+    glab mr delete "${n}" || { error "Failed to delete '$(item_ref "${n}")'"; return 1; }
     ask_delete_source_branch "${json}"
 }
 
@@ -941,7 +941,7 @@ create_request() {
         gh pr create "${create_args[@]}" || fail "Failed to create the ${NOUN}"
     else
         if [ "${source_branch}" != "${default_branch}" ]; then
-            prompt-no-yes "Keep source branch ${source_branch}?" || keep_source_branch=0
+            prompt-no-yes "Keep source branch '${source_branch}'?" || keep_source_branch=0
         fi
         prompt-no-yes "Squash before merge?" && squash_before_merge=1
         create_args=("--source-branch" "${source_branch}" "--target-branch" "${target_branch}"
