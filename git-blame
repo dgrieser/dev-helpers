@@ -17,6 +17,11 @@ C_RESET=$'\033[0m'
 
 SHOW_ARGS=(--format= -m --first-parent)
 
+# the footer leads with the file the blame is of; it takes its room out of the
+# first footer line, so a long path is shortened from the left, where the
+# telling part of a path is not
+FOOTER_MAX=40
+
 BLAME_HEADER=$'LVL\tAGE\tAUTHOR\tLINE\tCODE'
 # a key that only looks at the commit of a line stays in the picker without
 # reloading it: the pager and vimdiff get the terminal handed over, the browser
@@ -249,6 +254,25 @@ print_paths() {
     printf '%s\n' "${PICK_HEADER}${NL}${rows}"
 }
 
+# The blame names the file it is of on none of its rows, and a nested level not
+# even the revision it went back to - the level column only counts how deep it
+# went. Both lead the footer instead.
+print_footer() {
+    local text="${path}"
+
+    [ "${#text}" -gt "${FOOTER_MAX}" ] && text="…${text: -$(( FOOTER_MAX - 1 ))}"
+    printf '%s' "${text}"
+    [ -n "${ref}" ] && printf ' %s@%s%s' "${C_LEVEL}" \
+        "$(git_repo rev-parse --short "${ref}" 2>/dev/null)" "${C_RESET}"
+    printf '\n'
+}
+
+# the file picker lists the files of a revision without naming it
+print_pick_footer() {
+    [ -z "${ref}" ] && return 0
+    printf '%s@%s%s\n' "${C_LEVEL}" "$(git_repo rev-parse --short "${ref}" 2>/dev/null)" "${C_RESET}"
+}
+
 preview_line() {
     local sha file
 
@@ -420,6 +444,7 @@ pick_blame() {
                     --exec-reload-keys "${BLAME_EXEC_RELOAD_KEYS}" \
                     --silent-keys "${BLAME_SILENT_KEYS}" \
                     --command "${APP} --id ${id} --print-up" \
+                    --footer-prefix "${APP} --id ${id} --footer" \
                     "${query}" \
                     --preview="${APP} --id ${id} --preview {4}" \
                     --preview-window=right:60%,nowrap \
@@ -429,9 +454,16 @@ pick_blame() {
 }
 
 pick_path() {
+    local footer_args=()
+
+    # the files of the working tree need no revision named
+    [ -n "${ref}" ] \
+        && footer_args=(--footer-prefix "${APP} --id ${id} --pick-footer")
+
     fzf-with-header --key-command "${APP} --id ${id} --pick-key" \
                     --key-descriptions "${PICK_KEY_DESCS}" \
                     --command "${APP} --id ${id} --pick-print" \
+                    "${footer_args[@]}" \
                     "${query}" \
                     --preview="${APP} --id ${id} --pick-preview {1}" \
                     --preview-window=right:60%,nowrap \
@@ -573,6 +605,12 @@ while [ "${#}" -gt 0 ]; do
         --pick-print)
             mode="pick-print"
             ;;
+        --footer)
+            mode="footer"
+            ;;
+        --pick-footer)
+            mode="pick-footer"
+            ;;
         --preview)
             shift
             [ -z "${1}" ] && fail "Missing argument for preview"
@@ -679,6 +717,14 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
             print_paths
             exit 0
             ;;
+        footer)
+            print_footer
+            exit 0
+            ;;
+        pick-footer)
+            print_pick_footer
+            exit 0
+            ;;
         preview)
             preview_line "${preview_arg}"
             exit 0
@@ -697,7 +743,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
 fi
 
 case "${mode}" in
-    print-up|pick-print|preview|pick-preview|key|pick-key)
+    print-up|pick-print|footer|pick-footer|preview|pick-preview|key|pick-key)
         fail "No state for id ${id}"
         ;;
     print)

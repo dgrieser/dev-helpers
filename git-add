@@ -354,70 +354,78 @@ fi
 
 [ "${mode}" == "update" ] && exit 0
 
-previous_update=""
-if [ -f "${PREVIOUS_UPDATE_FILE}" ]; then
-    previous_update=$(cat "${PREVIOUS_UPDATE_FILE}" | head -n 1)
-    rm -f "${PREVIOUS_UPDATE_FILE}"
-fi
+# the state after the last change decides which end of the list the cursor
+# starts on: after staging the unstaged changes stay next to it, after anything
+# else the staged ones do, so the same key can be pressed again
+print_changes() {
+    local previous_update="" f key color
+    local sort_args=("-t" $'\t')
+    local -A STATUS
+    local CONFLICT=() UNTRACKED=() UNSTAGED=() STAGED=()
 
-mapfile -d '' -t CONFLICT  < <(list_conflict)
-mapfile -d '' -t UNTRACKED < <(list_untracked)
-mapfile -d '' -t UNSTAGED  < <(list_unstaged)
-mapfile -d '' -t STAGED    < <(list_staged)
+    if [ -f "${PREVIOUS_UPDATE_FILE}" ]; then
+        previous_update="$(head -n 1 "${PREVIOUS_UPDATE_FILE}")"
+        rm -f "${PREVIOUS_UPDATE_FILE}"
+    fi
 
-declare -A STATUS
+    mapfile -d '' -t CONFLICT  < <(list_conflict)
+    mapfile -d '' -t UNTRACKED < <(list_untracked)
+    mapfile -d '' -t UNSTAGED  < <(list_unstaged)
+    mapfile -d '' -t STAGED    < <(list_staged)
 
-for f in "${CONFLICT[@]}"; do
-  STATUS["${f}"]="conflict"
-done
-for f in "${UNTRACKED[@]}"; do
-  [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="untracked"
-done
-for f in "${UNSTAGED[@]}"; do
-  [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="unstaged"
-done
-for f in "${STAGED[@]}"; do
-  [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="staged"
-done
+    for f in "${CONFLICT[@]}"; do
+      STATUS["${f}"]="conflict"
+    done
+    for f in "${UNTRACKED[@]}"; do
+      [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="untracked"
+    done
+    for f in "${UNSTAGED[@]}"; do
+      [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="unstaged"
+    done
+    for f in "${STAGED[@]}"; do
+      [[ -n "${STATUS["${f}"]}" ]] || STATUS["${f}"]="staged"
+    done
 
-sort_args=("-t" $'\t')
-if [ -z "$previous_update" ] || [ "${previous_update}" == "stage" ]; then
-    sort_args+=("-k1,1nr")
-else
-    sort_args+=("-k1,1n")
-fi
-sort_args+=("-k3,3")
+    if [ -z "${previous_update}" ] || [ "${previous_update}" == "stage" ]; then
+        sort_args+=("-k1,1nr")
+    else
+        sort_args+=("-k1,1n")
+    fi
+    sort_args+=("-k3,3")
 
-content=$(
-  for f in "${!STATUS[@]}"; do
-    case "${STATUS[${f}]}" in
-      conflict)  key=4; color="${MAGENTA}";;
-      unstaged)  key=3; color="${YELLOW}";;
-      untracked) key=2; color="${RED}";;
-      staged)    key=1; color="${GREEN}";;
-    esac
-    printf "%s\t%b%s%b\t%b%s%b\n" "${key}" "${color}" "${STATUS[${f}]}" "${NC}" "${color}" "${f}" "${NC}"
-  done | sort "${sort_args[@]}"
-)
+    {
+        printf '%b\n' "${HEADER}"
+        for f in "${!STATUS[@]}"; do
+          case "${STATUS[${f}]}" in
+            conflict)  key=4; color="${MAGENTA}";;
+            unstaged)  key=3; color="${YELLOW}";;
+            untracked) key=2; color="${RED}";;
+            staged)    key=1; color="${GREEN}";;
+          esac
+          printf "%s\t%b%s%b\t%b%s%b\n" "${key}" "${color}" "${STATUS[${f}]}" "${NC}" "${color}" "${f}" "${NC}"
+        done | sort "${sort_args[@]}"
+    } | column -t -s $'\t'
+}
 
-result="$(echo -e "${HEADER}\n${content}" | column -t -s $'\t')"
 column_count=$(echo -e "${HEADER}" | tr $'\t' $'\n' | wc -l)
 columns="$(seq -s ',' 2 ${column_count})"
 
 case "${mode}" in
     list)
-        echo "${result}" | fzf-with-header --key-command "${APP} --id "${id}" --key" \
-                                           --key-descriptions "${KEY_DESCS}" \
-                                           --reload-keys "${RELOAD_KEYS}" \
-                                           --exec-reload-keys "${EXEC_RELOAD_KEYS}" \
-                                           --columns "${columns}" \
-                                           --command "${APP} --id "${id}" --print ${paths[@]}" \
-                                           "${query}" \
-                                           --preview="${PREVIEW_COMMAND}" \
-                                           --preview-window=right:70%,nowrap \
-                                           --expect="${EXPECT_KEYS}"
+        # the list comes from --print, which fzf runs itself once the picker is
+        # open, so building it here as well would only hold the picker back
+        fzf-with-header --key-command "${APP} --id "${id}" --key" \
+                        --key-descriptions "${KEY_DESCS}" \
+                        --reload-keys "${RELOAD_KEYS}" \
+                        --exec-reload-keys "${EXEC_RELOAD_KEYS}" \
+                        --columns "${columns}" \
+                        --command "${APP} --id "${id}" --print ${paths[@]}" \
+                        "${query}" \
+                        --preview="${PREVIEW_COMMAND}" \
+                        --preview-window=right:70%,nowrap \
+                        --expect="${EXPECT_KEYS}"
         ;;
     print)
-        echo "${result}"
+        print_changes
         ;;
 esac

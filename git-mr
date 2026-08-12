@@ -1053,6 +1053,14 @@ state_filter_label() {
     fi
 }
 
+# the context printed before the picker opened is gone from the screen while it
+# runs, so the two filters that decide what the list holds lead its footer
+list_footer() {
+    printf '%s%s%s · %s%s%s\n' \
+        "${C_BRANCH}" "$(branch_filter_label)" "${C_RESET}" \
+        "${C_LABEL}" "$(state_filter_label)" "${C_RESET}"
+}
+
 # the rows of the action menu; prompt-select colors the list itself, so the
 # rows stay plain and only the columns are padded
 menu_items() {
@@ -1230,6 +1238,7 @@ pick_list() {
                     --reload-keys "${LIST_RELOAD_KEYS}" \
                     --exec-reload-keys "${LIST_EXEC_RELOAD_KEYS}" \
                     --command "${APP_NAME} --id ${id} --list-print" \
+                    --footer-prefix "${APP_NAME} --id ${id} --list-footer" \
                     "${query}" \
                     --preview="${APP_NAME} --id ${id} --list-preview {1}" \
                     --preview-window=right:60%,nowrap \
@@ -1374,6 +1383,9 @@ while [ "${#}" -gt 0 ]; do
         --list-print)
             mode="list-print"
             ;;
+        --list-footer)
+            mode="list-footer"
+            ;;
         --list-preview)
             mode="list-preview"
             shift
@@ -1417,6 +1429,10 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
             list_print
             exit 0
             ;;
+        list-footer)
+            list_footer
+            exit 0
+            ;;
         list-preview)
             preview_item "${preview_arg}"
             exit 0
@@ -1428,7 +1444,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
 fi
 
 case "${mode}" in
-    list-print|list-preview|list-key)
+    list-print|list-footer|list-preview|list-key)
         fail "No state for id ${id}"
         ;;
 esac

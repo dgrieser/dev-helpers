@@ -13,6 +13,8 @@ TAG_LIMIT_DEFAULT=3
 TAG_PER_PAGE=20
 
 NL=$'\n'
+C_FILTER=$'\033[38;5;208m'
+C_RESET=$'\033[0m'
 HEADER="ID  STATUS  SOURCE  REF  CREATED  URL"
 # both actions leave the pipeline list alone, so neither reloads it: the log
 # pager gets the terminal handed over, the browser is opened silently
@@ -396,6 +398,22 @@ print_table() {
     printf '%s\n' "${header}${NL}${rows}" | k-format
 }
 
+# The ref, the source and the status of a pipeline are columns of the list, so
+# filtering by them is on the screen already. --grep and --var are not: they
+# drop pipelines with nothing saying why the list is as short as it is, so they
+# lead the footer.
+print_footer() {
+    local text=""
+
+    [ -n "${grep_pattern}" ] && text="grep ${grep_pattern}"
+    if [ "${#var_specs[@]}" -gt 0 ]; then
+        [ -n "${text}" ] && text="${text} · "
+        text="${text}var ${var_specs[*]}"
+    fi
+    [ -z "${text}" ] && return 0
+    printf '%s%s%s\n' "${C_FILTER}" "${text}" "${C_RESET}"
+}
+
 print_pipelines() {
     local json="${1}"
     local rows
@@ -571,7 +589,11 @@ has_active_pipelines() {
 }
 
 pick_pipelines() {
-    local watch_args=() refresh_bind=()
+    local watch_args=() refresh_bind=() footer_args=()
+
+    # a list nothing was silently dropped from has nothing to name
+    { [ -n "${grep_pattern}" ] || [ "${#var_specs[@]}" -gt 0 ]; } \
+        && footer_args=(--footer-prefix "${APP_NAME} --id ${id} --footer")
 
     if [ "${refresh}" -eq 1 ]; then
         # reload once shortly after the picker opened - a pipeline may have
@@ -589,6 +611,7 @@ pick_pipelines() {
                     --silent-keys "${SILENT_KEYS}" \
                     --columns 1,2,3,4,5 \
                     --command "${APP_NAME} --id ${id} --print" \
+                    "${footer_args[@]}" \
                     "${watch_args[@]}" \
                     "${query}" \
                     --preview="${APP_NAME} --id ${id} --preview {1}" \
@@ -729,6 +752,9 @@ while [ "${#}" -gt 0 ]; do
         --active)
             mode="active"
             ;;
+        --footer)
+            mode="footer"
+            ;;
         --var)
             shift
             [ -z "${1:-}" ] && error "Missing var argument" && usage
@@ -805,6 +831,10 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
             has_active_pipelines "$(cat "${JSON_FILE}")"
             exit $?
             ;;
+        footer)
+            print_footer
+            exit 0
+            ;;
         key)
             handle_key
             ;;
@@ -831,7 +861,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
 fi
 
 case "${mode}" in
-    key|preview|active)
+    key|preview|active|footer)
         fail "no cached pipeline result for id ${id}"
         ;;
 esac

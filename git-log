@@ -13,6 +13,11 @@ MAX_COUNT_DEFAULT=500
 # there; the printed list keeps the value git reports
 AUTHOR_MAX=10
 
+# the footer leads with what the list is narrowed down to, which no row of the
+# picker names; it takes its room out of the first footer line, so it is kept
+# short enough to leave the key list there
+FOOTER_MAX=32
+
 C_HASH=$'\033[33m'
 C_AGE=$'\033[38;5;6m'
 C_AUTHOR=$'\033[38;5;33m'
@@ -161,7 +166,12 @@ resolve_commit() {
 term_cols() {
     local cols
 
-    cols="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)"
+    # The picker runs this command in a background process group, where stty
+    # raises SIGTTOU on the terminal and the whole group is stopped instead of
+    # answering - the picker then waits for a list that never comes. Ignoring
+    # the signal in the subshell lets the query through. tput is no fallback
+    # there: with its stdout on a pipe it answers with the terminfo default.
+    cols="$(trap '' TTOU; stty size </dev/tty 2>/dev/null | cut -d' ' -f2)"
     [ -z "${cols}" ] && cols="$(tput cols 2>/dev/null)"
     [ -z "${cols}" ] && cols="${COLUMNS:-200}"
     printf '%s\n' "${cols}"
@@ -239,6 +249,29 @@ print_files() {
         return 0
     fi
     printf '%s\n' "${FILES_HEADER}${NL}${rows}" | render_table
+}
+
+footer_trim() {
+    local text="${1}"
+
+    if [ "${#text}" -gt "${FOOTER_MAX}" ]; then
+        printf '%s…' "${text:0:$(( FOOTER_MAX - 1 ))}"
+    else
+        printf '%s' "${text}"
+    fi
+}
+
+# the commit list says nowhere which paths it is filtered by
+print_log_footer() {
+    [ "${#paths[@]}" -eq 0 ] && return 0
+    footer_trim "${paths[*]}"
+    printf '\n'
+}
+
+# the file list of a commit shows neither its hash nor its subject
+print_files_footer() {
+    printf '%s%s%s %s\n' "${C_HASH}" "$(git rev-parse --short "${commit}" 2>/dev/null)" \
+        "${C_RESET}" "$(footer_trim "$(git log -1 --pretty=format:%s "${commit}" 2>/dev/null)")"
 }
 
 # the path is the last column of the file picker; renames are listed as
@@ -466,11 +499,18 @@ write_state() {
 }
 
 pick_log() {
+    local footer_args=()
+
+    # a log of the whole repository has nothing to name in the footer
+    [ "${#paths[@]}" -gt 0 ] \
+        && footer_args=(--footer-prefix "${APP} --id ${id} --footer")
+
     fzf-with-header --key-command "${APP} --id ${id} --key" \
                     --key-descriptions "${LOG_KEY_DESCS}" \
                     --exec-keys "${LOG_EXEC_KEYS}" \
                     --silent-keys "${LOG_SILENT_KEYS}" \
                     --command "${APP} --id ${id} --print" \
+                    "${footer_args[@]}" \
                     "${query}" \
                     --preview="${APP} --id ${id} --preview {-1}" \
                     --preview-window=right:60%,nowrap \
@@ -486,6 +526,7 @@ pick_files() {
                     --exec-keys "${FILES_EXEC_KEYS}" \
                     --silent-keys "${FILES_SILENT_KEYS}" \
                     --command "${APP} --id ${id} --files-print" \
+                    --footer-prefix "${APP} --id ${id} --files-footer" \
                     --preview="${APP} --id ${id} --file-preview {}" \
                     --preview-window=right:70%,nowrap \
                     --expect="${FILES_KEYS}" \
@@ -633,6 +674,12 @@ while [ "${#}" -gt 0 ]; do
         --files-print)
             mode="files-print"
             ;;
+        --footer)
+            mode="footer"
+            ;;
+        --files-footer)
+            mode="files-footer"
+            ;;
         --preview)
             shift
             [ -z "${1}" ] && fail "Missing argument for preview"
@@ -729,6 +776,14 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
             print_files
             exit 0
             ;;
+        footer)
+            print_log_footer
+            exit 0
+            ;;
+        files-footer)
+            print_files_footer
+            exit 0
+            ;;
         preview)
             preview_commit "${preview_arg}"
             exit 0
@@ -747,7 +802,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
 fi
 
 case "${mode}" in
-    files-print|preview|file-preview|key|files-key)
+    files-print|footer|files-footer|preview|file-preview|key|files-key)
         fail "No state for id ${id}"
         ;;
     print)

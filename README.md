@@ -78,6 +78,11 @@ writing a patch - act inside the picker: the pager, vimdiff and the editor get t
 terminal handed over and come back to the same picker, and the browser is opened
 without touching the screen. Only the editor reloads the blame afterwards, since
 it is the only one that writes the file the blame is of.
+
+No row of the blame names the file it is of, so the footer leads with it, followed
+by `@<rev>` once the blame is of a revision instead of the working tree - the LVL
+column counts how deep a walk went, the footer says where it arrived. The file
+picker names the revision the same way.
 ```bash
 git-blame [--print] [-q <query>] [-r <ref>] [-L <range>] [-w] [-M] [-C] \
           [--ignore-rev <rev>] [--ignore-revs-file <file>] [-o <dir>] \
@@ -262,6 +267,10 @@ single file stays in the file picker and reports what it did above the header, s
 several files can be reverted in a row. The keys that return something on stdout -
 copying a hash or a path, writing a patch - and the ones that leave the working
 tree changed still end the picker.
+
+The footer names what the list is narrowed down to, which no row of it says: the
+paths the log is filtered by in the commit list, and the hash and subject of the
+commit the files belong to in the file picker.
 ```bash
 git-log [--print] [-q <query>] [-n <count>] [--ref <rev>] [--all] \
         [--author <pattern>] [--grep <pattern>] [--merges|--no-merges] \
@@ -298,6 +307,10 @@ copying the message keep the screen and report above the header, and approving,
 merging, closing and deleting reload the list so the new state shows. Only those
 four reload, since a reload is an API call.
 
+The context printed before the picker opens is off the screen while it runs, so
+the footer leads with the two filters that decide what the list holds: the branch
+filter and the state filter.
+
 By default the requests of the current branch are listed; on the default or
 production branch (`--prod-branch`) requests are filtered by their target
 branch instead. `--feedback` prints the comments and review feedback as
@@ -326,6 +339,8 @@ Show GitLab CI or GitHub Actions pipeline status for a ref, or search pipelines 
 Alongside the pipelines of the selected ref, the pipelines of the 3 most recent tags are shown (`--tags <N>` changes the number of tags, `--no-tags` turns them off). Each tag costs one API request, so a large `N` makes the lookup - and every `--watch` reload - slower.
 
 Results open in an interactive picker with the pipeline's jobs in the preview: `enter` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs. Opening the browser and paging the logs happen inside the picker - the log pager gets the terminal handed over and returns to the same picker - so only `enter` ends it. The picker reloads once 10 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. A manual refresh (`ctrl-r`) refetches even after that, and if it brings up a running pipeline the auto-reloading resumes. Use `-p` or `-o json` for non-interactive output.
+
+The ref, the source and the status of a pipeline are columns of the list, so filtering by them is on the screen already. `--grep` and `--var` are not - they drop pipelines with nothing saying why the list is as short as it is - so the footer leads with them when they are used.
 ```bash
 git-pipe status [-r <project>] [--ref <ref>] [--tags <N>|--no-tags] [-q <query>] [-w <seconds>] \
                 [-p] [-o txt|json]
