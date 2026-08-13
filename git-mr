@@ -34,6 +34,15 @@ LIST_EXEC_RELOAD_KEYS="alt-m,alt-c,alt-x"
 # request is the user's own or the approval rights are missing
 RC_SELF_APPROVE=3
 
+# a merge the provider refuses because the requirements of the target branch are
+# not satisfied
+RC_MERGE_BLOCKED=4
+
+# the GitLab merge statuses a merge can still be attempted or queued for; a
+# conflict, a draft or a request another merge request blocks is not among them,
+# no flag gets around those
+GITLAB_BLOCKED_STATUSES="not_approved ci_must_pass ci_still_running discussions_not_resolved requested_changes status_checks_must_pass external_status_checks approvals_syncing jira_association_missing"
+
 JQ_STATE_COLOR='
     def statecolor:
         if . == "open" or . == "opened" then "\u001b[32m"
@@ -105,10 +114,13 @@ preview:
 
 $(key_help "enter:the chosen action (approve + merge by default),ctrl-s:show the request,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the feedback,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
-When the provider refuses the approval, because the request is your own or the
-approval rights are missing, the approve + merge action asks whether to merge it
-without that approval (on GitHub bypassing the branch protection rules with
---admin, which needs the permission to do so).
+When the approval is refused, because the request is your own or the approval
+rights are missing, and when the provider blocks the merge although the approval
+went through, the approve + merge and the merge action offer three ways on:
+merging past the requirements (GitHub --admin, which needs the permission to do
+so; GitLab --auto-merge=false), leaving the merge to the provider until every
+requirement is met (--auto, on GitLab --auto-merge), or leaving the request
+alone.
 
 Actions:
   -c, --create            create a request from the current branch
@@ -204,11 +216,13 @@ set_provider_labels() {
         NOUN_PLURAL="pull requests"
         ABBR="PR"
         SIGIL="#"
+        PROVIDER_LABEL="GitHub"
     else
         NOUN="merge request"
         NOUN_PLURAL="merge requests"
         ABBR="MR"
         SIGIL="!"
+        PROVIDER_LABEL="GitLab"
     fi
 }
 
@@ -599,37 +613,91 @@ approve_item() {
     return 1
 }
 
-merge_item() {
+# both clients refuse a blocked merge before they ask for a merge method, so the
+# state is read up front; parsing it out of the error is no option, capturing the
+# output would swallow that question
+merge_blocked_reason() {
     local n="${1}"
-    local bypass="${2:-0}"
-    local merge_args=()
+    local status
 
     if [ "${provider}" = "github" ]; then
-        # --admin merges through the branch protection rules, so a missing
-        # approval does not block the merge
-        [ "${bypass}" -eq 1 ] && merge_args+=("--admin")
+        status="$(gh pr view "${n}" --repo "${github_repo_selector}" \
+            --json mergeStateStatus --jq '.mergeStateStatus // empty' 2>/dev/null)" || return 1
+        [ "${status}" = "BLOCKED" ] || return 1
+        printf 'the requirements of the target branch are not satisfied\n'
+        return 0
+    fi
+    status="$(glab mr view "${n}" --output json 2>/dev/null \
+        | jq -r '.detailed_merge_status // empty')" || return 1
+    case " ${GITLAB_BLOCKED_STATUSES} " in
+        *" ${status} "*) printf '%s\n' "${status//_/ }" ;;
+        *) return 1 ;;
+    esac
+}
+
+# mode is empty for a plain merge, bypass to merge past the requirements and auto
+# to leave the merge to the provider until they are met
+merge_item() {
+    local n="${1}"
+    local mode="${2:-}"
+    local reason
+    local merge_args=()
+
+    if [ -z "${mode}" ] && reason="$(merge_blocked_reason "${n}")"; then
+        error "Cannot merge $(item_ref "${n}"): ${remote_host} reports ${reason}"
+        return "${RC_MERGE_BLOCKED}"
+    fi
+    if [ "${provider}" = "github" ]; then
+        case "${mode}" in
+            # --admin merges through the branch protection rules, so a missing
+            # approval does not block the merge
+            bypass) merge_args+=("--admin") ;;
+            # --auto hands the merge to GitHub, which runs it once every
+            # requirement is met
+            auto)   merge_args+=("--auto") ;;
+        esac
         gh pr merge "${n}" --repo "${github_repo_selector}" "${merge_args[@]}" \
             || { error "Failed to merge $(item_ref "${n}")"; return 1; }
     else
-        # glab has no bypass flag; the merge goes through unless the project
-        # makes the missing approval mandatory
-        glab mr merge "${n}" || { error "Failed to merge $(item_ref "${n}")"; return 1; }
+        case "${mode}" in
+            # glab has no bypass flag, it only decides whether the merge waits
+            # for the pipeline; the merge goes through unless the project makes
+            # the missing approval mandatory
+            bypass) merge_args+=("--auto-merge=false") ;;
+            auto)   merge_args+=("--auto-merge") ;;
+        esac
+        glab mr merge "${n}" "${merge_args[@]}" \
+            || { error "Failed to merge $(item_ref "${n}")"; return 1; }
     fi
 }
 
-# a refused self approval falls back to asking whether to merge without it
-merge_without_approval() {
-    local n="${1}"
-
+# a refused approval and a blocked merge both fall back to the same question:
+# merge past the requirements, wait for them, or leave the request alone
+bypass_items() {
     if [ "${provider}" = "github" ]; then
-        prompt-no-yes "Merge '$(item_ref "${n}")' anyway, bypassing the branch protection rules (--admin)?" \
-            || { echo "Abort." 1>&2; return 2; }
-        merge_item "${n}" 1
+        printf '%s\t%s\n' \
+            "bypass" "merge now, bypassing the branch protection rules (--admin)" \
+            "auto"   "let ${PROVIDER_LABEL} merge it once every requirement is met (--auto)"
     else
-        prompt-no-yes "Merge '$(item_ref "${n}")' anyway, without an approval?" \
-            || { echo "Abort." 1>&2; return 2; }
-        merge_item "${n}"
+        printf '%s\t%s\n' \
+            "bypass" "merge now, without waiting for the pipeline (--auto-merge=false)" \
+            "auto"   "let ${PROVIDER_LABEL} merge it once the pipeline succeeds (--auto-merge)"
     fi
+    printf '%s\t%s\n' "abort" "leave the ${NOUN} as it is"
+}
+
+ask_merge_bypass() {
+    local n="${1}"
+    local choice
+
+    need_cmd prompt-select
+    choice="$(bypass_items | prompt-select --prompt "Merge '$(item_ref "${n}")' anyway?" \
+        --delimiter '\t')" || { echo "Abort." 1>&2; return 2; }
+    case "${choice}" in
+        bypass) merge_item "${n}" bypass ;;
+        auto)   merge_item "${n}" auto ;;
+        *)      echo "Abort." 1>&2; return 2 ;;
+    esac
 }
 
 approve_and_merge() {
@@ -642,9 +710,15 @@ approve_and_merge() {
     prompt-yes-no "Approve and merge '$(item_ref "${n}")'?" || { echo "Abort." 1>&2; return 2; }
     approve_item "${n}"
     rc=$?
-    [ "${rc}" -eq 0 ] && { merge_item "${n}"; return "${?}"; }
+    if [ "${rc}" -eq 0 ]; then
+        merge_item "${n}"
+        rc=$?
+        # the approval went through, the target branch still asks for more
+        [ "${rc}" -eq "${RC_MERGE_BLOCKED}" ] && { ask_merge_bypass "${n}"; return "${?}"; }
+        return "${rc}"
+    fi
     [ "${rc}" -ne "${RC_SELF_APPROVE}" ] && return 1
-    merge_without_approval "${n}"
+    ask_merge_bypass "${n}"
 }
 
 # the remote the requests belong to; the branch of a request lives there
@@ -1025,7 +1099,12 @@ run_action() {
             [ "${rc}" -eq "${RC_SELF_APPROVE}" ] && rc=1
             return "${rc}"
             ;;
-        merge)    merge_item "${n}" ;;
+        merge)
+            merge_item "${n}"
+            rc=$?
+            [ "${rc}" -eq "${RC_MERGE_BLOCKED}" ] && { ask_merge_bypass "${n}"; rc=$?; }
+            return "${rc}"
+            ;;
         close)    close_item "${n}" ;;
         delete)   delete_item "${n}" ;;
         copy)     copy_message "${n}" ;;
