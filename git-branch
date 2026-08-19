@@ -12,11 +12,11 @@ usage: ${APP_NAME} [OPTIONS] [BRANCH_NAME]
 Create, delete, or reset a Git branch.
 
 Options:
-  --delete              Delete BRANCH_NAME, or infer the current branch if omitted
+  -D, --delete          Delete BRANCH_NAME, or infer the current branch if omitted
                         Also delete its upstream remote branch if defined
                         If deleting the current branch, check out the default branch first
-  --reset               Reset hard to the current branch upstream, or BRANCH_NAME upstream
-  --backup              Backup the current branch into a new backup branch
+  -R, --reset           Reset hard to the current branch upstream, or BRANCH_NAME upstream
+  -B, --backup          Backup the current branch into a new backup branch
   -y, --yes             Run without prompting
   -h, --help            Show this help message and exit
 EOF
@@ -93,16 +93,16 @@ while [ "${#}" -gt 0 ]; do
 		-h|--help)
 			usage
 			;;
-		--delete)
+		-D|--delete)
 			delete_mode=1
 			;;
-		--reset)
+		-R|--reset)
 			reset_mode=1
 			;;
-        --backup)
+        -B|--backup)
             backup_mode=1
             ;;
-		-y|--yes)
+		-y|-Y|--yes)
 			assume_yes=1
 			;;
 		-*)
