@@ -43,10 +43,10 @@ LOG_SILENT_KEYS="ctrl-o"
 LOG_KEY_DESCS="enter:files,ctrl-c:copy hash,ctrl-d:diff,ctrl-o:open,alt-p:patch,alt-r:revert,alt-b:revert on branch"
 
 FILES_HEADER=$'STATUS\t+\t-\tPATH'
-FILES_KEYS="ctrl-c,alt-p,esc,bspace"
+FILES_KEYS="ctrl-c,alt-p,esc"
 FILES_EXEC_KEYS="enter,ctrl-e,alt-v"
 FILES_SILENT_KEYS="alt-r"
-FILES_KEY_DESCS="enter:diff,ctrl-c:copy path,ctrl-e:edit,alt-v:vimdiff,alt-p:patch,alt-r:revert file,esc:back,bspace:back"
+FILES_KEY_DESCS="enter:diff,ctrl-c:copy path,ctrl-e:edit,alt-v:vimdiff,alt-p:patch,alt-r:revert file,esc:back"
 
 key_help() {
     printf '%s' "${1}" | tr ',' '\n' | awk -F':' '{ printf "  %-8s %s\n", $1, $2 }'
@@ -67,8 +67,8 @@ enter steps into a commit and opens a file picker with the changed files on
 the left and the diff of the selected file in the preview:
 $(key_help "${FILES_KEY_DESCS}")
 
-esc and backspace leave the file picker and return to the commit list, so
-backspace does not erase the search query there.
+esc leaves the file picker and returns to the commit list; backspace erases the
+search query there, the same way it does in the commit list.
 
 Options:
   -q, --query <query>       start the picker with a search query
@@ -597,7 +597,7 @@ handle_files_key() {
     path="$(path_from_line "${line}")"
 
     case "${key}" in
-        esc|bspace)
+        esc)
             exit 255
             ;;
     esac

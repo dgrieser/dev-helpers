@@ -256,8 +256,8 @@ optionally pushes it and opens a merge/pull request.
 plus their churn on the left and the diff of the selected file in the preview:
 `enter` shows the file diff, `ctrl-c` copies the path, `ctrl-e` opens the file in
 the editor, `alt-v` opens the before and after version in vimdiff, `alt-p` writes
-the file's diff as a patch, and `alt-r` reverts just that file's change. `esc` and
-`backspace` return to the commit list. Merge commits are shown against their first
+the file's diff as a patch, and `alt-r` reverts just that file's change. `esc`
+returns to the commit list. Merge commits are shown against their first
 parent.
 
 Reading a commit or a file acts inside the picker instead of ending it: the pager,
@@ -338,12 +338,15 @@ Show GitLab CI or GitHub Actions pipeline status for a ref, or search pipelines 
 
 Alongside the pipelines of the selected ref, the pipelines of the 3 most recent tags are shown (`--tags <N>` changes the number of tags, `--no-tags` turns them off). Each tag costs one API request, so a large `N` makes the lookup - and every `--watch` reload - slower.
 
-Results open in an interactive picker with the pipeline's jobs in the preview: `enter` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs. Opening the browser and paging the logs happen inside the picker - the log pager gets the terminal handed over and returns to the same picker - so only `enter` ends it. The picker reloads once 10 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. A manual refresh (`ctrl-r`) refetches even after that, and if it brings up a running pipeline the auto-reloading resumes. Use `-p` or `-o json` for non-interactive output.
+Results open in an interactive picker with the pipeline's jobs in the preview: `enter` steps into the pipeline and lists its jobs, `tab` narrows the list down to the pipelines that are still running and back, `ctrl-y` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs. Everything but `enter` happens inside the picker - the log pager gets the terminal handed over and returns to the same picker. The picker reloads once 10 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. A manual refresh (`ctrl-r`) refetches even after that, and if it brings up a running pipeline the auto-reloading resumes. Use `-p` or `-o json` for non-interactive output.
 
-The ref, the source and the status of a pipeline are columns of the list, so filtering by them is on the screen already. `--grep` and `--var` are not - they drop pipelines with nothing saying why the list is as short as it is - so the footer leads with them when they are used.
+The jobs of a pipeline open in a picker of their own (`-j <pipeline>` opens it directly), with the details of the selected job and the tail of its log in the preview: `enter` pages the whole log, `ctrl-y` copies the job URL, `ctrl-o` opens it in the browser, `esc` returns to the pipeline list. The preview keeps up with the log of a job that is still running; on GitHub a job has no log before it finished, so its steps take the place of the log until then.
+
+The ref, the source, the status and the user of a pipeline are columns of the list, so filtering by them is on the screen already. `--grep` and `--var` are not - they drop pipelines with nothing saying why the list is as short as it is - so the footer leads with them when they are used, followed by whether `tab` currently narrows the list down to what is running.
 ```bash
 git-pipe status [-r <project>] [--ref <ref>] [--tags <N>|--no-tags] [-q <query>] [-w <seconds>] \
                 [-p] [-o txt|json]
+git-pipe -j <pipeline> [-r <project>] [-w <seconds>] [-p] [-o txt|json]
 git-pipe search [-r <project>] [--ref <ref>|--all-refs] [--tags <N>|--no-tags] \
                 [--var <NAME[=VALUE]>] [--grep <pattern>] \
                 [--source <source>] [-s <status>|--failed|--succeeded|--aborted|...] \

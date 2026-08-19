@@ -13,16 +13,34 @@ TAG_LIMIT_DEFAULT=3
 TAG_PER_PAGE=20
 
 NL=$'\n'
+CR=$'\r'
+TAB=$'\t'
+C_ID=$'\033[33m'
 C_FILTER=$'\033[38;5;208m'
+C_LABEL=$'\033[38;5;250m'
 C_RESET=$'\033[0m'
-HEADER="ID  STATUS  SOURCE  REF  CREATED  URL"
-# both actions leave the pipeline list alone, so neither reloads it: the log
-# pager gets the terminal handed over, the browser is opened silently
+# the id and the URL are in the list for the search and for the keys, the picker
+# shows neither of them (see PICKER_COLUMNS)
+HEADER="ID  STATUS  SOURCE  REF  USER  CREATED  URL"
+PICKER_COLUMNS="2,3,4,5,6"
+# only enter ends the pipeline list, and only to open the jobs of a pipeline: the
+# log pager gets the terminal handed over, the browser and the clipboard are
+# silent, and the status filter reloads the list it narrows down
 KEYS="esc,ctrl-c,ctrl-d,enter"
 EXEC_KEYS="ctrl-l"
-SILENT_KEYS="ctrl-o"
-KEY_DESCS="enter:copy url,ctrl-o:open,ctrl-l:logs"
-KEY_DESCS_HELP="enter copy url, ctrl-o open, ctrl-l logs"
+SILENT_KEYS="ctrl-o,ctrl-y"
+RELOAD_KEYS="tab"
+KEY_DESCS="enter:jobs,tab:running only,ctrl-y:copy url,ctrl-o:open,ctrl-l:logs"
+KEY_DESCS_HELP="enter jobs, tab running only, ctrl-y copy url, ctrl-o open, ctrl-l logs"
+
+# the jobs of a pipeline, opened with enter: the log pager gets the terminal
+# handed over, the browser and the clipboard are silent, esc returns to the
+# pipeline list and ctrl-c/ctrl-d leave both
+JOBS_KEYS="esc,ctrl-c,ctrl-d"
+JOBS_EXEC_KEYS="enter"
+JOBS_SILENT_KEYS="ctrl-o,ctrl-y"
+JOBS_KEY_DESCS="enter:log,ctrl-y:copy url,ctrl-o:open,esc:back"
+JOBS_KEY_DESCS_HELP="enter log, ctrl-y copy url, ctrl-o open, esc back"
 
 usage() {
     cat <<EOF 1>&2
@@ -34,9 +52,16 @@ In addition to the pipelines of the selected ref, the pipelines of the ${TAG_LIM
 recent tags are included (see --tags/--no-tags).
 
 Results are shown in an interactive picker (keys: ${KEY_DESCS_HELP}).
+tab narrows the list down to the pipelines that are still running and back.
 The picker reloads once ${WATCH_FIRST_DELAY} seconds after it opened, then keeps reloading
 as long as pipelines are still running. Once it stopped, a manual refresh
 (ctrl-r) that brings up a running pipeline resumes the auto-reloading.
+
+enter steps into a pipeline and opens a picker with its jobs, the details and
+the tail of the log of the selected job in the preview (keys: ${JOBS_KEY_DESCS_HELP}).
+The log of a job that is still running is shown as it grows; on GitHub the
+logs of a job only become available once it finished, so its steps take their
+place until then.
 
 COMMAND
     status                  show CI pipeline status for a ref
@@ -45,6 +70,7 @@ COMMAND
 Options:
     -h|--help               show this help
     -r|--repo <PROJECT>     project to operate on (default: current directory)
+    -j|--jobs <PIPELINE_ID> open the jobs of a pipeline instead of the pipeline list
         --ref <REF>         ref to filter by (default: current branch)
         --tags <N>          also show the pipelines of the N most recent tags
                             (default ${TAG_LIMIT_DEFAULT}, 0 disables; one API request per tag)
@@ -170,11 +196,13 @@ detect_provider() {
     local host
 
     host="$(host_from_url "${remote_url}")" || fail "failed to determine remote host"
+    # the path of the project, which GitLab's GraphQL API takes instead of the id
+    remote_repository="$(repository_from_url "${remote_url}")" \
+        || fail "failed to determine the repository of ${remote_url}"
     if [[ "${host}" == *github* ]] \
         || [ -n "$(git config --get remote.origin.gh-resolved 2>/dev/null)" ]; then
         provider="github"
-        github_repository="$(repository_from_url "${remote_url}")" \
-            || fail "failed to determine GitHub repository"
+        github_repository="${remote_repository}"
         github_repo_selector="${github_repository}"
         github_api_args=()
         if [ "${host}" != "github.com" ]; then
@@ -269,6 +297,7 @@ list_github_pipelines_json() {
             status: (if .status == "completed" then (.conclusion // .status) else .status end),
             source: .event,
             ref: .head_branch,
+            user: (.triggering_actor.login // .actor.login // "-"),
             created_at,
             web_url: .html_url
         })
@@ -281,6 +310,58 @@ list_pipelines_json() {
     else
         list_gitlab_pipelines_json
     fi
+}
+
+# GitLab's pipeline list does not carry the user who triggered a pipeline, and
+# asking the REST API for it is one request per pipeline; GraphQL answers for a
+# whole list of them at once
+gitlab_user_map() {
+    local ids_json="${1}"
+    local gids query out
+
+    gids="$(jq -r 'map("\"gid://gitlab/Ci::Pipeline/\(.)\"") | join(",")' <<< "${ids_json}")"
+    [ -z "${gids}" ] && { echo '{}'; return 0; }
+    query="{ project(fullPath: \"${remote_repository}\") { pipelines(ids: [${gids}]) { nodes { id user { username } } } } }"
+    out="$(glab api graphql -f query="${query}" 2>/dev/null)" || return 1
+    jq -e '.data.project.pipelines.nodes' <<< "${out}" >/dev/null 2>&1 || return 1
+    jq -c '
+        .data.project.pipelines.nodes
+        | map({ key: (.id | sub("^.*/"; "")), value: (.user.username // "-") })
+        | from_entries
+    ' <<< "${out}"
+}
+
+# the user of a pipeline never changes, so every id is looked up once per run;
+# the lookup is capped at what GraphQL returns per page
+gitlab_annotate_users() {
+    local json="${1}"
+    local cache="{}" missing chunk map total i
+
+    [ -s "${USERS_FILE}" ] && cache="$(cat "${USERS_FILE}")"
+    missing="$(jq -c --argjson c "${cache}" '[ .[] | .id | tostring | select($c[.] == null) ]' <<< "${json}")"
+    total="$(jq 'length' <<< "${missing}")"
+    i=0
+    while [ "${i}" -lt "${total}" ]; do
+        chunk="$(jq -c --argjson i "${i}" '.[$i:$i+100]' <<< "${missing}")"
+        i=$((i + 100))
+        map="$(gitlab_user_map "${chunk}")" || continue
+        # an id the answer says nothing about is not asked for again
+        cache="$(jq -c -n --argjson c "${cache}" --argjson ids "${chunk}" --argjson m "${map}" \
+            '$c + ($ids | map({ key: ., value: "-" }) | from_entries) + $m')"
+    done
+    printf '%s\n' "${cache}" > "${USERS_FILE}"
+    jq --argjson c "${cache}" 'map(.user = ($c[.id | tostring] // "-"))' <<< "${json}"
+}
+
+annotate_users() {
+    local json="${1}"
+
+    # the runs of GitHub Actions name their actor themselves
+    if [ "${provider}" = "github" ] || [ "$(jq 'length' <<< "${json}")" -eq 0 ]; then
+        printf '%s\n' "${json}"
+        return 0
+    fi
+    gitlab_annotate_users "${json}"
 }
 
 list_tag_names() {
@@ -383,8 +464,29 @@ JQ_STATUS_COLOR='
         elif . == "canceled" or . == "cancelled" or . == "skipped" or . == "neutral" then "\u001b[90m"
         else "" end;
     def colored: (. // "-") as $s | ($s | statuscolor) + $s + "\u001b[0m";
+    # the user who triggered a pipeline, colored like the author of a commit
+    def usercolored: (. // "-") as $u | "\u001b[38;5;33m" + $u + "\u001b[0m";
     # k-format only turns timestamps without fractional seconds into an age
     def ts: (. // "-") | sub("\\.[0-9]+(?=(Z|[+-]))"; "");
+'
+
+# the statuses a pipeline or a job has not reached a final state in yet
+JQ_ACTIVE='
+    def active:
+        . == "created" or . == "waiting_for_resource" or . == "preparing"
+        or . == "pending" or . == "queued" or . == "requested" or . == "waiting"
+        or . == "running" or . == "in_progress";
+'
+
+JQ_TIME='
+    def epoch: sub("\\.[0-9]+(?=(Z|[+-]))"; "") | fromdateiso8601;
+    def dur:
+        if . == null then "-"
+        else (. | floor) as $s
+            | if $s >= 3600 then "\($s / 3600 | floor)h\($s % 3600 / 60 | floor)m"
+              elif $s >= 60 then "\($s / 60 | floor)m\($s % 60)s"
+              else "\($s)s" end
+        end;
 '
 
 print_table() {
@@ -396,6 +498,16 @@ print_table() {
         return 0
     fi
     printf '%s\n' "${header}${NL}${rows}" | k-format
+}
+
+# tab is a filter no row of the list names, and it is switched while the picker
+# runs, so the footer always says which of the two the list is
+state_filter_label() {
+    if [ "$(active_only)" -eq 1 ]; then
+        echo "running only"
+    else
+        echo "all states"
+    fi
 }
 
 # The ref, the source and the status of a pipeline are columns of the list, so
@@ -410,8 +522,8 @@ print_footer() {
         [ -n "${text}" ] && text="${text} · "
         text="${text}var ${var_specs[*]}"
     fi
-    [ -z "${text}" ] && return 0
-    printf '%s%s%s\n' "${C_FILTER}" "${text}" "${C_RESET}"
+    [ -n "${text}" ] && printf '%s%s%s · ' "${C_FILTER}" "${text}" "${C_RESET}"
+    printf '%s%s%s\n' "${C_LABEL}" "$(state_filter_label)" "${C_RESET}"
 }
 
 print_pipelines() {
@@ -428,6 +540,7 @@ print_pipelines() {
             (.status | colored),
             (.source // "-"),
             (.ref // "-"),
+            (.user | usercolored),
             (.created_at | ts),
             (.web_url // "-")
         ] | join("  ")
@@ -435,15 +548,33 @@ print_pipelines() {
     print_table "${HEADER}" "${rows}"
 }
 
+# a job that is still running has no duration of its own yet, so the one shown
+# for it is how long it has been running
 list_gitlab_jobs_json() {
     local pid="${1}"
     local jobs
 
     jobs="$(glab api "projects/$(project_id)/pipelines/${pid}/jobs" --paginate 2>/dev/null)" || return 1
-    jq -s '
+    jq -s "${JQ_TIME}"'
         add // []
         | sort_by(.id)
-        | map({name, stage, status, created_at: (.started_at // .created_at), web_url})
+        | map({
+            id,
+            name,
+            stage,
+            status,
+            started_at: (.started_at // .created_at),
+            duration: (
+                if .duration != null then .duration
+                elif .started_at != null and .finished_at == null then (now - (.started_at | epoch))
+                else null end
+            ),
+            runner: (((.runner.description // "") | gsub("^\\s+|\\s+$"; ""))
+                     | if . == "" then null else . end),
+            user: (.user.username // null),
+            failure_reason,
+            web_url
+        })
     ' <<< "${jobs}"
 }
 
@@ -453,60 +584,281 @@ list_github_jobs_json() {
 
     jobs="$(gh api "${github_api_args[@]}" --paginate \
         "repos/${github_repository}/actions/runs/${rid}/jobs?per_page=100" 2>/dev/null)" || return 1
-    jq -s '
+    jq -s "${JQ_TIME}"'
         [.[].jobs[]]
         | sort_by(.id)
         | map({
+            id,
             name,
             stage: (.workflow_name // "-"),
             status: (if .status == "completed" then (.conclusion // .status) else .status end),
-            created_at: (.started_at // .created_at),
-            web_url: .html_url
+            started_at: (.started_at // .created_at),
+            duration: (
+                if .started_at == null then null
+                else ((if .completed_at != null then (.completed_at | epoch) else now end)
+                      - (.started_at | epoch))
+                end
+            ),
+            runner: (.runner_name // null),
+            user: null,
+            failure_reason: null,
+            web_url: .html_url,
+            steps: [ .steps[]? | {
+                number,
+                name,
+                status: (if .status == "completed" then (.conclusion // .status) else .status end)
+            } ]
         })
     ' <<< "${jobs}"
 }
 
+list_jobs_json() {
+    if [ "${provider}" = "github" ]; then
+        list_github_jobs_json "${1}"
+    else
+        list_gitlab_jobs_json "${1}"
+    fi
+}
+
+# the jobs of a pipeline in the preview of the pipeline list, in the order they
+# run in
 show_jobs() {
     local pid="${1}"
     local json rows
 
-    if [ "${provider}" = "github" ]; then
-        json="$(list_github_jobs_json "${pid}")" || { echo "failed to list jobs for ${pid}"; return 1; }
-    else
-        json="$(list_gitlab_jobs_json "${pid}")" || { echo "failed to list jobs for ${pid}"; return 1; }
-    fi
+    json="$(list_jobs_json "${pid}")" || { echo "failed to list jobs for ${pid}"; return 1; }
 
-    rows="$(jq -r "${JQ_STATUS_COLOR}"'
+    rows="$(jq -r "${JQ_STATUS_COLOR}${JQ_TIME}"'
         .[] | [
             (.status | colored),
             (.stage // "-"),
             (.name // "-"),
-            (.created_at | ts)
+            (.started_at | ts),
+            (.duration | dur)
         ] | join("  ")
     ' <<< "${json}")"
-    local stage_header="STAGE"
-    [ "${provider}" = "github" ] && stage_header="WORKFLOW"
-    print_table "STATUS  ${stage_header}  NAME  STARTED" "${rows}"
+    print_table "STATUS  $(stage_header)  NAME  STARTED  DURATION" "${rows}"
+}
+
+stage_header() {
+    if [ "${provider}" = "github" ]; then
+        echo "WORKFLOW"
+    else
+        echo "STAGE"
+    fi
+}
+
+jobs_header() {
+    printf 'ID  STATUS  %s  NAME  STARTED  DURATION  URL\n' "$(stage_header)"
+}
+
+# The jobs of a pipeline. The list is fed newest first, which the bottom up
+# layout of the picker turns into the order the jobs run in, with the cursor on
+# the one that ran last.
+print_jobs() {
+    local json="${1}"
+    local rows
+
+    if [ "${output}" = "json" ]; then
+        echo "${json}"
+        return 0
+    fi
+    rows="$(jq -r "${JQ_STATUS_COLOR}${JQ_TIME}"'
+        reverse | .[] | [
+            (.id | tostring),
+            (.status | colored),
+            (.stage // "-"),
+            (.name // "-"),
+            (.started_at | ts),
+            (.duration | dur),
+            (.web_url // "-")
+        ] | join("  ")
+    ' <<< "${json}")"
+    print_table "$(jobs_header)" "${rows}"
+}
+
+# the pipeline the jobs belong to is gone from the screen while the jobs picker
+# runs, so its footer names it
+print_jobs_footer() {
+    local pid ref status
+
+    pid="$(jq -r '.id // "-"' <<< "${jobs_pipeline_json}")"
+    ref="$(jq -r '.ref // "-"' <<< "${jobs_pipeline_json}")"
+    status="$(jq -r "${JQ_STATUS_COLOR}"'.status | colored' <<< "${jobs_pipeline_json}")"
+    printf '%spipeline %s%s · %s%s%s · %s\n' \
+        "${C_ID}" "${pid}" "${C_RESET}" "${C_FILTER}" "${ref}" "${C_RESET}" "${status}"
+}
+
+# what both providers put into a log for their own web UI and what neither of
+# them says anything with in a terminal: GitLab's collapsible sections, the
+# timestamp both of them prefix every line with, GitHub's groups, and the
+# carriage returns whatever ran in the job drew its progress with. A GitLab
+# runner also flags every line with the stream it came from, and a flag ending
+# in "+" means the line continues the one before it instead of being one of its
+# own.
+clean_trace() {
+    sed -E "s/\x1b\[0K//g; s/^\xef\xbb\xbf//; s/section_(start|end):[0-9]+:[^${CR}]*${CR}//g" \
+        | awk '
+            function flush() { if (open) print buf }
+            {
+                line = $0
+                stamped = 0
+                # the timestamp of the provider, which carries fractional
+                # seconds; one a tool of its own wrote stays where it is
+                if (match(line, /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+Z /)) {
+                    line = substr(line, RLENGTH + 1)
+                    stamped = 1
+                }
+                cont = 0
+                if (stamped && match(line, /^[0-9][0-9][OE][+ ]/)) {
+                    cont = (substr(line, 4, 1) == "+")
+                    line = substr(line, 5)
+                }
+                if (cont && open) { buf = buf line; next }
+                flush()
+                buf = line
+                open = 1
+            }
+            END { flush() }
+        ' \
+        | sed -E "s/^##\[(group|endgroup|command)\]//" \
+        | tr "${CR}" '\n'
+}
+
+# A job with nothing to show yet answers with an error instead of an empty log:
+# GitHub has no log for a job before it finished and drops it once it expired,
+# GitLab knows no trace for a job that has not started. Both of them say so on
+# stdout, so the answer only counts if the request went through.
+job_trace() {
+    local jid="${1}"
+    local out
+
+    if [ "${provider}" = "github" ]; then
+        out="$(gh api "${github_api_args[@]}" \
+            "repos/${github_repository}/actions/jobs/${jid}/logs" 2>/dev/null)" || return 0
+    else
+        out="$(glab api "projects/$(project_id)/jobs/${jid}/trace" 2>/dev/null)" || return 0
+    fi
+    printf '%s\n' "${out}"
+}
+
+# the details of a job and the tail of its log in the preview of the jobs picker;
+# the log is cut to what the preview window holds, so its last line is the last
+# one of the log
+show_job() {
+    local jid="${1}"
+    local job lines detail_lines tail_lines
+    local name stage status started duration runner user failure url steps trace
+
+    job="$(jq -c --arg id "${jid}" 'map(select((.id | tostring) == $id)) | first // empty' < "${JSON_FILE}")"
+    [ -z "${job}" ] && { echo "no job ${jid}"; return 0; }
+
+    IFS=$'\t' read -r name stage status started duration runner user failure url \
+        < <(jq -r "${JQ_STATUS_COLOR}${JQ_TIME}"'[
+                (.name // "-"),
+                (.stage // "-"),
+                (.status | colored),
+                (.started_at | ts),
+                (.duration | dur),
+                (.runner // "-"),
+                (.user // "-"),
+                (.failure_reason // "-"),
+                (.web_url // "-")
+            ] | @tsv' <<< "${job}")
+
+    local details=()
+    details+=("NAME${TAB}${name}")
+    details+=("$(stage_header)${TAB}${stage}")
+    details+=("STATUS${TAB}${status}")
+    details+=("STARTED${TAB}${started}")
+    details+=("DURATION${TAB}${duration}")
+    [ "${runner}" != "-" ] && details+=("RUNNER${TAB}${runner}")
+    [ "${user}" != "-" ] && details+=("USER${TAB}${user}")
+    [ "${failure}" != "-" ] && details+=("FAILURE${TAB}${failure}")
+    details+=("URL${TAB}${url}")
+    detail_lines="${#details[@]}"
+    printf '%s\n' "${details[@]}" \
+        | awk -F'\t' -v c="${C_LABEL}" -v r="${C_RESET}" '{ printf "%s%-10s%s%s\n", c, $1, r, $2 }'
+
+    # what is left of the preview window below the details, so the last line of
+    # the log is the last line of the preview - which only holds as long as no
+    # line of it is wrapped, hence the nowrap window of the jobs picker
+    lines="${FZF_PREVIEW_LINES:-40}"
+    tail_lines=$((lines - detail_lines - 2))
+    [ "${tail_lines}" -lt 5 ] && tail_lines=5
+
+    trace="$(job_trace "${jid}" | clean_trace)"
+    # the steps of a GitHub job are what there is to watch until its log shows up
+    if [ -z "${trace}" ] && [ "${provider}" = "github" ]; then
+        steps="$(jq -r "${JQ_STATUS_COLOR}"'
+            (.steps // []) | .[] | "  \(.status | colored)  \(.name)"
+        ' <<< "${job}" | tail -n "${tail_lines}")"
+        if [ -n "${steps}" ]; then
+            printf '\n%sSTEPS%s\n%s\n' "${C_LABEL}" "${C_RESET}" "${steps}"
+            return 0
+        fi
+    fi
+    if [ -z "${trace}" ]; then
+        printf '\n%sno log%s\n' "${C_LABEL}" "${C_RESET}"
+        return 0
+    fi
+
+    printf '\n%sLOG%s\n' "${C_LABEL}" "${C_RESET}"
+    printf '%s\n' "${trace}" | tail -n "${tail_lines}"
+}
+
+show_job_log() {
+    local jid="${1}"
+    local trace
+
+    trace="$(job_trace "${jid}" | clean_trace)"
+    if [ -z "${trace}" ]; then
+        printf 'No log for job %s.\n' "${jid}" | less -R
+        return 0
+    fi
+    printf '%s\n' "${trace}" | less -R
 }
 
 show_logs() {
     local pid="${1}"
     local jobs_json job_id job_name
 
-    if [ "${provider}" = "github" ]; then
-        gh run view "${pid}" --repo "${github_repo_selector}" --log 2>&1 | less -R
-        return 0
-    fi
-
-    jobs_json="$(glab api "projects/$(project_id)/pipelines/${pid}/jobs" --paginate 2>/dev/null)" \
-        || fail "failed to list jobs for ${pid}"
+    jobs_json="$(list_jobs_json "${pid}")" || fail "failed to list jobs for ${pid}"
     {
         while IFS=$'\t' read -r job_id job_name; do
             [ -z "${job_id}" ] && continue
             printf '\n\033[1m===== %s (job %s) =====\033[0m\n' "${job_name}" "${job_id}"
-            glab api "projects/$(project_id)/jobs/${job_id}/trace" 2>/dev/null
-        done < <(jq -rs 'add // [] | sort_by(.id) | .[] | [(.id | tostring), .name] | @tsv' <<< "${jobs_json}")
+            job_trace "${job_id}" | clean_trace
+        done < <(jq -r '.[] | [(.id | tostring), .name] | @tsv' <<< "${jobs_json}")
     } | less -R
+}
+
+pipeline_detail_json() {
+    local pid="${1}"
+
+    if [ "${provider}" = "github" ]; then
+        gh api "${github_api_args[@]}" "repos/${github_repository}/actions/runs/${pid}" 2>/dev/null \
+            | jq -c '{
+                id,
+                status: (if .status == "completed" then (.conclusion // .status) else .status end),
+                source: .event,
+                ref: .head_branch,
+                user: (.triggering_actor.login // .actor.login // "-"),
+                created_at,
+                web_url: .html_url
+            }'
+    else
+        glab api "projects/$(project_id)/pipelines/${pid}" 2>/dev/null \
+            | jq -c '{
+                id,
+                status,
+                source,
+                ref,
+                user: (.user.username // "-"),
+                created_at,
+                web_url
+            }'
+    fi
 }
 
 open_url() {
@@ -517,20 +869,64 @@ open_url() {
     gio open "${url}" &>/dev/null
 }
 
+copy_url() {
+    local url="${1}"
+
+    [ -z "${url}" ] && { error "no URL for the selected row"; return 1; }
+    need_cmd clip
+    printf '%s' "${url}" | clip || { error "Failed to copy the URL"; return 1; }
+    echo "${url} copied to clipboard." 1>&2
+}
+
+# tab switches the status filter of the pipeline list; the file is what the
+# reload that follows the key reads it back from
+active_only() {
+    if [ -s "${FILTER_FILE}" ]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+toggle_active_only() {
+    if [ "$(active_only)" -eq 1 ]; then
+        rm -f "${FILTER_FILE}"
+    else
+        echo 1 > "${FILTER_FILE}"
+    fi
+}
+
 handle_key() {
     local key line pid url
 
     key="$(head -n 1 <<< "${key_result}")"
-    line="$(tail -n 1 <<< "${key_result}")"
+    # an empty list has no row for the key, and the key itself must not be taken
+    # for one
+    line="$(sed -n '2p' <<< "${key_result}")"
     pid="$(awk '{print $1}' <<< "${line}")"
     url="$(awk '{print $NF}' <<< "${line}")"
 
     case "${key}" in
+        tab)
+            toggle_active_only
+            exit 0
+            ;;
+        esc|ctrl-c|ctrl-d)
+            exit 255
+            ;;
+    esac
+    [ -z "${pid}" ] && exit 0
+
+    case "${key}" in
         enter)
-            echo "${line}"
-            need_cmd clip
-            printf '%s' "${url}" | clip
+            # leaving the jobs of a pipeline with esc returns to this list,
+            # ending it there ends this one as well
+            PROJECT_ID="${PROJECT_ID:-}" "${0}" --jobs "${pid}" --watch "${watch_seconds}" || exit 0
             exit 1
+            ;;
+        ctrl-y)
+            copy_url "${url}"
+            exit 0
             ;;
         ctrl-o)
             open_url "${url}"
@@ -540,8 +936,43 @@ handle_key() {
             show_logs "${pid}"
             exit 0
             ;;
-        esc|ctrl-c|ctrl-d)
+        *)
+            fail "Unknown key: ${key}"
+            ;;
+    esac
+}
+
+handle_jobs_key() {
+    local key line jid url
+
+    key="$(head -n 1 <<< "${key_result}")"
+    line="$(sed -n '2p' <<< "${key_result}")"
+    jid="$(awk '{print $1}' <<< "${line}")"
+    url="$(awk '{print $NF}' <<< "${line}")"
+
+    case "${key}" in
+        esc)
+            # back to the pipeline list this view was opened from
             exit 255
+            ;;
+        ctrl-c|ctrl-d)
+            exit 1
+            ;;
+    esac
+    [ -z "${jid}" ] && exit 0
+
+    case "${key}" in
+        enter)
+            show_job_log "${jid}"
+            exit 0
+            ;;
+        ctrl-y)
+            copy_url "${url}"
+            exit 0
+            ;;
+        ctrl-o)
+            open_url "${url}"
+            exit 0
             ;;
         *)
             fail "Unknown key: ${key}"
@@ -552,6 +983,7 @@ handle_key() {
 write_state() {
     {
         printf 'provider=%q\n' "${provider}"
+        printf 'remote_repository=%q\n' "${remote_repository}"
         printf 'github_repository=%q\n' "${github_repository}"
         printf 'github_repo_selector=%q\n' "${github_repo_selector}"
         declare -p github_api_args
@@ -559,6 +991,7 @@ write_state() {
         printf 'repo_dir=%q\n' "${PWD}"
         # the query context, so a --watch reload can fetch the result set again
         printf 'refresh=%q\n' "${refresh}"
+        printf 'watch_seconds=%q\n' "${watch_seconds}"
         printf 'action=%q\n' "${action}"
         printf 'ref=%q\n' "${ref}"
         printf 'tag_limit=%q\n' "${tag_limit}"
@@ -566,34 +999,43 @@ write_state() {
         printf 'grep_pattern=%q\n' "${grep_pattern}"
         printf 'per_page=%q\n' "${per_page}"
         printf 'paginate=%q\n' "${paginate}"
+        # the jobs view lists one pipeline instead of a result set of its own
+        printf 'jobs_pipeline_id=%q\n' "${jobs_pipeline_id}"
+        printf 'jobs_pipeline_json=%q\n' "${jobs_pipeline_json}"
         declare -p statuses
         declare -p var_specs
     } > "${STATE_FILE}"
 }
 
 fetch_pipelines() {
+    local pipelines
+
     case "${action}" in
-        status) cmd_status ;;
-        search) cmd_search ;;
+        status) pipelines="$(cmd_status)" || return 1 ;;
+        search) pipelines="$(cmd_search)" || return 1 ;;
         *)      return 1 ;;
     esac
+    annotate_users "${pipelines}"
 }
 
-# pipelines that are not in a final state yet, so the view has to keep updating
-has_active_pipelines() {
-    jq -e '
-        any(.[].status; . == "created" or . == "waiting_for_resource" or . == "preparing"
-            or . == "pending" or . == "queued" or . == "requested" or . == "waiting"
-            or . == "running" or . == "in_progress")
-    ' <<< "${1}" >/dev/null
+# pipelines or jobs that are not in a final state yet, so the view has to keep
+# updating
+has_active() {
+    jq -e "${JQ_ACTIVE}"'any(.[].status; active)' <<< "${1}" >/dev/null
+}
+
+# what tab narrows the list down to; the unfiltered list is what the watcher
+# looks at, so the reloading does not stop with the running pipelines hidden
+filter_active() {
+    if [ "$(active_only)" -eq 1 ]; then
+        jq "${JQ_ACTIVE}"'[ .[] | select(.status | active) ]' <<< "${1}"
+    else
+        printf '%s\n' "${1}"
+    fi
 }
 
 pick_pipelines() {
-    local watch_args=() refresh_bind=() footer_args=()
-
-    # a list nothing was silently dropped from has nothing to name
-    { [ -n "${grep_pattern}" ] || [ "${#var_specs[@]}" -gt 0 ]; } \
-        && footer_args=(--footer-prefix "${APP_NAME} --id ${id} --footer")
+    local watch_args=() refresh_bind=()
 
     if [ "${refresh}" -eq 1 ]; then
         # reload once shortly after the picker opened - a pipeline may have
@@ -609,15 +1051,42 @@ pick_pipelines() {
                     --key-descriptions "${KEY_DESCS}" \
                     --exec-keys "${EXEC_KEYS}" \
                     --silent-keys "${SILENT_KEYS}" \
-                    --columns 1,2,3,4,5 \
+                    --reload-keys "${RELOAD_KEYS}" \
+                    --columns "${PICKER_COLUMNS}" \
                     --command "${APP_NAME} --id ${id} --print" \
-                    "${footer_args[@]}" \
+                    --footer-prefix "${APP_NAME} --id ${id} --footer" \
                     "${watch_args[@]}" \
                     "${query}" \
                     --preview="${APP_NAME} --id ${id} --preview {1}" \
                     --preview-window=right:50%,wrap \
                     "${refresh_bind[@]}" \
                     --expect="${KEYS}" \
+                    --no-sort
+}
+
+pick_jobs() {
+    local watch_args=() refresh_bind=()
+
+    if [ "${refresh}" -eq 1 ]; then
+        # a job that starts while the view is open shows up on its own, and the
+        # preview of a running one keeps up with its log
+        watch_args=("--watch" "${watch_seconds}"
+                    "--watch-while" "${APP_NAME} --id ${id} --active")
+        refresh_bind=("--bind=result:refresh-preview")
+    fi
+
+    fzf-with-header --key-command "${APP_NAME} --id ${id} --jobs-key" \
+                    --key-descriptions "${JOBS_KEY_DESCS}" \
+                    --exec-keys "${JOBS_EXEC_KEYS}" \
+                    --silent-keys "${JOBS_SILENT_KEYS}" \
+                    --columns "${PICKER_COLUMNS}" \
+                    --command "${APP_NAME} --id ${id} --jobs-print" \
+                    --footer-prefix "${APP_NAME} --id ${id} --jobs-footer" \
+                    "${watch_args[@]}" \
+                    --preview="${APP_NAME} --id ${id} --jobs-preview {1}" \
+                    --preview-window=right:60%,nowrap \
+                    "${refresh_bind[@]}" \
+                    --expect="${JOBS_KEYS}" \
                     --no-sort
 }
 
@@ -684,6 +1153,9 @@ id_given=0
 query=""
 key_result=""
 preview_id=""
+jobs_pipeline_id=""
+jobs_pipeline_json=""
+remote_repository=""
 
 add_status() {
     statuses+=("${1}")
@@ -698,6 +1170,12 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ -z "${1:-}" ] && error "Missing repo argument" && usage
             repo="${1}"
+            ;;
+        -j|--jobs)
+            shift
+            [ -z "${1:-}" ] && error "Missing jobs argument" && usage
+            ! [[ "${1}" =~ ^[0-9]+$ ]] && error "Invalid pipeline id: ${1}" && usage
+            jobs_pipeline_id="${1}"
             ;;
         --ref)
             shift
@@ -754,6 +1232,24 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --footer)
             mode="footer"
+            ;;
+        --jobs-key)
+            shift
+            [ -z "${1:-}" ] && error "Missing jobs-key argument" && usage
+            mode="jobs-key"
+            key_result="${1}"
+            ;;
+        --jobs-preview)
+            shift
+            [ -z "${1:-}" ] && error "Missing jobs-preview argument" && usage
+            mode="jobs-preview"
+            preview_id="${1}"
+            ;;
+        --jobs-print)
+            mode="jobs-print"
+            ;;
+        --jobs-footer)
+            mode="jobs-footer"
             ;;
         --var)
             shift
@@ -814,9 +1310,13 @@ need_cmd jq
 
 STATE_FILE="/tmp/${APP_NAME}-${id}.state"
 JSON_FILE="/tmp/${APP_NAME}-${id}.json"
+# the status filter of the pipeline list, switched with tab while it runs
+FILTER_FILE="/tmp/${APP_NAME}-${id}.filter"
+# the users the pipelines of this run were looked up for, see gitlab_user_map
+USERS_FILE="/tmp/${APP_NAME}-${id}.users"
 
 # --key, --preview and --print are called by the picker with the id of the run
-# that produced the result set; reuse its state and cached pipelines
+# that produced the result set; reuse its state and cached pipelines or jobs
 if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; then
     # shellcheck source=/dev/null
     . "${STATE_FILE}"
@@ -828,7 +1328,8 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
     fi
     case "${mode}" in
         active)
-            has_active_pipelines "$(cat "${JSON_FILE}")"
+            # the cached list is the one of the view that asked, pipelines or jobs
+            has_active "$(cat "${JSON_FILE}")"
             exit $?
             ;;
         footer)
@@ -854,19 +1355,45 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
                 [ -n "${pipelines}" ] && printf '%s\n' "${pipelines}" > "${JSON_FILE}"
             fi
             [ -z "${pipelines}" ] && pipelines="$(cat "${JSON_FILE}")"
-            print_pipelines "${pipelines}"
+            print_pipelines "$(filter_active "${pipelines}")"
+            exit 0
+            ;;
+        jobs-footer)
+            print_jobs_footer
+            exit 0
+            ;;
+        jobs-key)
+            handle_jobs_key
+            ;;
+        jobs-preview)
+            show_job "${preview_id}"
+            exit 0
+            ;;
+        jobs-print)
+            need_cmd k-format
+            jobs=""
+            # a job that starts while the view is open is one the next reload
+            # brings, the same way the pipeline list picks up a new pipeline
+            if [ "${refresh:-0}" -eq 1 ]; then
+                jobs="$(list_jobs_json "${jobs_pipeline_id}" 2>/dev/null)"
+                [ -n "${jobs}" ] && printf '%s\n' "${jobs}" > "${JSON_FILE}"
+            fi
+            [ -z "${jobs}" ] && jobs="$(cat "${JSON_FILE}")"
+            print_jobs "${jobs}"
             exit 0
             ;;
     esac
 fi
 
 case "${mode}" in
-    key|preview|active|footer)
+    key|preview|active|footer|jobs-key|jobs-preview|jobs-print|jobs-footer)
         fail "no cached pipeline result for id ${id}"
         ;;
 esac
 
-[ -z "${action}" ] && error "Missing command" && usage
+[ -z "${action}" ] && [ -z "${jobs_pipeline_id}" ] && error "Missing command" && usage
+[ -n "${action}" ] && [ -n "${jobs_pipeline_id}" ] \
+    && error "-j/--jobs takes a pipeline instead of a command" && usage
 
 if [ "${action}" = "status" ]; then
     { [ "${#statuses[@]}" -gt 0 ] || [ "${#var_specs[@]}" -gt 0 ] || [ -n "${grep_pattern}" ] || [ -n "${source}" ] \
@@ -884,7 +1411,8 @@ if [ -n "${repo}" ]; then
     cded=1
 fi
 
-if [ -z "${ref}" ] && [ "${all_refs}" -eq 0 ]; then
+# the jobs view lists one pipeline, whichever ref it belongs to
+if [ -z "${ref}" ] && [ "${all_refs}" -eq 0 ] && [ -z "${jobs_pipeline_id}" ]; then
     ref="$(git branch --show-current)"
     [ -z "${ref}" ] && fail "failed to determine current branch (detached HEAD?); use --ref$([ "${action}" = "search" ] && echo " or --all-refs")"
 fi
@@ -898,6 +1426,37 @@ else
 fi
 
 [ "${provider}" = "gitlab" ] && project_id >/dev/null
+
+trap 'rm -f "${STATE_FILE}" "${JSON_FILE}" "${FILTER_FILE}" "${USERS_FILE}"' EXIT
+
+if [ -n "${jobs_pipeline_id}" ]; then
+    jobs="$(list_jobs_json "${jobs_pipeline_id}")" \
+        || fail "failed to list the jobs of ${jobs_pipeline_id}"
+    exit_code=0
+    if [ "${output}" = "json" ]; then
+        echo "${jobs}"
+    elif [ "${mode}" = "print" ] || [ ! -t 1 ]; then
+        need_cmd k-format
+        print_jobs "${jobs}"
+    else
+        need_cmd k-format
+        need_cmd fzf-with-header
+        # the pipeline the footer names; it is the one thing of this view that
+        # every reload would fetch again without changing
+        jobs_pipeline_json="$(pipeline_detail_json "${jobs_pipeline_id}")"
+        [ -z "${jobs_pipeline_json}" ] \
+            && jobs_pipeline_json="$(jq -cn --arg id "${jobs_pipeline_id}" '{id: $id}')"
+        [ "${watch_seconds}" -gt 0 ] && refresh=1
+        printf '%s\n' "${jobs}" > "${JSON_FILE}"
+        write_state
+        pick_jobs
+        exit_code=$?
+    fi
+    if [ "${cded}" -eq 1 ]; then
+        cd - &> /dev/null || fail "failed to return to previous directory"
+    fi
+    exit "${exit_code}"
+fi
 
 pipelines="$(fetch_pipelines)" || exit 1
 
@@ -916,13 +1475,12 @@ else
     need_cmd fzf-with-header
     if [ "${watch_seconds}" -gt 0 ]; then
         if [ -n "${grep_pattern}" ] || [ "${#var_specs[@]}" -gt 0 ]; then
-            has_active_pipelines "${pipelines}" \
+            has_active "${pipelines}" \
                 && warning "pipelines are still running, but --grep/--var results are too expensive to refresh automatically"
         else
             refresh=1
         fi
     fi
-    trap 'rm -f "${STATE_FILE}" "${JSON_FILE}"' EXIT
     printf '%s\n' "${pipelines}" > "${JSON_FILE}"
     write_state
     pick_pipelines "${pipelines}"
