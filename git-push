@@ -62,6 +62,11 @@ if [ -n "${BRANCH_FQ}" ]; then
     BRANCH="${BRANCH_FQ}"
 fi
 
+if [ "${PUSH_ONLY}" -eq 0 ] && [ -z "$(git -C "${git_dir}" status --porcelain)" ]; then
+    echo "No changes to commit."
+    PUSH_ONLY=1
+fi
+
 message="Commit and push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_ONLY}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\" (force with lease)?"
