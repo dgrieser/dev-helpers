@@ -103,4 +103,6 @@ else
     git-color -C "${git_dir}" push -u origin "${BRANCH}"
 fi
 
-git-pipe status
+# the pipelines of interest after a push are the ones of the branch it went to,
+# so the tag queries are only latency here
+git-pipe status --no-tags

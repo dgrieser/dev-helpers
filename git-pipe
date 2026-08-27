@@ -29,9 +29,9 @@ PICKER_COLUMNS="2,3,4,5,6"
 KEYS="esc,ctrl-c,ctrl-d,enter"
 EXEC_KEYS="ctrl-l"
 SILENT_KEYS="ctrl-o,ctrl-y"
-RELOAD_KEYS="tab"
-KEY_DESCS="enter:jobs,tab:running only,ctrl-y:copy url,ctrl-o:open,ctrl-l:logs"
-KEY_DESCS_HELP="enter jobs, tab running only, ctrl-y copy url, ctrl-o open, ctrl-l logs"
+RELOAD_KEYS="tab,ctrl-r"
+KEY_DESCS="enter:jobs,tab:running only,ctrl-r:refresh,ctrl-y:copy url,ctrl-o:open,ctrl-l:logs"
+KEY_DESCS_HELP="enter jobs, tab running only, ctrl-r refresh, ctrl-y copy url, ctrl-o open, ctrl-l logs"
 
 # the jobs of a pipeline, opened with enter: the log pager gets the terminal
 # handed over, the browser and the clipboard are silent, esc returns to the
@@ -54,8 +54,10 @@ recent tags are included (see --tags/--no-tags).
 Results are shown in an interactive picker (keys: ${KEY_DESCS_HELP}).
 tab narrows the list down to the pipelines that are still running and back.
 The picker reloads once ${WATCH_FIRST_DELAY} seconds after it opened, then keeps reloading
-as long as pipelines are still running. Once it stopped, a manual refresh
-(ctrl-r) that brings up a running pipeline resumes the auto-reloading.
+as long as pipelines are still running. A reload fetches the pipelines of the
+ref and of the most recent tag; ctrl-r fetches everything again, the tag list
+and the older tags included. Once the reloading stopped, a manual refresh that
+brings up a running pipeline resumes it.
 
 enter steps into a pipeline and opens a picker with its jobs, the details and
 the tail of the log of the selected job in the preview (keys: ${JOBS_KEY_DESCS_HELP}).
@@ -73,7 +75,7 @@ Options:
     -j|--jobs <PIPELINE_ID> open the jobs of a pipeline instead of the pipeline list
         --ref <REF>         ref to filter by (default: current branch)
         --tags <N>          also show the pipelines of the N most recent tags
-                            (default ${TAG_LIMIT_DEFAULT}, 0 disables; one API request per tag)
+                            (default ${TAG_LIMIT_DEFAULT}, 0 disables)
         --no-tags           shorthand for --tags 0
     -q|--query <QUERY>      start the picker with a search query
     -p|--print              print the result table instead of opening the picker
@@ -374,31 +376,74 @@ list_tag_names() {
     fi
 }
 
-# neither API can filter pipelines by "is a tag", so query the most recent tags
-# by ref - both providers accept a tag name where they take a branch/ref
-list_tag_pipelines_json() {
-    local out="[]" tag part
-    local saved_ref="${ref}"
-    local saved_per_page="${per_page}"
-    local saved_paginate="${paginate}"
-    local saved_truncated="${TRUNCATED}"
+# the tags of a repository change rarely, and a reload of the picker is not what
+# brings a new one, so the list is asked for once per run
+cached_tag_names() {
+    if [ ! -s "${TAGS_FILE}" ]; then
+        list_tag_names | head -n "${tag_limit}" > "${TAGS_FILE}"
+    fi
+    cat "${TAGS_FILE}"
+}
 
-    per_page="${TAG_PER_PAGE}"
-    paginate=0
+# Neither API can filter pipelines by "is a tag", so query the tags by ref - both
+# providers accept a tag name where they take a branch/ref. That is one request
+# per tag, and they wait for the network instead of for each other, so they run
+# at once and every one of them answers into a file of its own.
+fetch_tag_pipelines() {
+    local tags="${1}"
+    local dir tag out
+    local i=0
+
+    [ -z "${tags}" ] && { echo "[]"; return 0; }
+    dir="$(mktemp -d)" || { echo "[]"; return 0; }
     while IFS= read -r tag; do
         [ -z "${tag}" ] && continue
-        ref="${tag}"
-        part="$(list_pipelines_json)" || part="[]"
-        out="$(jq -s 'add' <(printf '%s\n' "${out}") <(printf '%s\n' "${part}"))"
-    done < <(list_tag_names | head -n "${tag_limit}")
+        (
+            # the query context of a tag belongs to its subshell alone, so the
+            # ref and the window of the caller stay what they are and TRUNCATED
+            # keeps naming the main query
+            ref="${tag}"
+            per_page="${TAG_PER_PAGE}"
+            paginate=0
+            part="$(list_pipelines_json 2>/dev/null)" || part="[]"
+            [ -z "${part}" ] && part="[]"
+            printf '%s\n' "${part}"
+        ) > "${dir}/${i}" &
+        i=$((i + 1))
+    done <<< "${tags}"
+    wait
 
-    ref="${saved_ref}"
-    per_page="${saved_per_page}"
-    paginate="${saved_paginate}"
-    # the tag queries use their own window, so keep the warning about the main one
-    TRUNCATED="${saved_truncated}"
+    if [ "${i}" -eq 0 ]; then
+        out="[]"
+    else
+        out="$(cat "${dir}"/* | jq -s 'add // []')" || out="[]"
+    fi
+    rm -rf "${dir}"
+    printf '%s\n' "${out}"
+}
 
-    jq 'unique_by(.id) | sort_by(.id) | reverse' <<< "${out}"
+# The pipelines of a tag that is not the most recent one are done with, so they
+# are fetched once and read back from the cache by every reload after that; only
+# the newest tag can still have something running, so only it is asked for again.
+# ctrl-r drops both caches, see handle_key.
+list_tag_pipelines_json() {
+    local tags newest older cached fresh
+
+    tags="$(cached_tag_names)"
+    [ -z "${tags}" ] && { echo "[]"; return 0; }
+    newest="$(head -n 1 <<< "${tags}")"
+    older="$(tail -n +2 <<< "${tags}")"
+
+    if [ -s "${TAGPIPES_FILE}" ]; then
+        cached="$(cat "${TAGPIPES_FILE}")"
+    else
+        cached="$(fetch_tag_pipelines "${older}")"
+        printf '%s\n' "${cached}" > "${TAGPIPES_FILE}"
+    fi
+    fresh="$(fetch_tag_pipelines "${newest}")"
+
+    jq -s 'add | unique_by(.id) | sort_by(.id) | reverse' \
+        <(printf '%s\n' "${cached}") <(printf '%s\n' "${fresh}")
 }
 
 merge_tag_pipelines() {
@@ -911,6 +956,12 @@ handle_key() {
             toggle_active_only
             exit 0
             ;;
+        ctrl-r)
+            # the tags of a run are fetched once, and a manual refresh is what
+            # asks for them again
+            rm -f "${TAGS_FILE}" "${TAGPIPES_FILE}"
+            exit 0
+            ;;
         esc|ctrl-c|ctrl-d)
             exit 255
             ;;
@@ -1314,6 +1365,10 @@ JSON_FILE="/tmp/${APP_NAME}-${id}.json"
 FILTER_FILE="/tmp/${APP_NAME}-${id}.filter"
 # the users the pipelines of this run were looked up for, see gitlab_user_map
 USERS_FILE="/tmp/${APP_NAME}-${id}.users"
+# the tags of this run and the pipelines of the ones that are not the newest,
+# both fetched once and dropped by ctrl-r
+TAGS_FILE="/tmp/${APP_NAME}-${id}.tags"
+TAGPIPES_FILE="/tmp/${APP_NAME}-${id}.tagpipes"
 
 # --key, --preview and --print are called by the picker with the id of the run
 # that produced the result set; reuse its state and cached pipelines or jobs
@@ -1427,7 +1482,7 @@ fi
 
 [ "${provider}" = "gitlab" ] && project_id >/dev/null
 
-trap 'rm -f "${STATE_FILE}" "${JSON_FILE}" "${FILTER_FILE}" "${USERS_FILE}"' EXIT
+trap 'rm -f "${STATE_FILE}" "${JSON_FILE}" "${FILTER_FILE}" "${USERS_FILE}" "${TAGS_FILE}" "${TAGPIPES_FILE}"' EXIT
 
 if [ -n "${jobs_pipeline_id}" ]; then
     jobs="$(list_jobs_json "${jobs_pipeline_id}")" \

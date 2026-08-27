@@ -174,5 +174,7 @@ if [ "${create}" -eq 1 ]; then
     git-color tag -f "${tag}" "${commit}" && git-color push origin "${fq_tag}"
     [ $? -ne 0 ] && abort
 
-    git-pipe status
+    # the pipeline of interest is the one the tag just pushed triggered, so ask
+    # for that ref instead of the branch and skip the tag queries
+    git-pipe status --ref "${tag}" --no-tags
 fi
