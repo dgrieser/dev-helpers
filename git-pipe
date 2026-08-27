@@ -7,6 +7,9 @@ APP_NAME="$(basename "${0}")"
 PER_PAGE_DEFAULT=20
 WATCH_SECONDS_DEFAULT=5
 WATCH_FIRST_DELAY=10
+# a pipeline a push just triggered may not be there yet, see wait_for_pipelines
+WAIT_SECONDS_DEFAULT=30
+WAIT_POLL_SECONDS=3
 # how many of the most recent tags to include pipelines for, and how many
 # pipelines to fetch per tag
 TAG_LIMIT_DEFAULT=3
@@ -81,6 +84,10 @@ Options:
     -p|--print              print the result table instead of opening the picker
     -w|--watch <SECONDS>    reload interval while pipelines are still running
                             (default ${WATCH_SECONDS_DEFAULT}, 0 disables auto-reloading)
+        --wait [SECONDS]    wait up to SECONDS for a pipeline to show up instead
+                            of reporting none right away; a pipeline a push just
+                            triggered takes a moment to exist
+                            (default ${WAIT_SECONDS_DEFAULT} when no value is given)
 
 search options:
         --all-refs            do not filter by ref (search all refs)
@@ -1069,6 +1076,31 @@ fetch_pipelines() {
     annotate_users "${pipelines}"
 }
 
+# The pipeline of a ref that was just pushed does not exist the moment the push
+# returns, so asking for it right away answers with nothing. --wait keeps asking
+# until one shows up or the time is up.
+wait_for_pipelines() {
+    local pipelines="${1}"
+    local count deadline left nap
+
+    count="$(jq 'length' <<< "${pipelines}")"
+    { [ "${count}" -gt 0 ] || [ "${wait_seconds}" -le 0 ]; } \
+        && { printf '%s\n' "${pipelines}"; return 0; }
+
+    log "No pipelines yet, waiting up to ${wait_seconds}s for one to show up..."
+    deadline=$((SECONDS + wait_seconds))
+    while [ "${SECONDS}" -lt "${deadline}" ]; do
+        left=$((deadline - SECONDS))
+        nap="${WAIT_POLL_SECONDS}"
+        [ "${left}" -lt "${nap}" ] && nap="${left}"
+        sleep "${nap}"
+        pipelines="$(fetch_pipelines)" || return 1
+        count="$(jq 'length' <<< "${pipelines}")"
+        [ "${count}" -gt 0 ] && break
+    done
+    printf '%s\n' "${pipelines}"
+}
+
 # pipelines or jobs that are not in a final state yet, so the view has to keep
 # updating
 has_active() {
@@ -1198,6 +1230,7 @@ var_specs=()
 TRUNCATED=0
 mode="list"
 watch_seconds="${WATCH_SECONDS_DEFAULT}"
+wait_seconds=0
 refresh=0
 id=$$
 id_given=0
@@ -1259,6 +1292,15 @@ while [ "${#}" -gt 0 ]; do
             [ -z "${1:-}" ] && error "Missing watch argument" && usage
             ! [[ "${1}" =~ ^[0-9]+$ ]] && error "Invalid watch interval: ${1}" && usage
             watch_seconds="${1}"
+            ;;
+        --wait)
+            # the seconds are optional: bare --wait waits the default
+            if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+                shift
+                wait_seconds="${1}"
+            else
+                wait_seconds="${WAIT_SECONDS_DEFAULT}"
+            fi
             ;;
         --id)
             shift
@@ -1514,6 +1556,7 @@ if [ -n "${jobs_pipeline_id}" ]; then
 fi
 
 pipelines="$(fetch_pipelines)" || exit 1
+pipelines="$(wait_for_pipelines "${pipelines}")" || exit 1
 
 pipeline_count="$(jq 'length' <<< "${pipelines}")"
 

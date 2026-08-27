@@ -175,6 +175,7 @@ if [ "${create}" -eq 1 ]; then
     [ $? -ne 0 ] && abort
 
     # the pipeline of interest is the one the tag just pushed triggered, so ask
-    # for that ref instead of the branch and skip the tag queries
-    git-pipe status --ref "${tag}" --no-tags
+    # for that ref instead of the branch and skip the tag queries; it takes a
+    # moment to exist, hence --wait
+    git-pipe status --ref "${tag}" --no-tags --wait
 fi
