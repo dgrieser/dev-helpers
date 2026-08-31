@@ -171,8 +171,10 @@ _git-activity-to-issue()
     __dh_init
     case "${prev}" in
         --start|--end|--per-page|--max-pages|--time-spent-slot-minutes|--filter) return 0 ;;
+        --issue-group|--issue-project|--issue-limit) return 0 ;;
+        --issue-state) __dh_compgen "opened closed all"; return 0 ;;
     esac
-    __dh_compgen "--start --end --per-page --max-pages --json-array --time-spent --time-spent-book --interactive --time-spent-slot-minutes --filter -v --verbose -h --help"
+    __dh_compgen "--start --end --per-page --max-pages --json-array --time-spent --time-spent-book --interactive --issue-group --issue-project --issue-limit --issue-state --time-spent-slot-minutes --filter -v --verbose -h --help"
     return 0
 }
 complete -F _git-activity-to-issue git-activity-to-issue

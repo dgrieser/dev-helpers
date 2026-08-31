@@ -31,9 +31,49 @@ __dh_complete_alias g git-find-repo      # map wrapper functions explicitly
 ## Tools
 
 ### git-activity-to-issue
-Resolve GitLab activity feed items to issue references.
+Resolve GitLab activity feed items to issue references, and book the time they
+stand for to those issues.
+
+Every activity in the given range is walked back to the issues it belongs to:
+directly for an issue event, through the merge request of a branch or a commit,
+through the issues a merge request closes or is related to, and through every
+issue reference in a commit message, a commit comment or a note. `--time-spent`
+adds the working block an activity falls into, `--time-spent-book` books that
+block as a timelog on each resolved issue.
+
+`--interactive` takes over where an activity resolves to nothing, which today is
+a `WARNING: No issue found for …` and nothing else: a picker opens on the issues
+of the configured groups and projects, `enter` uses the one under the cursor and
+`alt-i` creates a new one - project, title, description, parent epic, labels and
+assignee are asked in turn, and the created issue is used right away. `ctrl-s`
+searches GitLab for issues the preloaded list does not have, prefilled with the
+words of the activity, `ctrl-f` scopes the list to another group and keeps it
+there for the rest of the run, `ctrl-t` resolves the activity again - for a
+reference that was just fixed in GitLab - and `esc` leaves the activity without
+an issue, as before.
+
+Afterwards two questions follow. The first offers to write the reference back to
+GitLab, as a comment on the commit of a push or on the merge request of a note,
+so the next run resolves the activity on its own. The second offers to use the
+same issue for every activity of the same kind in the same project - all commit
+pushes, all new branches, all comments - or for every activity in that project;
+that choice lives for the current run only and is never written to disk.
+
+Without `--issue-group` or `--issue-project` the run asks where to look, once,
+the first time an activity actually needs the picker: a list of the user's groups
+and projects opens, `tab` marks as many as wanted and `enter` takes them. `esc`
+skips the question, and the picker then offers the issues of the activity's own
+project, of its top-level group and the ones assigned to the user. Either way the
+activity's own project is always among them.
+
+`--interactive` falls back to the plain warnings when there is no terminal.
 ```bash
-git-activity-to-issue
+git-activity-to-issue [--start <date>] [--end <date>] [--per-page <n>] [--max-pages <n>] \
+                      [--json-array] [--time-spent] [--time-spent-book] \
+                      [--time-spent-slot-minutes <n>] [--interactive] \
+                      [--issue-group <group>] [--issue-project <project>] \
+                      [--issue-limit <n>] [--issue-state opened|closed|all] \
+                      [--filter <url>] [-v|--verbose]
 ```
 
 ### git-add

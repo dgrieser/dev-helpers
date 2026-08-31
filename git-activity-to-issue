@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, time, timedelta, timezone
 import json
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -301,6 +304,1198 @@ def url_is_filtered(url: str | None, filters: list[str]) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------
+# interactive issue picking and creation
+# --------------------------------------------------------------------------
+
+# the first column identifies the issue for the keys and for the preview, the
+# picker shows the reference a person recognises instead (see PICK_COLUMNS)
+PICK_COLUMNS = "2,3,4,5"
+# only these end the picker: three of them return a decision, esc drops it
+PICK_KEYS = "enter,esc,alt-i,ctrl-t"
+# searching and scoping change what the list shows without needing the screen
+PICK_RELOAD_KEYS = "ctrl-s,ctrl-f"
+# the browser and the clipboard leave the list as it is
+PICK_SILENT_KEYS = "ctrl-o,ctrl-y"
+PICK_KEY_DESCS = (
+    "enter:use issue,alt-i:new issue,ctrl-s:search,ctrl-f:group,"
+    "ctrl-t:try again,ctrl-o:open,ctrl-y:copy url,ctrl-r:refresh,esc:skip"
+)
+PICK_HELPERS = (
+    "fzf",
+    "fzf-with-header",
+    "prompt-input",
+    "prompt-multiline",
+    "prompt-no-yes",
+    "prompt-select",
+)
+
+C_REF = "\033[33m"
+C_OPEN = "\033[32m"
+C_CLOSED = "\033[31m"
+C_MUTED = "\033[38;5;245m"
+C_RESET = "\033[0m"
+
+# words that say nothing about which issue an activity belongs to
+PICK_QUERY_STOP_WORDS = {
+    "add", "added", "and", "branch", "build", "chore", "ci", "commit", "created",
+    "deleted", "docs", "feat", "fix", "fixed", "for", "from", "into", "merge",
+    "merged", "opened", "project", "pushed", "refactor", "remove", "removed",
+    "style", "test", "tests", "the", "update", "updated", "with",
+}
+
+
+def helper_path(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def missing_pick_helpers() -> list[str]:
+    return [name for name in PICK_HELPERS if helper_path(name) is None]
+
+
+def tty_available() -> bool:
+    try:
+        with open("/dev/tty", "r", encoding="utf-8"):
+            return True
+    except OSError:
+        return False
+
+
+def self_command() -> str:
+    return os.path.realpath(sys.argv[0])
+
+
+def pick_state_path(run_id: str, suffix: str) -> str:
+    return f"/tmp/git-activity-to-issue-{run_id}.{suffix}.json"
+
+
+def read_json_file(path: str, default: Any = None) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json_file(path: str, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False)
+
+
+def remove_pick_state(run_id: str) -> None:
+    for suffix in ("state", "candidates", "choice", "scope"):
+        try:
+            os.remove(pick_state_path(run_id, suffix))
+        except OSError:
+            pass
+
+
+def short_age(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return "-"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    seconds = (datetime.now(timezone.utc) - parsed).total_seconds()
+    if seconds < 0:
+        seconds = 0
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 14:
+        return f"{days}d"
+    if days < 60:
+        return f"{days // 7}w"
+    if days < 730:
+        return f"{days // 30}mo"
+    return f"{days // 365}y"
+
+
+def local_datetime(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def activity_kind(event: dict[str, Any]) -> tuple[str, str]:
+    """A key grouping activities that deserve the same issue, and its label."""
+    target_type = str(event.get("target_type") or "")
+    action_name = str(event.get("action_name") or "")
+    push_data = event.get("push_data")
+    if not isinstance(push_data, dict):
+        push_data = {}
+    ref_type = str(push_data.get("ref_type") or "")
+
+    if target_type == "Project" and ref_type == "branch":
+        if "new" in action_name:
+            return ("push:branch:new", "new branch pushes")
+        return ("push:branch:commits", "commit pushes")
+    if target_type == "Project" and ref_type == "tag":
+        return ("push:tag", "tag pushes")
+    if target_type == "Project":
+        return ("push:other", "pushes")
+    if target_type == "MergeRequest":
+        action = action_name or "changed"
+        return (f"mr:{action}", f"{action} merge requests")
+    if target_type in ("Note", "DiffNote", "DiscussionNote"):
+        return ("note", "comments")
+    if target_type in ("Issue", "WorkItem"):
+        action = action_name or "changed"
+        return (f"issue:{action}", f"{action} issues")
+    kind = f"{target_type or 'activity'}:{action_name or 'changed'}"
+    return (kind, f"{kind} activities")
+
+
+def pick_query_prefill(event: dict[str, Any]) -> str:
+    push_data = event.get("push_data")
+    if not isinstance(push_data, dict):
+        push_data = {}
+    note = event.get("note")
+    if not isinstance(note, dict):
+        note = {}
+    text = " ".join(
+        dedupe_summary_parts(
+            [
+                event.get("target_title"),
+                push_data.get("commit_title"),
+                push_data.get("ref"),
+                note.get("body"),
+            ]
+        )
+    )
+    words: list[str] = []
+    for raw in re.split(r"[^A-Za-z0-9]+", text):
+        word = raw.strip().lower()
+        if len(word) < 3 or word in PICK_QUERY_STOP_WORDS or word.isdigit():
+            continue
+        if word in words:
+            continue
+        words.append(word)
+        if len(words) >= 6:
+            break
+    return " ".join(words)
+
+
+def scope_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "groups": list(args.issue_group),
+        "projects": list(args.issue_project),
+        "limit": args.issue_limit,
+        "state": args.issue_state,
+        # without a scope of its own the picker leans on what is assigned to the
+        # user, which is where an issue worth booking to usually is
+        "assigned": not (args.issue_group or args.issue_project),
+        "explicit": bool(args.issue_group or args.issue_project),
+        # a scope nobody named on the command line is asked for once, the first
+        # time an activity actually needs the picker
+        "asked": bool(args.issue_group or args.issue_project),
+    }
+
+
+def scope_for_event(api: GitLabApi, event: dict[str, Any], scope: dict[str, Any]) -> dict[str, Any]:
+    """The configured scope, widened by the project the activity happened in."""
+    result = dict(scope)
+    result["groups"] = list(scope.get("groups") or [])
+    result["projects"] = list(scope.get("projects") or [])
+    project_id = int_or_none(event.get("project_id"))
+    if project_id is None:
+        return result
+    if str(project_id) not in result["projects"]:
+        result["projects"].append(str(project_id))
+    if not scope.get("explicit"):
+        try:
+            namespace = project_namespace_path(api, project_id)
+        except RuntimeError:
+            namespace = None
+        if namespace:
+            root = namespace.split("/", 1)[0]
+            if root not in result["groups"]:
+                result["groups"].append(root)
+    return result
+
+
+def scope_label(scope: dict[str, Any]) -> str:
+    parts = list(scope.get("groups") or []) + list(scope.get("projects") or [])
+    if scope.get("assigned"):
+        parts.append("assigned to me")
+    return ", ".join(parts) if parts else "none"
+
+
+def scope_issue_paths(scope: dict[str, Any], *, search: str | None = None) -> list[str]:
+    limit = int(scope.get("limit") or 100)
+    state = str(scope.get("state") or "opened")
+    extra = ""
+    if search:
+        # a search is meant to find the one issue that was named, closed or not
+        state = "all"
+        extra = (
+            f"&search={urllib.parse.quote(search, safe='')}"
+            "&in=title%2Cdescription"
+        )
+    paths: list[str] = []
+    for group in scope.get("groups") or []:
+        encoded = urllib.parse.quote(str(group), safe="")
+        paths.append(
+            f"groups/{encoded}/issues?scope=all&state={state}"
+            f"&order_by=updated_at&per_page={limit}{extra}"
+        )
+    for project in scope.get("projects") or []:
+        encoded = urllib.parse.quote(str(project), safe="")
+        paths.append(
+            f"projects/{encoded}/issues?state={state}"
+            f"&order_by=updated_at&per_page={limit}{extra}"
+        )
+    if scope.get("assigned"):
+        paths.append(
+            f"issues?scope=assigned_to_me&state={state}"
+            f"&order_by=updated_at&per_page={limit}{extra}"
+        )
+    return paths
+
+
+def candidate_from_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    project_id = int_or_none(item.get("project_id"))
+    iid = int_or_none(item.get("iid"))
+    if project_id is None or iid is None:
+        return None
+
+    project_path = ""
+    references = item.get("references")
+    if isinstance(references, dict):
+        full = references.get("full")
+        if isinstance(full, str) and "#" in full:
+            project_path = full.rsplit("#", 1)[0]
+    if not project_path:
+        web_url = item.get("web_url")
+        if isinstance(web_url, str) and "/-/" in web_url:
+            path = urllib.parse.urlsplit(web_url).path
+            project_path = path.split("/-/", 1)[0].strip("/")
+    if not project_path:
+        project_path = str(project_id)
+
+    epic = item.get("epic")
+    epic_title = None
+    if isinstance(epic, dict):
+        epic_title = epic.get("title")
+
+    milestone = item.get("milestone")
+    milestone_title = None
+    if isinstance(milestone, dict):
+        milestone_title = milestone.get("title")
+
+    assignees = []
+    for assignee in item.get("assignees") or []:
+        if isinstance(assignee, dict) and assignee.get("username"):
+            assignees.append(str(assignee["username"]))
+
+    return {
+        "ref": f"{project_id}#{iid}",
+        "project_id": project_id,
+        "iid": iid,
+        "project_path": project_path,
+        "full_ref": f"{project_path}#{iid}",
+        "title": clean_summary_part(item.get("title")) or "-",
+        "state": str(item.get("state") or "-"),
+        "updated_at": item.get("updated_at") or item.get("created_at") or "",
+        "web_url": item.get("web_url") or "",
+        "labels": [str(label) for label in (item.get("labels") or [])],
+        "milestone": milestone_title,
+        "epic": epic_title,
+        "assignees": assignees,
+        "description": item.get("description") or "",
+    }
+
+
+def load_candidates(
+    api: GitLabApi,
+    scope: dict[str, Any],
+    *,
+    search: str | None = None,
+    existing: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for candidate in existing or []:
+        merged[candidate["ref"]] = candidate
+
+    for path in scope_issue_paths(scope, search=search):
+        try:
+            data = api.get(path)
+        except RuntimeError as exc:
+            verbose_log(api.verbose, f"candidates {path}: {exc}")
+            continue
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            candidate = candidate_from_item(item)
+            if candidate is not None:
+                merged[candidate["ref"]] = candidate
+
+    return sorted(
+        merged.values(), key=lambda entry: str(entry.get("updated_at") or ""), reverse=True
+    )
+
+
+def pad_column(value: str, width: int) -> str:
+    return value + " " * max(2, width - len(value) + 2)
+
+
+def print_candidate_rows(candidates: list[dict[str, Any]]) -> None:
+    refs = [entry["ref"] for entry in candidates] or ["REF"]
+    states = [entry["state"] for entry in candidates] or ["STATE"]
+    ages = [short_age(entry.get("updated_at")) for entry in candidates] or ["UPDATED"]
+    issues = [
+        ellipsize(entry["full_ref"], 46) for entry in candidates
+    ] or ["ISSUE"]
+
+    ref_width = max(len("REF"), *(len(value) for value in refs))
+    state_width = max(len("STATE"), *(len(value) for value in states))
+    age_width = max(len("UPDATED"), *(len(value) for value in ages))
+    issue_width = max(len("ISSUE"), *(len(value) for value in issues))
+
+    print(
+        pad_column("REF", ref_width)
+        + pad_column("STATE", state_width)
+        + pad_column("UPDATED", age_width)
+        + pad_column("ISSUE", issue_width)
+        + "TITLE"
+    )
+    for index, entry in enumerate(candidates):
+        state = entry["state"]
+        state_color = C_OPEN if state == "opened" else C_CLOSED
+        print(
+            C_REF
+            + pad_column(entry["ref"], ref_width)
+            + C_RESET
+            + state_color
+            + pad_column(state, state_width)
+            + C_RESET
+            + C_MUTED
+            + pad_column(ages[index], age_width)
+            + C_RESET
+            + pad_column(issues[index], issue_width)
+            + entry["title"]
+        )
+
+
+def print_candidate_preview(candidate: dict[str, Any]) -> None:
+    print(f"{C_REF}{candidate['full_ref']}{C_RESET}  {candidate['title']}")
+    print()
+    rows = [
+        ("state", candidate.get("state")),
+        ("updated", local_datetime(candidate.get("updated_at"))),
+        ("epic", candidate.get("epic")),
+        ("milestone", candidate.get("milestone")),
+        ("assignees", ", ".join(candidate.get("assignees") or [])),
+        ("labels", ", ".join(candidate.get("labels") or [])),
+        ("url", candidate.get("web_url")),
+    ]
+    for label, value in rows:
+        if value:
+            print(f"{C_MUTED}{label:<10}{C_RESET}{value}")
+    description = candidate.get("description") or ""
+    if description:
+        print()
+        rendered = description
+        if helper_path("glow"):
+            width = int_or_none(os.environ.get("FZF_PREVIEW_COLUMNS")) or 100
+            proc = subprocess.run(
+                ["glow", "-s", "dark", "-w", str(max(20, width - 2)), "-"],
+                check=False,
+                text=True,
+                input=description,
+                stdout=subprocess.PIPE,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                rendered = proc.stdout.rstrip("\n")
+        print(rendered)
+
+
+def run_prompt(cmd: list[str]) -> tuple[int, str]:
+    """Run a cli-helpers prompt; its UI is on the tty, its answer on stdout."""
+    proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE)
+    return proc.returncode, (proc.stdout or "").strip("\n")
+
+
+def ask_line(question: str, default: str = "") -> str | None:
+    cmd = ["prompt-input", question]
+    if default:
+        cmd.extend(["--default", default])
+    code, answer = run_prompt(cmd)
+    if code != 0:
+        return None
+    return answer
+
+
+def ask_text(default: str = "") -> str | None:
+    cmd = ["prompt-multiline"]
+    if default:
+        cmd.extend(["--default", default])
+    code, answer = run_prompt(cmd)
+    if code != 0:
+        return None
+    return answer
+
+
+def ask_no_yes(question: str) -> bool:
+    proc = subprocess.run(["prompt-no-yes", question], check=False)
+    return proc.returncode == 0
+
+
+def ask_select(question: str, entries: list[tuple[str, str]], default: str = "") -> str | None:
+    cmd = ["prompt-select", "--prompt", question, "--return", "key"]
+    if default:
+        cmd.extend(["--default", default])
+    cmd.extend(f"{key}={title}" for key, title in entries)
+    code, answer = run_prompt(cmd)
+    if code != 0:
+        return None
+    return answer
+
+
+def glab_write(
+    api: GitLabApi,
+    method: str,
+    path: str,
+    fields: list[tuple[str, str]],
+    *,
+    typed: tuple[str, ...] = (),
+) -> Any:
+    cmd = ["glab", "api", "-X", method, path]
+    for key, value in fields:
+        flag = "--field" if key in typed else "--raw-field"
+        cmd.extend([flag, f"{key}={value}"])
+    if api.verbose:
+        print(" ".join(cmd), file=sys.stderr)
+    proc = subprocess.run(
+        cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"glab api {method} {path} failed")
+    try:
+        return json.loads(proc.stdout or "null")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid JSON from glab api {path}: {exc}") from exc
+
+
+def resolve_project_id(api: GitLabApi, value: str) -> int | None:
+    numeric = int_or_none(value)
+    if numeric is not None:
+        return numeric
+    project = project_from_path(api, value)
+    if project is None:
+        return None
+    return int_or_none(project.get("id"))
+
+
+def user_id_for_username(api: GitLabApi, username: str) -> int | None:
+    encoded = urllib.parse.quote(username, safe="")
+    try:
+        data = api.get(f"users?username={encoded}")
+    except RuntimeError:
+        return None
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, dict):
+            return int_or_none(first.get("id"))
+    return None
+
+
+def group_epics(api: GitLabApi, project_id: int) -> list[dict[str, Any]]:
+    try:
+        namespace = project_namespace_path(api, project_id)
+    except RuntimeError:
+        return []
+    if not namespace:
+        return []
+    root = namespace.split("/", 1)[0]
+    encoded = urllib.parse.quote(root, safe="")
+    try:
+        data = api.get(
+            f"groups/{encoded}/epics?state=opened&include_descendant_groups=true"
+            "&order_by=updated_at&per_page=100"
+        )
+    except RuntimeError as exc:
+        warning(f"cannot list the epics of {root}: {exc}")
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+def known_project_paths(state: dict[str, Any], candidates: list[dict[str, Any]]) -> list[str]:
+    paths: list[str] = []
+    own = state.get("project_path")
+    if own:
+        paths.append(str(own))
+    for candidate in candidates:
+        path = candidate.get("project_path")
+        if path and path not in paths:
+            paths.append(str(path))
+    return paths
+
+
+def create_issue_interactively(
+    api: GitLabApi, state: dict[str, Any], candidates: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Walk the user through creating an issue. None means they aborted."""
+    default_project = str(state.get("project_path") or "")
+    paths = known_project_paths(state, candidates)
+    code, answer = run_prompt(
+        ["prompt-complete", "--prompt", "Project:", "--default", default_project] + paths
+    )
+    if code != 0:
+        return None
+    project_path = answer.strip() or default_project
+    if not project_path:
+        warning("no project for the new issue")
+        return None
+
+    project_id = resolve_project_id(api, project_path)
+    if project_id is None:
+        warning(f"unknown project: {project_path}")
+        return None
+
+    title = ask_line("Title:", str(state.get("issue_title_default") or ""))
+    if title is None:
+        return None
+    title = title.strip()
+    if not title:
+        warning("an issue needs a title")
+        return None
+
+    print("Description:", file=sys.stderr)
+    description = ask_text(str(state.get("issue_description_default") or ""))
+    if description is None:
+        return None
+
+    epic_id: int | None = None
+    epics = group_epics(api, project_id)
+    if epics:
+        entries = [("", "(none)")]
+        for epic in epics:
+            epic_iid = int_or_none(epic.get("id"))
+            if epic_iid is None:
+                continue
+            entries.append((str(epic_iid), ellipsize(epic.get("title"), 80)))
+        answer = ask_select("Parent epic:", entries, default="")
+        if answer is None:
+            return None
+        epic_id = int_or_none(answer)
+
+    labels = ask_line("Labels (comma separated):", "")
+    if labels is None:
+        return None
+
+    assignee = ask_line("Assignee:", str(state.get("current_username") or ""))
+    if assignee is None:
+        return None
+
+    print(file=sys.stderr)
+    print(f"{project_path}: {title}", file=sys.stderr)
+    proc = subprocess.run(["prompt-continue"], check=False)
+    if proc.returncode != 0:
+        return None
+
+    fields: list[tuple[str, str]] = [("title", title), ("description", description)]
+    if labels.strip():
+        fields.append(("labels", labels.strip()))
+    assignee_id = user_id_for_username(api, assignee.strip()) if assignee.strip() else None
+    if assignee_id is not None:
+        fields.append(("assignee_ids[]", str(assignee_id)))
+    typed = ("assignee_ids[]", "epic_id")
+
+    path = f"projects/{project_id}/issues"
+    created: Any = None
+    if epic_id is not None:
+        try:
+            created = glab_write(
+                api, "POST", path, fields + [("epic_id", str(epic_id))], typed=typed
+            )
+        except RuntimeError as exc:
+            warning(f"cannot set the parent epic, creating without it: {exc}")
+            created = None
+    if not isinstance(created, dict):
+        try:
+            created = glab_write(api, "POST", path, fields, typed=typed)
+        except RuntimeError as exc:
+            warning(f"cannot create the issue: {exc}")
+            return None
+
+    candidate = candidate_from_item(created)
+    if candidate is None:
+        warning("GitLab did not return the created issue")
+        return None
+    print(f"created {candidate['full_ref']} {candidate['web_url']}", file=sys.stderr)
+    return candidate
+
+
+def write_back_target(
+    state: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[str, str, str] | None:
+    """(label, api path, body field) of the place a back reference belongs."""
+    project_id = int_or_none(state.get("project_id"))
+    target_type = str(state.get("target_type") or "")
+    target_iid = int_or_none(state.get("target_iid"))
+    commit_sha = str(state.get("commit_sha") or "")
+    noteable_type = str(state.get("noteable_type") or "")
+    noteable_iid = int_or_none(state.get("noteable_iid"))
+
+    if project_id is not None:
+        if target_type == "Project" and commit_sha:
+            return (
+                f"comment on commit {commit_sha[:8]}",
+                f"projects/{project_id}/repository/commits/{commit_sha}/comments",
+                "note",
+            )
+        if target_type == "MergeRequest" and target_iid is not None:
+            return (
+                f"comment on merge request !{target_iid}",
+                f"projects/{project_id}/merge_requests/{target_iid}/notes",
+                "body",
+            )
+        if noteable_iid is not None and noteable_type == "MergeRequest":
+            return (
+                f"comment on merge request !{noteable_iid}",
+                f"projects/{project_id}/merge_requests/{noteable_iid}/notes",
+                "body",
+            )
+        if noteable_iid is not None and noteable_type in ("Issue", "WorkItem"):
+            return (
+                f"comment on issue #{noteable_iid}",
+                f"projects/{project_id}/issues/{noteable_iid}/notes",
+                "body",
+            )
+
+    issue_project = int_or_none(candidate.get("project_id"))
+    issue_iid = int_or_none(candidate.get("iid"))
+    if issue_project is None or issue_iid is None:
+        return None
+    return (
+        f"comment on {candidate['full_ref']}",
+        f"projects/{issue_project}/issues/{issue_iid}/notes",
+        "body",
+    )
+
+
+def offer_write_back(api: GitLabApi, state: dict[str, Any], candidate: dict[str, Any]) -> None:
+    target = write_back_target(state, candidate)
+    if target is None:
+        return
+    label, path, field = target
+    if not ask_no_yes(f"Link this activity to {candidate['full_ref']} ({label})?"):
+        return
+    body = candidate["full_ref"]
+    activity_url = state.get("activity_url")
+    if activity_url:
+        body = f"{body}\n\n{activity_url}"
+    try:
+        glab_write(api, "POST", path, [(field, body)])
+    except RuntimeError as exc:
+        warning(f"cannot write the back reference: {exc}")
+        return
+    print(f"linked {candidate['full_ref']} ({label})", file=sys.stderr)
+
+
+def ask_reuse(state: dict[str, Any], candidate: dict[str, Any]) -> str:
+    kind_label = str(state.get("kind_label") or "activities")
+    project_path = str(state.get("project_path") or "this project")
+    answer = ask_select(
+        f"Use {candidate['full_ref']} for:",
+        [
+            ("none", "just this activity"),
+            ("kind", f"all {kind_label} in {project_path}"),
+            ("project", f"all activities in {project_path}"),
+        ],
+        default="none",
+    )
+    return answer or "none"
+
+
+def finish_choice(
+    api: GitLabApi,
+    run_id: str,
+    state: dict[str, Any],
+    candidate: dict[str, Any],
+    source: str,
+) -> int:
+    offer_write_back(api, state, candidate)
+    reuse = ask_reuse(state, candidate)
+    write_json_file(
+        pick_state_path(run_id, "choice"),
+        {"action": "use", "source": source, "reuse": reuse, "issue": candidate},
+    )
+    return 1
+
+
+def pick_print(run_id: str) -> int:
+    candidates = read_json_file(pick_state_path(run_id, "candidates"), []) or []
+    print_candidate_rows(candidates)
+    return 0
+
+
+def pick_preview(run_id: str, ref: str) -> int:
+    candidates = read_json_file(pick_state_path(run_id, "candidates"), []) or []
+    for candidate in candidates:
+        if candidate.get("ref") == ref:
+            print_candidate_preview(candidate)
+            return 0
+    return 0
+
+
+def pick_footer(run_id: str) -> int:
+    state = read_json_file(pick_state_path(run_id, "state"), {}) or {}
+    summary = ellipsize(state.get("activity_summary"), 80)
+    print(
+        f"{C_MUTED}activity{C_RESET} {summary} · "
+        f"{C_MUTED}scope{C_RESET} {state.get('scope_label') or 'none'}"
+    )
+    return 0
+
+
+def pick_query(run_id: str) -> int:
+    state = read_json_file(pick_state_path(run_id, "state"), {}) or {}
+    print(state.get("query_prefill") or "", end="")
+    return 0
+
+
+def pick_groups(run_id: str) -> int:
+    state = read_json_file(pick_state_path(run_id, "state"), {}) or {}
+    api = GitLabApi(verbose=bool(state.get("verbose")))
+    rows = [("(configured)", "the scope this run started with")]
+    try:
+        data = api.get("groups?min_access_level=10&order_by=name&sort=asc&per_page=100")
+    except RuntimeError:
+        data = []
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            full_path = item.get("full_path")
+            if not full_path:
+                continue
+            rows.append((str(full_path), clean_summary_part(item.get("name")) or "-"))
+    width = min(48, max(len("GROUP"), *(len(row[0]) for row in rows)))
+    print(pad_column("GROUP", width) + "NAME")
+    for path, name in rows:
+        print(pad_column(path, width) + name)
+    return 0
+
+
+def pick_key(run_id: str, payload: str) -> int:
+    lines = (payload or "").split("\n")
+    key = lines[0].strip() if lines else ""
+    line = lines[1] if len(lines) > 1 else ""
+    state_file = pick_state_path(run_id, "state")
+    candidates_file = pick_state_path(run_id, "candidates")
+    state = read_json_file(state_file, {}) or {}
+    candidates = read_json_file(candidates_file, []) or []
+    api = GitLabApi(verbose=bool(state.get("verbose")))
+
+    ref = line.split()[0] if line.strip() else ""
+    candidate = next((entry for entry in candidates if entry.get("ref") == ref), None)
+
+    if key == "esc":
+        write_json_file(pick_state_path(run_id, "choice"), {"action": "skip"})
+        return 1
+    if key == "ctrl-t":
+        write_json_file(pick_state_path(run_id, "choice"), {"action": "retry"})
+        return 1
+    if key == "enter":
+        if candidate is None:
+            print("no issue under the cursor", file=sys.stderr)
+            return 0
+        return finish_choice(api, run_id, state, candidate, "picked")
+    if key == "alt-i":
+        created = create_issue_interactively(api, state, candidates)
+        if created is None:
+            return 0
+        candidates.insert(0, created)
+        write_json_file(candidates_file, candidates)
+        return finish_choice(api, run_id, state, created, "created")
+    if key == "ctrl-o":
+        if candidate and candidate.get("web_url"):
+            subprocess.run(
+                ["gio", "open", candidate["web_url"]],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return 0
+    if key == "ctrl-y":
+        if candidate and candidate.get("web_url"):
+            subprocess.run(["clip"], check=False, text=True, input=candidate["web_url"])
+            print(f"{candidate['web_url']} copied to clipboard.", file=sys.stderr)
+        return 0
+    if key == "ctrl-s":
+        query = os.environ.get("FZF_WITH_HEADER_ANSWER", "").strip()
+        if not query:
+            return 0
+        scope = state.get("scope") or {}
+        try:
+            merged = load_candidates(api, scope, search=query, existing=candidates)
+        except RuntimeError as exc:
+            print(f"search failed: {exc}", file=sys.stderr)
+            return 0
+        write_json_file(candidates_file, merged)
+        found = len(merged) - len(candidates)
+        print(f"{found} more issue(s) for '{query}'", file=sys.stderr)
+        return 0
+    if key == "ctrl-f":
+        answer = os.environ.get("FZF_WITH_HEADER_ANSWER", "").strip()
+        group = answer.split()[0] if answer else ""
+        if not group:
+            return 0
+        scope = dict(state.get("scope") or {})
+        if group == "(configured)":
+            scope = dict(state.get("initial_scope") or scope)
+        else:
+            scope["groups"] = [group]
+            scope["projects"] = []
+            scope["assigned"] = False
+        state["scope"] = scope
+        state["scope_label"] = scope_label(scope)
+        write_json_file(state_file, state)
+        try:
+            merged = load_candidates(api, scope)
+        except RuntimeError as exc:
+            print(f"cannot list issues of {group}: {exc}", file=sys.stderr)
+            return 0
+        write_json_file(candidates_file, merged)
+        return 0
+
+    # fzf was ended without one of the keys, e.g. by ctrl-c: the picker must
+    # not come back, or there is no way out of it
+    write_json_file(pick_state_path(run_id, "choice"), {"action": "skip"})
+    return 1
+
+
+def run_picker(run_id: str) -> int:
+    base = f"{shlex.quote(self_command())} --pick-id {shlex.quote(run_id)}"
+    cmd = [
+        "fzf-with-header",
+        "--key-command", f"{base} --pick-key",
+        "--command", f"{base} --pick-print",
+        "--footer-prefix", f"{base} --pick-footer",
+        "--key-descriptions", PICK_KEY_DESCS,
+        "--columns", PICK_COLUMNS,
+        "--reload-keys", PICK_RELOAD_KEYS,
+        "--silent-keys", PICK_SILENT_KEYS,
+        "--ask", "ctrl-s:Search issues:",
+        "--ask-prefill", f"ctrl-s:{base} --pick-query",
+        "--pick", "ctrl-f:Group:",
+        "--pick-command", f"ctrl-f:{base} --pick-groups",
+        f"--preview={base} --pick-preview {{1}}",
+        "--preview-window=right:60%,nowrap",
+        f"--expect={PICK_KEYS}",
+        "--no-sort",
+    ]
+    with open("/dev/tty", "r", encoding="utf-8") as tty_in, open(
+        "/dev/tty", "w", encoding="utf-8"
+    ) as tty_out:
+        proc = subprocess.run(
+            cmd, check=False, stdin=tty_in, stdout=tty_out, stderr=tty_out
+        )
+    return proc.returncode
+
+
+def build_pick_state(
+    api: GitLabApi,
+    event: dict[str, Any],
+    *,
+    summary: str,
+    url: str | None,
+    scope: dict[str, Any],
+    initial_scope: dict[str, Any],
+    verbose: bool,
+) -> dict[str, Any]:
+    project_id = int_or_none(event.get("project_id"))
+    push_data = event.get("push_data")
+    if not isinstance(push_data, dict):
+        push_data = {}
+    note = event.get("note")
+    if not isinstance(note, dict):
+        note = {}
+    kind_key, kind_label = activity_kind(event)
+
+    project_path = ""
+    if project_id is not None:
+        try:
+            project = api.get(f"projects/{project_id}")
+        except RuntimeError:
+            project = None
+        if isinstance(project, dict):
+            project_path = str(project.get("path_with_namespace") or "")
+    if not project_path and project_id is not None:
+        project_path = str(project_id)
+
+    title_default = clean_summary_part(
+        push_data.get("commit_title") or event.get("target_title")
+    )
+    description_default = activity_summary(event, ellipsized=False)
+    if url:
+        description_default = f"{description_default}\n\nSee: {url}"
+
+    try:
+        username = current_username(api)
+    except RuntimeError:
+        username = ""
+
+    return {
+        "activity_summary": summary,
+        "activity_url": url,
+        "project_id": project_id,
+        "project_path": project_path,
+        "target_type": event.get("target_type"),
+        "target_iid": int_or_none(event.get("target_iid")),
+        "commit_sha": str(push_data.get("commit_to") or push_data.get("commit_from") or ""),
+        "noteable_type": note.get("noteable_type"),
+        "noteable_iid": int_or_none(note.get("noteable_iid")),
+        "kind_key": kind_key,
+        "kind_label": kind_label,
+        "scope": scope,
+        "initial_scope": initial_scope,
+        "scope_label": scope_label(scope),
+        "query_prefill": pick_query_prefill(event),
+        "issue_title_default": title_default,
+        "issue_description_default": description_default,
+        "current_username": username,
+        "verbose": verbose,
+    }
+
+
+class ReuseMap:
+    """Choices the user asked to apply again, for this run only."""
+
+    def __init__(self) -> None:
+        self.by_kind: dict[tuple[int, str], IssueRef] = {}
+        self.by_project: dict[int, IssueRef] = {}
+
+    def lookup(self, event: dict[str, Any]) -> IssueRef | None:
+        project_id = int_or_none(event.get("project_id"))
+        if project_id is None:
+            return None
+        kind_key, _ = activity_kind(event)
+        issue = self.by_kind.get((project_id, kind_key))
+        if issue is not None:
+            return issue
+        return self.by_project.get(project_id)
+
+    def remember(self, event: dict[str, Any], issue: IssueRef, reuse: str) -> None:
+        project_id = int_or_none(event.get("project_id"))
+        if project_id is None or reuse == "none":
+            return
+        if reuse == "project":
+            self.by_project[project_id] = issue
+            return
+        kind_key, _ = activity_kind(event)
+        self.by_kind[(project_id, kind_key)] = issue
+
+
+SCOPE_KEYS = "enter,esc"
+SCOPE_KEY_DESCS = "enter:use selection,tab:mark,esc:skip"
+
+
+def print_scope_rows(rows: list[tuple[str, str, str]]) -> None:
+    keys = [f"{kind}:{path}" for kind, path, _ in rows] or ["SCOPE"]
+    kinds = [kind for kind, _, _ in rows] or ["TYPE"]
+    paths = [ellipsize(path, 60) for _, path, _ in rows] or ["PATH"]
+
+    key_width = min(40, max(len("SCOPE"), *(len(value) for value in keys)))
+    kind_width = max(len("TYPE"), *(len(value) for value in kinds))
+    path_width = max(len("PATH"), *(len(value) for value in paths))
+
+    print(
+        pad_column("SCOPE", key_width)
+        + pad_column("TYPE", kind_width)
+        + pad_column("PATH", path_width)
+        + "NAME"
+    )
+    for index, (kind, _, name) in enumerate(rows):
+        print(
+            pad_column(keys[index], key_width)
+            + C_MUTED
+            + pad_column(kind, kind_width)
+            + C_RESET
+            + pad_column(paths[index], path_width)
+            + name
+        )
+
+
+def pick_scope_print() -> int:
+    api = GitLabApi()
+    rows: list[tuple[str, str, str]] = []
+    try:
+        groups = api.get("groups?min_access_level=10&order_by=name&sort=asc&per_page=100")
+    except RuntimeError:
+        groups = []
+    if isinstance(groups, list):
+        for item in groups:
+            if isinstance(item, dict) and item.get("full_path"):
+                rows.append(
+                    (
+                        "group",
+                        str(item["full_path"]),
+                        clean_summary_part(item.get("name")) or "-",
+                    )
+                )
+    try:
+        projects = api.get(
+            "projects?membership=true&min_access_level=10"
+            "&order_by=last_activity_at&per_page=100"
+        )
+    except RuntimeError:
+        projects = []
+    if isinstance(projects, list):
+        for item in projects:
+            if isinstance(item, dict) and item.get("path_with_namespace"):
+                rows.append(
+                    (
+                        "project",
+                        str(item["path_with_namespace"]),
+                        clean_summary_part(item.get("name")) or "-",
+                    )
+                )
+    print_scope_rows(rows)
+    return 0
+
+
+def pick_scope_key(run_id: str, payload: str) -> int:
+    lines = (payload or "").split("\n")
+    key = lines[0].strip() if lines else ""
+    if key != "enter":
+        # esc, or fzf ended without a key: the scope stays what it was
+        write_json_file(pick_state_path(run_id, "scope"), {"picked": False})
+        return 1
+
+    groups: list[str] = []
+    projects: list[str] = []
+    for line in lines[1:]:
+        field = line.split()[0] if line.strip() else ""
+        kind, _, path = field.partition(":")
+        if not path:
+            continue
+        if kind == "group" and path not in groups:
+            groups.append(path)
+        elif kind == "project" and path not in projects:
+            projects.append(path)
+
+    write_json_file(
+        pick_state_path(run_id, "scope"),
+        {"picked": bool(groups or projects), "groups": groups, "projects": projects},
+    )
+    return 1
+
+
+def ask_scope(run_id: str) -> dict[str, Any] | None:
+    """Let the user name the groups and projects to look for issues in."""
+    base = f"{shlex.quote(self_command())} --pick-id {shlex.quote(run_id)}"
+    cmd = [
+        "fzf-with-header",
+        "--key-command", f"{base} --pick-scope-key",
+        "--command", f"{base} --pick-scope-print",
+        "--key-descriptions", SCOPE_KEY_DESCS,
+        "--columns", "2,3,4",
+        "--multi",
+        "--prompt=where to look for issues> ",
+        f"--expect={SCOPE_KEYS}",
+        "--no-sort",
+    ]
+    try:
+        os.remove(pick_state_path(run_id, "scope"))
+    except OSError:
+        pass
+    with open("/dev/tty", "r", encoding="utf-8") as tty_in, open(
+        "/dev/tty", "w", encoding="utf-8"
+    ) as tty_out:
+        subprocess.run(cmd, check=False, stdin=tty_in, stdout=tty_out, stderr=tty_out)
+    answer = read_json_file(pick_state_path(run_id, "scope"), {}) or {}
+    if not answer.get("picked"):
+        return None
+    return answer
+
+
+def resolve_interactively(
+    api: GitLabApi,
+    event: dict[str, Any],
+    *,
+    summary: str,
+    url: str | None,
+    scope: dict[str, Any],
+    run_id: str,
+    verbose: bool,
+) -> tuple[str, IssueRef | None, str, dict[str, Any]]:
+    """Open the picker for one activity: (action, issue, reuse, scope)."""
+    if not scope.get("asked"):
+        scope = dict(scope)
+        scope["asked"] = True
+        chosen = ask_scope(run_id)
+        if chosen is not None:
+            scope["groups"] = chosen["groups"]
+            scope["projects"] = chosen["projects"]
+            scope["assigned"] = False
+            scope["explicit"] = True
+    event_scope = scope_for_event(api, event, scope)
+    state = build_pick_state(
+        api,
+        event,
+        summary=summary,
+        url=url,
+        scope=event_scope,
+        initial_scope=event_scope,
+        verbose=verbose,
+    )
+    write_json_file(pick_state_path(run_id, "state"), state)
+    try:
+        candidates = load_candidates(api, event_scope)
+    except RuntimeError as exc:
+        warning(f"cannot list issues: {exc}")
+        candidates = []
+    write_json_file(pick_state_path(run_id, "candidates"), candidates)
+    try:
+        os.remove(pick_state_path(run_id, "choice"))
+    except OSError:
+        pass
+
+    run_picker(run_id)
+
+    # a group picked inside the picker sticks for the rest of the run; a scope
+    # nobody touched stays the one the caller had, project of the activity and all
+    state_after = read_json_file(pick_state_path(run_id, "state"), {}) or {}
+    next_scope = state_after.get("scope")
+    if isinstance(next_scope, dict) and next_scope != event_scope:
+        scope = next_scope
+
+    choice = read_json_file(pick_state_path(run_id, "choice"), {}) or {}
+    action = str(choice.get("action") or "skip")
+    if action != "use":
+        return (action, None, "none", scope)
+
+    issue_data = choice.get("issue") or {}
+    project_id = int_or_none(issue_data.get("project_id"))
+    iid = int_or_none(issue_data.get("iid"))
+    if project_id is None or iid is None:
+        return ("skip", None, "none", scope)
+    issue = IssueRef(
+        project_id=project_id,
+        iid=iid,
+        source=str(choice.get("source") or "picked"),
+        title=issue_data.get("title") or None,
+        web_url=issue_data.get("web_url") or None,
+    )
+    return ("use", issue, str(choice.get("reuse") or "none"), scope)
+
+
 def parse_args() -> argparse.Namespace:
     today = date.today()
     month_start = today.replace(day=1).isoformat()
@@ -347,7 +1542,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="ask on tty before booking time spent to GitLab",
+        help=(
+            "pick or create an issue for every activity that resolves to none, "
+            "and ask before booking time spent to GitLab"
+        ),
+    )
+    parser.add_argument(
+        "--issue-group",
+        action="append",
+        default=[],
+        metavar="GROUP",
+        help=(
+            "group or subgroup full path to look for issues in; repeatable, "
+            "e.g. --issue-group asylum"
+        ),
+    )
+    parser.add_argument(
+        "--issue-project",
+        action="append",
+        default=[],
+        metavar="PROJECT",
+        help="project full path or id to look for issues in; repeatable",
+    )
+    parser.add_argument(
+        "--issue-limit",
+        type=int,
+        default=100,
+        help="issues loaded per group or project, default: 100",
+    )
+    parser.add_argument(
+        "--issue-state",
+        choices=("opened", "closed", "all"),
+        default="opened",
+        help="which issues to offer, default: opened",
     )
     parser.add_argument(
         "--time-spent-slot-minutes",
@@ -371,6 +1598,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="print glab API calls to stderr",
     )
+    # the picker calls the script back the way the bash helpers do; these are
+    # never typed by hand
+    parser.add_argument("--pick-id", help=argparse.SUPPRESS)
+    parser.add_argument("--pick-print", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--pick-preview", metavar="REF", help=argparse.SUPPRESS)
+    parser.add_argument("--pick-key", metavar="PAYLOAD", help=argparse.SUPPRESS)
+    parser.add_argument("--pick-footer", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--pick-query", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--pick-groups", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--pick-scope-print", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument("--pick-scope-key", metavar="PAYLOAD", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -689,33 +1929,6 @@ mutation createTimelog(
             if source_field in timelog:
                 result[output_field] = timelog[source_field]
     return result
-
-
-def confirm_retry_missing_issue(summary: str, url: str | None) -> bool:
-    """Prompt on the tty to retry resolving a missing issue. True = retry."""
-    location = f" ({url})" if url else ""
-    try:
-        with open("/dev/tty", "w", encoding="utf-8") as tty_out, open(
-            "/dev/tty", "r", encoding="utf-8"
-        ) as tty_in:
-            print(file=tty_out)
-            print(f"No issue found for {summary}{location}", file=tty_out)
-            while True:
-                print(
-                    "Fix the reference in GitLab, then answer. [r]etry / [s]kip: ",
-                    end="",
-                    file=tty_out,
-                    flush=True,
-                )
-                answer = tty_in.readline().strip().lower()
-                if answer in ("r", "retry"):
-                    return True
-                if answer in ("s", "skip", ""):
-                    return False
-                print("Please answer 'r' (retry) or 's' (skip).", file=tty_out)
-    except OSError:
-        warning("--interactive requires a tty; skipping retry prompt")
-        return False
 
 
 def confirm_time_spent_booking(booking_preview: str) -> bool:
@@ -1400,8 +2613,39 @@ def summarize_event(
     return result
 
 
+def run_pick_callback(args: argparse.Namespace) -> int:
+    run_id = str(args.pick_id)
+    if args.pick_print:
+        return pick_print(run_id)
+    if args.pick_preview is not None:
+        return pick_preview(run_id, args.pick_preview)
+    if args.pick_footer:
+        return pick_footer(run_id)
+    if args.pick_query:
+        return pick_query(run_id)
+    if args.pick_groups:
+        return pick_groups(run_id)
+    if args.pick_scope_print:
+        return pick_scope_print()
+    if args.pick_scope_key is not None:
+        return pick_scope_key(run_id, args.pick_scope_key)
+    if args.pick_key is not None:
+        return pick_key(run_id, args.pick_key)
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.pick_id:
+        return run_pick_callback(args)
+    run_id = str(os.getpid())
+    try:
+        return run(args, run_id)
+    finally:
+        remove_pick_state(run_id)
+
+
+def run(args: argparse.Namespace, run_id: str) -> int:
     try:
         start = parse_bound(args.start, end=False)
         end = parse_bound(args.end, end=True)
@@ -1415,9 +2659,6 @@ def main() -> int:
             raise ValueError("--time-spent-slot-minutes must be greater than zero")
         if 60 % args.time_spent_slot_minutes != 0:
             raise ValueError("--time-spent-slot-minutes must divide 60")
-        if args.interactive and not args.time_spent_book:
-            raise ValueError("--interactive requires --time-spent-book")
-
         events = fetch_events(
             start,
             end,
@@ -1438,6 +2679,21 @@ def main() -> int:
 
     api = GitLabApi(verbose=args.verbose)
     results: list[dict[str, Any]] = []
+
+    interactive = args.interactive
+    if interactive:
+        missing = missing_pick_helpers()
+        if missing:
+            warning(
+                f"--interactive needs {', '.join(missing)}; "
+                "falling back to warnings"
+            )
+            interactive = False
+        elif not tty_available():
+            warning("--interactive requires a tty; falling back to warnings")
+            interactive = False
+    scope = scope_from_args(args)
+    reuse_map = ReuseMap()
 
     try:
         verbose_log(args.verbose, f"resolving {len(events)} events")
@@ -1478,17 +2734,55 @@ def main() -> int:
                 if error or issues:
                     break
                 summary = activity_summary(event)
-                if not args.interactive:
+                if not interactive:
                     url_suffix = f" ({url})" if url else ""
                     warning(f"No issue found for {summary}{url_suffix}")
                     break
-                if not confirm_retry_missing_issue(summary, url):
+                remembered = reuse_map.lookup(event)
+                if remembered is not None:
+                    issues = [
+                        IssueRef(
+                            project_id=remembered.project_id,
+                            iid=remembered.iid,
+                            source="reused",
+                            title=remembered.title,
+                            web_url=remembered.web_url,
+                        )
+                    ]
+                    verbose_log(
+                        args.verbose,
+                        f"activity={event.get('id')} reused "
+                        f"{remembered.project_id}#{remembered.iid}",
+                    )
                     break
-                api.cache.clear()
+                action, picked, reuse, scope = resolve_interactively(
+                    api,
+                    event,
+                    summary=summary,
+                    url=url,
+                    scope=scope,
+                    run_id=run_id,
+                    verbose=args.verbose,
+                )
+                if action == "retry":
+                    api.cache.clear()
+                    verbose_log(
+                        args.verbose,
+                        f"activity={event.get('id')} retrying after cache clear",
+                    )
+                    continue
+                if action != "use" or picked is None:
+                    url_suffix = f" ({url})" if url else ""
+                    warning(f"No issue found for {summary}{url_suffix}")
+                    break
+                reuse_map.remember(event, picked, reuse)
+                issues = [picked]
                 verbose_log(
                     args.verbose,
-                    f"activity={event.get('id')} retrying after cache clear",
+                    f"activity={event.get('id')} {picked.source} "
+                    f"{picked.project_id}#{picked.iid}",
                 )
+                break
             working_block = (
                 working_block_for_event(event, args.time_spent_slot_minutes)
                 if args.time_spent or args.time_spent_book
@@ -1508,7 +2802,7 @@ def main() -> int:
                 api,
                 results,
                 args.time_spent_slot_minutes,
-                interactive=args.interactive,
+                interactive=interactive,
             )
         except RuntimeError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
