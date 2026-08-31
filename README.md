@@ -43,14 +43,21 @@ block as a timelog on each resolved issue.
 
 `--interactive` takes over where an activity resolves to nothing, which today is
 a `WARNING: No issue found for …` and nothing else: a picker opens on the issues
-of the configured groups and projects, `enter` uses the one under the cursor and
-`alt-i` creates a new one - project, title, description, parent epic, labels and
-assignee are asked in turn, and the created issue is used right away. `ctrl-s`
-searches GitLab for issues the preloaded list does not have, prefilled with the
-words of the activity, `ctrl-f` scopes the list to another group and keeps it
-there for the rest of the run, `ctrl-t` resolves the activity again - for a
-reference that was just fixed in GitLab - and `esc` leaves the activity without
-an issue, as before.
+of the configured groups and projects. Above the list stands the activity an
+issue is being chosen for, in full - summary, project, time, kind, branch, commit
+and its URL - so the decision is made on the whole thing and not on one truncated
+line; `ctrl-a` opens that URL in the browser.
+
+`enter` uses the issue under the cursor and `alt-i` creates a new one - project,
+title, description, parent epic, labels and assignee are asked in turn, the
+labels in a picker of the project's own labels where `tab` marks as many as
+wanted and a name that matches none is taken as typed, and the URL of the created
+issue is printed once it exists. `ctrl-s` searches GitLab for issues the
+preloaded list does not have, prefilled with the words of the activity, `ctrl-f`
+scopes the list to another group and keeps it there for the rest of the run,
+`ctrl-o` opens the highlighted issue and `ctrl-y` copies its URL, `ctrl-t`
+resolves the activity again - for a reference that was just fixed in GitLab -
+and `esc` leaves the activity without an issue, as before.
 
 Afterwards two questions follow. The first offers to write the reference back to
 GitLab, as a comment on the commit of a push or on the merge request of a note,
@@ -60,11 +67,16 @@ pushes, all new branches, all comments - or for every activity in that project;
 that choice lives for the current run only and is never written to disk.
 
 Without `--issue-group` or `--issue-project` the run asks where to look, once,
-the first time an activity actually needs the picker: a list of the user's groups
-and projects opens, `tab` marks as many as wanted and `enter` takes them. `esc`
-skips the question, and the picker then offers the issues of the activity's own
-project, of its top-level group and the ones assigned to the user. Either way the
-activity's own project is always among them.
+the first time an activity actually needs the picker: a list of every group and
+project the user has access to opens, `tab` marks as many as wanted, `enter`
+takes them and a path that matches none is taken as typed. `esc` skips the
+question, and the picker then offers the issues of the activity's own project, of
+its top-level group and the ones assigned to the user. Either way the activity's
+own project is always among them.
+
+That list is a dozen round trips, so it is kept in
+`~/.cache/git-activity-to-issue/<host>/` for a day; `--issue-refresh` forgets it
+and asks GitLab again.
 
 `--interactive` falls back to the plain warnings when there is no terminal.
 ```bash
@@ -73,6 +85,7 @@ git-activity-to-issue [--start <date>] [--end <date>] [--per-page <n>] [--max-pa
                       [--time-spent-slot-minutes <n>] [--interactive] \
                       [--issue-group <group>] [--issue-project <project>] \
                       [--issue-limit <n>] [--issue-state opened|closed|all] \
+                      [--issue-refresh] \
                       [--filter <url>] [-v|--verbose]
 ```
 

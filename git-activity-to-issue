@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 from datetime import date, datetime, time, timedelta, timezone
 import json
 import os
@@ -12,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any
@@ -93,6 +95,55 @@ class GitLabApi:
 
         self.cache[path] = data
         return data
+
+    def get_paged(
+        self,
+        path: str,
+        *,
+        per_page: int = 100,
+        max_pages: int = 20,
+        workers: int = 8,
+    ) -> list[Any]:
+        """Every page of a list endpoint - one page is never the whole list.
+
+        A `glab api` call is a process, a TLS handshake and a round trip, so the
+        pages after the first are fetched a batch at a time instead of one after
+        the other; a short page ends the walk.
+        """
+        joiner = "&" if "?" in path else "?"
+
+        def page_items(page: int) -> list[Any] | None:
+            try:
+                data = self.get(f"{path}{joiner}per_page={per_page}&page={page}")
+            except RuntimeError:
+                return None
+            return data if isinstance(data, list) else None
+
+        first = page_items(1)
+        if not first:
+            return []
+        items: list[Any] = list(first)
+        if len(first) < per_page:
+            return items
+
+        page = 2
+        while page <= max_pages:
+            batch = list(range(page, min(page + workers, max_pages + 1)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                pages = list(pool.map(page_items, batch))
+            done = False
+            for data in pages:
+                if not data:
+                    done = True
+                    break
+                items.extend(data)
+                if len(data) < per_page:
+                    done = True
+                    break
+            if done:
+                break
+            page += len(batch)
+        return items
 
     def graphql(self, query: str, variables: dict[str, str]) -> Any:
         cmd = ["glab", "api", "graphql", "--raw-field", f"query={query}"]
@@ -316,10 +367,11 @@ PICK_KEYS = "enter,esc,alt-i,ctrl-t"
 # searching and scoping change what the list shows without needing the screen
 PICK_RELOAD_KEYS = "ctrl-s,ctrl-f"
 # the browser and the clipboard leave the list as it is
-PICK_SILENT_KEYS = "ctrl-o,ctrl-y"
+PICK_SILENT_KEYS = "ctrl-o,ctrl-y,ctrl-a"
 PICK_KEY_DESCS = (
     "enter:use issue,alt-i:new issue,ctrl-s:search,ctrl-f:group,"
-    "ctrl-t:try again,ctrl-o:open,ctrl-y:copy url,ctrl-r:refresh,esc:skip"
+    "ctrl-t:try again,ctrl-a:open activity,ctrl-o:open issue,"
+    "ctrl-y:copy url,ctrl-r:refresh,esc:skip"
 )
 PICK_HELPERS = (
     "fzf",
@@ -343,6 +395,74 @@ PICK_QUERY_STOP_WORDS = {
     "merged", "opened", "project", "pushed", "refactor", "remove", "removed",
     "style", "test", "tests", "the", "update", "updated", "with",
 }
+
+
+# groups and projects change rarely, and listing them is a dozen round trips
+CACHE_TTL_SECONDS = 24 * 60 * 60
+
+
+def gitlab_host() -> str:
+    host = os.environ.get("GITLAB_HOST", "").strip()
+    if host:
+        return host
+    proc = subprocess.run(
+        ["glab", "config", "get", "host"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    return (proc.stdout or "").strip()
+
+
+def cache_dir() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    host = re.sub(r"[^A-Za-z0-9_.-]", "_", gitlab_host() or "default")
+    path = os.path.join(base, "git-activity-to-issue", host)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return ""
+    return path
+
+
+def cached_list(name: str, build: Any) -> list[Any]:
+    directory = cache_dir()
+    path = os.path.join(directory, f"{name}.json") if directory else ""
+    if path:
+        try:
+            age = datetime.now().timestamp() - os.path.getmtime(path)
+        except OSError:
+            age = None
+        if age is not None and age < CACHE_TTL_SECONDS:
+            data = read_json_file(path, None)
+            if isinstance(data, list) and data:
+                return data
+    data = build()
+    if path and data:
+        try:
+            write_json_file(path, data)
+        except OSError:
+            pass
+    return data
+
+
+def clear_cache() -> None:
+    directory = cache_dir()
+    if not directory:
+        return
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if name.endswith(".json"):
+            try:
+                os.remove(os.path.join(directory, name))
+            except OSError:
+                pass
 
 
 def helper_path(name: str) -> str | None:
@@ -383,7 +503,7 @@ def write_json_file(path: str, data: Any) -> None:
 
 
 def remove_pick_state(run_id: str) -> None:
-    for suffix in ("state", "candidates", "choice", "scope"):
+    for suffix in ("state", "candidates", "choice", "scope", "labels"):
         try:
             os.remove(pick_state_path(run_id, suffix))
         except OSError:
@@ -723,6 +843,47 @@ def print_candidate_preview(candidate: dict[str, Any]) -> None:
         print(rendered)
 
 
+def tty_width(default: int = 100) -> int:
+    for stream in (sys.stderr, sys.stdout):
+        try:
+            if stream is not None and stream.isatty():
+                return os.get_terminal_size(stream.fileno()).columns
+        except (OSError, ValueError):
+            pass
+    try:
+        with open("/dev/tty", "w", encoding="utf-8") as handle:
+            return os.get_terminal_size(handle.fileno()).columns
+    except (OSError, ValueError):
+        return default
+
+
+def activity_header(state: dict[str, Any]) -> str:
+    """The activity an issue is being chosen for, in full, for the fzf header."""
+    width = max(40, tty_width() - 2)
+    label_width = 9
+    lines: list[str] = []
+
+    def row(label: str, value: str, *, color: str = "", wrap: bool = True) -> None:
+        if not value:
+            return
+        room = width - label_width
+        # a URL broken over two lines is no longer one a terminal can open, so
+        # it stays whole even where it does not fit
+        parts = textwrap.wrap(value, room) if wrap else [value]
+        for index, part in enumerate(parts or [""]):
+            head = f"{label:<{label_width}}" if index == 0 else " " * label_width
+            lines.append(f"{C_MUTED}{head}{C_RESET}{color}{part}{C_RESET}")
+
+    row("activity", str(state.get("activity_summary_full") or state.get("activity_summary") or ""))
+    row("project", str(state.get("project_path") or ""))
+    row("when", str(state.get("activity_when") or ""))
+    row("kind", str(state.get("kind_label") or ""))
+    row("branch", str(state.get("branch") or ""))
+    row("commit", str(state.get("commit_sha") or "")[:12])
+    row("url", str(state.get("activity_url") or ""), color=C_REF, wrap=False)
+    return "\n".join(lines)
+
+
 def run_prompt(cmd: list[str]) -> tuple[int, str]:
     """Run a cli-helpers prompt; its UI is on the tty, its answer on stdout."""
     proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE)
@@ -822,15 +983,11 @@ def group_epics(api: GitLabApi, project_id: int) -> list[dict[str, Any]]:
         return []
     root = namespace.split("/", 1)[0]
     encoded = urllib.parse.quote(root, safe="")
-    try:
-        data = api.get(
-            f"groups/{encoded}/epics?state=opened&include_descendant_groups=true"
-            "&order_by=updated_at&per_page=100"
-        )
-    except RuntimeError as exc:
-        warning(f"cannot list the epics of {root}: {exc}")
-        return []
-    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+    data = api.get_paged(
+        f"groups/{encoded}/epics?state=opened&include_descendant_groups=true"
+        "&order_by=updated_at"
+    )
+    return [item for item in data if isinstance(item, dict)]
 
 
 def known_project_paths(state: dict[str, Any], candidates: list[dict[str, Any]]) -> list[str]:
@@ -846,7 +1003,10 @@ def known_project_paths(state: dict[str, Any], candidates: list[dict[str, Any]])
 
 
 def create_issue_interactively(
-    api: GitLabApi, state: dict[str, Any], candidates: list[dict[str, Any]]
+    api: GitLabApi,
+    run_id: str,
+    state: dict[str, Any],
+    candidates: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     """Walk the user through creating an issue. None means they aborted."""
     default_project = str(state.get("project_path") or "")
@@ -893,9 +1053,7 @@ def create_issue_interactively(
             return None
         epic_id = int_or_none(answer)
 
-    labels = ask_line("Labels (comma separated):", "")
-    if labels is None:
-        return None
+    labels = ask_labels(run_id, project_id)
 
     assignee = ask_line("Assignee:", str(state.get("current_username") or ""))
     if assignee is None:
@@ -1069,22 +1227,27 @@ def pick_query(run_id: str) -> int:
     return 0
 
 
+def cached_group_rows(api: GitLabApi) -> list[Any]:
+    def build() -> list[Any]:
+        rows: list[Any] = []
+        for item in api.get_paged("groups?min_access_level=10&order_by=name&sort=asc"):
+            if isinstance(item, dict) and item.get("full_path"):
+                rows.append(
+                    [
+                        str(item["full_path"]),
+                        clean_summary_part(item.get("name")) or "-",
+                    ]
+                )
+        return rows
+
+    return cached_list("groups", build)
+
+
 def pick_groups(run_id: str) -> int:
     state = read_json_file(pick_state_path(run_id, "state"), {}) or {}
     api = GitLabApi(verbose=bool(state.get("verbose")))
     rows = [("(configured)", "the scope this run started with")]
-    try:
-        data = api.get("groups?min_access_level=10&order_by=name&sort=asc&per_page=100")
-    except RuntimeError:
-        data = []
-    if isinstance(data, list):
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            full_path = item.get("full_path")
-            if not full_path:
-                continue
-            rows.append((str(full_path), clean_summary_part(item.get("name")) or "-"))
+    rows.extend((row[0], row[1]) for row in cached_group_rows(api))
     width = min(48, max(len("GROUP"), *(len(row[0]) for row in rows)))
     print(pad_column("GROUP", width) + "NAME")
     for path, name in rows:
@@ -1117,12 +1280,22 @@ def pick_key(run_id: str, payload: str) -> int:
             return 0
         return finish_choice(api, run_id, state, candidate, "picked")
     if key == "alt-i":
-        created = create_issue_interactively(api, state, candidates)
+        created = create_issue_interactively(api, run_id, state, candidates)
         if created is None:
             return 0
         candidates.insert(0, created)
         write_json_file(candidates_file, candidates)
         return finish_choice(api, run_id, state, created, "created")
+    if key == "ctrl-a":
+        activity_url = state.get("activity_url")
+        if activity_url:
+            subprocess.run(
+                ["gio", "open", activity_url],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return 0
     if key == "ctrl-o":
         if candidate and candidate.get("web_url"):
             subprocess.run(
@@ -1180,7 +1353,7 @@ def pick_key(run_id: str, payload: str) -> int:
     return 1
 
 
-def run_picker(run_id: str) -> int:
+def run_picker(run_id: str, header: str) -> int:
     base = f"{shlex.quote(self_command())} --pick-id {shlex.quote(run_id)}"
     cmd = [
         "fzf-with-header",
@@ -1197,6 +1370,7 @@ def run_picker(run_id: str) -> int:
         "--pick-command", f"ctrl-f:{base} --pick-groups",
         f"--preview={base} --pick-preview {{1}}",
         "--preview-window=right:60%,nowrap",
+        f"--header={header}",
         f"--expect={PICK_KEYS}",
         "--no-sort",
     ]
@@ -1251,8 +1425,12 @@ def build_pick_state(
     except RuntimeError:
         username = ""
 
+    created = event_created_at(event)
     return {
         "activity_summary": summary,
+        "activity_summary_full": activity_summary(event, ellipsized=False),
+        "activity_when": created.astimezone().strftime("%Y-%m-%d %H:%M") if created else "",
+        "branch": clean_summary_part(push_data.get("ref")),
         "activity_url": url,
         "project_id": project_id,
         "project_path": project_path,
@@ -1302,6 +1480,92 @@ class ReuseMap:
         self.by_kind[(project_id, kind_key)] = issue
 
 
+LABEL_KEYS = "enter,esc"
+LABEL_KEY_DESCS = "enter:use selection,tab:mark,esc:no label"
+
+
+def pick_labels_print(run_id: str) -> int:
+    state = read_json_file(pick_state_path(run_id, "state"), {}) or {}
+    project_id = int_or_none(state.get("create_project_id"))
+    api = GitLabApi(verbose=bool(state.get("verbose")))
+    labels: list[tuple[str, str]] = []
+    if project_id is not None:
+        for item in api.get_paged(f"projects/{project_id}/labels"):
+            if isinstance(item, dict) and item.get("name"):
+                labels.append(
+                    (
+                        str(item["name"]),
+                        clean_summary_part(item.get("description")) or "-",
+                    )
+                )
+    names = [name for name, _ in labels] or ["LABEL"]
+    width = min(40, max(len("LABEL"), *(len(value) for value in names)))
+    print(pad_column("LABEL", width) + "DESCRIPTION")
+    for name, description in labels:
+        print(pad_column(name, width) + C_MUTED + description + C_RESET)
+    return 0
+
+
+def pick_labels_key(run_id: str, payload: str) -> int:
+    lines = (payload or "").split("\n")
+    key = lines[0].strip() if lines else ""
+    if key != "enter":
+        write_json_file(pick_state_path(run_id, "labels"), {"picked": False})
+        return 1
+
+    names: list[str] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        # a label name may carry single spaces, the columns are two apart
+        name = re.split(r"  +", line.strip())[0].strip()
+        if name and name not in names:
+            names.append(name)
+    # nothing marked: whatever was typed is taken as a label of its own, so a
+    # label the project does not have yet can be given here as well
+    if not names:
+        typed = os.environ.get("FZF_WITH_HEADER_QUERY", "").strip()
+        if typed:
+            names.append(typed)
+
+    write_json_file(
+        pick_state_path(run_id, "labels"), {"picked": bool(names), "labels": names}
+    )
+    return 1
+
+
+def ask_labels(run_id: str, project_id: int) -> str:
+    """Mark labels of the project; a typed one that matches nothing counts too."""
+    state_file = pick_state_path(run_id, "state")
+    state = read_json_file(state_file, {}) or {}
+    state["create_project_id"] = project_id
+    write_json_file(state_file, state)
+
+    base = f"{shlex.quote(self_command())} --pick-id {shlex.quote(run_id)}"
+    cmd = [
+        "fzf-with-header",
+        "--key-command", f"{base} --pick-labels-key",
+        "--command", f"{base} --pick-labels-print",
+        "--key-descriptions", LABEL_KEY_DESCS,
+        "--multi",
+        "--prompt=labels> ",
+        f"--expect={LABEL_KEYS}",
+        "--no-sort",
+    ]
+    try:
+        os.remove(pick_state_path(run_id, "labels"))
+    except OSError:
+        pass
+    with open("/dev/tty", "r", encoding="utf-8") as tty_in, open(
+        "/dev/tty", "w", encoding="utf-8"
+    ) as tty_out:
+        subprocess.run(cmd, check=False, stdin=tty_in, stdout=tty_out, stderr=tty_out)
+    answer = read_json_file(pick_state_path(run_id, "labels"), {}) or {}
+    if not answer.get("picked"):
+        return ""
+    return ",".join(answer.get("labels") or [])
+
+
 SCOPE_KEYS = "enter,esc"
 SCOPE_KEY_DESCS = "enter:use selection,tab:mark,esc:skip"
 
@@ -1334,39 +1598,24 @@ def print_scope_rows(rows: list[tuple[str, str, str]]) -> None:
 
 def pick_scope_print() -> int:
     api = GitLabApi()
-    rows: list[tuple[str, str, str]] = []
-    try:
-        groups = api.get("groups?min_access_level=10&order_by=name&sort=asc&per_page=100")
-    except RuntimeError:
-        groups = []
-    if isinstance(groups, list):
-        for item in groups:
-            if isinstance(item, dict) and item.get("full_path"):
-                rows.append(
-                    (
-                        "group",
-                        str(item["full_path"]),
-                        clean_summary_part(item.get("name")) or "-",
-                    )
-                )
-    try:
-        projects = api.get(
-            "projects?membership=true&min_access_level=10"
-            "&order_by=last_activity_at&per_page=100"
-        )
-    except RuntimeError:
-        projects = []
-    if isinstance(projects, list):
-        for item in projects:
+    def build() -> list[Any]:
+        rows: list[Any] = []
+        for item in cached_group_rows(api):
+            rows.append(["group", item[0], item[1]])
+        for item in api.get_paged(
+            "projects?membership=true&min_access_level=10&order_by=last_activity_at"
+        ):
             if isinstance(item, dict) and item.get("path_with_namespace"):
                 rows.append(
-                    (
+                    [
                         "project",
                         str(item["path_with_namespace"]),
                         clean_summary_part(item.get("name")) or "-",
-                    )
+                    ]
                 )
-    print_scope_rows(rows)
+        return rows
+
+    print_scope_rows([tuple(row) for row in cached_list("scope", build)])
     return 0
 
 
@@ -1389,6 +1638,21 @@ def pick_scope_key(run_id: str, payload: str) -> int:
             groups.append(path)
         elif kind == "project" and path not in projects:
             projects.append(path)
+
+    # nothing marked: whatever was typed is taken as a path of its own, so a
+    # group or project the cached list does not have yet can be given here too
+    if not groups and not projects:
+        typed = os.environ.get("FZF_WITH_HEADER_QUERY", "").strip()
+        if typed:
+            api = GitLabApi()
+            try:
+                project = project_from_path(api, typed)
+            except RuntimeError:
+                project = None
+            if project is not None:
+                projects.append(typed)
+            else:
+                groups.append(typed)
 
     write_json_file(
         pick_state_path(run_id, "scope"),
@@ -1467,7 +1731,7 @@ def resolve_interactively(
     except OSError:
         pass
 
-    run_picker(run_id)
+    run_picker(run_id, activity_header(state))
 
     # a group picked inside the picker sticks for the rest of the run; a scope
     # nobody touched stays the one the caller had, project of the activity and all
@@ -1565,6 +1829,11 @@ def parse_args() -> argparse.Namespace:
         help="project full path or id to look for issues in; repeatable",
     )
     parser.add_argument(
+        "--issue-refresh",
+        action="store_true",
+        help="forget the cached group and project lists before listing them again",
+    )
+    parser.add_argument(
         "--issue-limit",
         type=int,
         default=100,
@@ -1611,6 +1880,10 @@ def parse_args() -> argparse.Namespace:
         "--pick-scope-print", action="store_true", help=argparse.SUPPRESS
     )
     parser.add_argument("--pick-scope-key", metavar="PAYLOAD", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--pick-labels-print", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument("--pick-labels-key", metavar="PAYLOAD", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -2629,6 +2902,10 @@ def run_pick_callback(args: argparse.Namespace) -> int:
         return pick_scope_print()
     if args.pick_scope_key is not None:
         return pick_scope_key(run_id, args.pick_scope_key)
+    if args.pick_labels_print:
+        return pick_labels_print(run_id)
+    if args.pick_labels_key is not None:
+        return pick_labels_key(run_id, args.pick_labels_key)
     if args.pick_key is not None:
         return pick_key(run_id, args.pick_key)
     return 0
@@ -2692,6 +2969,8 @@ def run(args: argparse.Namespace, run_id: str) -> int:
         elif not tty_available():
             warning("--interactive requires a tty; falling back to warnings")
             interactive = False
+    if args.issue_refresh:
+        clear_cache()
     scope = scope_from_args(args)
     reuse_map = ReuseMap()
 
@@ -2776,6 +3055,11 @@ def run(args: argparse.Namespace, run_id: str) -> int:
                     warning(f"No issue found for {summary}{url_suffix}")
                     break
                 reuse_map.remember(event, picked, reuse)
+                # the picker is torn down and rebuilt around every choice, so
+                # what the child printed is gone; the URL of a created issue is
+                # the one thing worth keeping on the screen
+                if picked.source == "created" and picked.web_url:
+                    print(f"created {picked.web_url}", file=sys.stderr)
                 issues = [picked]
                 verbose_log(
                     args.verbose,
