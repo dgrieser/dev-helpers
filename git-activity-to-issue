@@ -449,20 +449,54 @@ def cached_list(name: str, build: Any) -> list[Any]:
     return data
 
 
+# what GitLab was asked for, and what the user picked out of it: the first is
+# thrown away by --issue-refresh, the second is the answer to a question and
+# outlives it
+CACHE_LISTINGS = ("groups.json", "scope.json")
+CACHE_SELECTION = "selection.json"
+
+
 def clear_cache() -> None:
     directory = cache_dir()
     if not directory:
         return
-    try:
-        names = os.listdir(directory)
-    except OSError:
+    for name in CACHE_LISTINGS:
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def load_selected_scope() -> dict[str, Any] | None:
+    directory = cache_dir()
+    if not directory:
+        return None
+    data = read_json_file(os.path.join(directory, CACHE_SELECTION), None)
+    if not isinstance(data, dict):
+        return None
+    groups = [str(value) for value in (data.get("groups") or [])]
+    projects = [str(value) for value in (data.get("projects") or [])]
+    if not groups and not projects:
+        return None
+    return {"picked": True, "groups": groups, "projects": projects}
+
+
+def save_selected_scope(scope: dict[str, Any]) -> None:
+    directory = cache_dir()
+    if not directory:
         return
-    for name in names:
-        if name.endswith(".json"):
-            try:
-                os.remove(os.path.join(directory, name))
-            except OSError:
-                pass
+    try:
+        write_json_file(
+            os.path.join(directory, CACHE_SELECTION),
+            {"groups": scope.get("groups") or [], "projects": scope.get("projects") or []},
+        )
+    except OSError:
+        pass
+
+
+def selected_scope_label(scope: dict[str, Any]) -> str:
+    parts = list(scope.get("groups") or []) + list(scope.get("projects") or [])
+    return ellipsize(", ".join(parts), 70) or "nothing"
 
 
 def helper_path(name: str) -> str | None:
@@ -500,6 +534,34 @@ def read_json_file(path: str, default: Any = None) -> Any:
 def write_json_file(path: str, data: Any) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False)
+
+
+def sweep_pick_state() -> None:
+    """Drop run state of processes that are gone - a kill runs no cleanup."""
+    prefix = "git-activity-to-issue-"
+    try:
+        names = os.listdir("/tmp")
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(prefix) or not name.endswith(".json"):
+            continue
+        run_id = name[len(prefix) :].split(".", 1)[0]
+        if not run_id.isdigit():
+            continue
+        try:
+            os.kill(int(run_id), 0)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            # somebody else's process, or one we may not signal: leave it alone
+            continue
+        else:
+            continue
+        try:
+            os.remove(os.path.join("/tmp", name))
+        except OSError:
+            pass
 
 
 def remove_pick_state(run_id: str) -> None:
@@ -857,9 +919,13 @@ def tty_width(default: int = 100) -> int:
         return default
 
 
-def activity_header(state: dict[str, Any]) -> str:
-    """The activity an issue is being chosen for, in full, for the fzf header."""
-    width = max(40, tty_width() - 2)
+def preview_width() -> int:
+    return int_or_none(os.environ.get("FZF_PREVIEW_COLUMNS")) or tty_width()
+
+
+def activity_block(state: dict[str, Any], width: int) -> str:
+    """The activity an issue is being chosen for, in full, for the preview."""
+    width = max(40, width)
     label_width = 9
     lines: list[str] = []
 
@@ -1165,11 +1231,11 @@ def offer_write_back(api: GitLabApi, state: dict[str, Any], candidate: dict[str,
     print(f"linked {candidate['full_ref']} ({label})", file=sys.stderr)
 
 
-def ask_reuse(state: dict[str, Any], candidate: dict[str, Any]) -> str:
+def ask_reuse(state: dict[str, Any], question: str) -> str:
     kind_label = str(state.get("kind_label") or "activities")
     project_path = str(state.get("project_path") or "this project")
     answer = ask_select(
-        f"Use {candidate['full_ref']} for:",
+        question,
         [
             ("none", "just this activity"),
             ("kind", f"all {kind_label} in {project_path}"),
@@ -1188,7 +1254,7 @@ def finish_choice(
     source: str,
 ) -> int:
     offer_write_back(api, state, candidate)
-    reuse = ask_reuse(state, candidate)
+    reuse = ask_reuse(state, f"Use {candidate['full_ref']} for:")
     write_json_file(
         pick_state_path(run_id, "choice"),
         {"action": "use", "source": source, "reuse": reuse, "issue": candidate},
@@ -1203,11 +1269,19 @@ def pick_print(run_id: str) -> int:
 
 
 def pick_preview(run_id: str, ref: str) -> int:
+    width = preview_width()
+    state = read_json_file(pick_state_path(run_id, "state"), {}) or {}
+    # the activity leads every preview: the issue is chosen for it, so it has to
+    # be readable in full while the issues are walked
+    print(activity_block(state, width))
+    print()
+    print(f"{C_MUTED}{'─' * width}{C_RESET}")
+    print()
     candidates = read_json_file(pick_state_path(run_id, "candidates"), []) or []
     for candidate in candidates:
         if candidate.get("ref") == ref:
             print_candidate_preview(candidate)
-            return 0
+            break
     return 0
 
 
@@ -1269,7 +1343,10 @@ def pick_key(run_id: str, payload: str) -> int:
     candidate = next((entry for entry in candidates if entry.get("ref") == ref), None)
 
     if key == "esc":
-        write_json_file(pick_state_path(run_id, "choice"), {"action": "skip"})
+        reuse = ask_reuse(state, "Leave without an issue for:")
+        write_json_file(
+            pick_state_path(run_id, "choice"), {"action": "skip", "reuse": reuse}
+        )
         return 1
     if key == "ctrl-t":
         write_json_file(pick_state_path(run_id, "choice"), {"action": "retry"})
@@ -1353,7 +1430,7 @@ def pick_key(run_id: str, payload: str) -> int:
     return 1
 
 
-def run_picker(run_id: str, header: str) -> int:
+def run_picker(run_id: str) -> int:
     base = f"{shlex.quote(self_command())} --pick-id {shlex.quote(run_id)}"
     cmd = [
         "fzf-with-header",
@@ -1370,7 +1447,6 @@ def run_picker(run_id: str, header: str) -> int:
         "--pick-command", f"ctrl-f:{base} --pick-groups",
         f"--preview={base} --pick-preview {{1}}",
         "--preview-window=right:60%,nowrap",
-        f"--header={header}",
         f"--expect={PICK_KEYS}",
         "--no-sort",
     ]
@@ -1452,14 +1528,18 @@ def build_pick_state(
     }
 
 
+# a remembered decision is either an issue or the decision to book none
+REUSE_SKIP = "skip"
+
+
 class ReuseMap:
     """Choices the user asked to apply again, for this run only."""
 
     def __init__(self) -> None:
-        self.by_kind: dict[tuple[int, str], IssueRef] = {}
-        self.by_project: dict[int, IssueRef] = {}
+        self.by_kind: dict[tuple[int, str], Any] = {}
+        self.by_project: dict[int, Any] = {}
 
-    def lookup(self, event: dict[str, Any]) -> IssueRef | None:
+    def lookup(self, event: dict[str, Any]) -> Any:
         project_id = int_or_none(event.get("project_id"))
         if project_id is None:
             return None
@@ -1469,7 +1549,7 @@ class ReuseMap:
             return issue
         return self.by_project.get(project_id)
 
-    def remember(self, event: dict[str, Any], issue: IssueRef, reuse: str) -> None:
+    def remember(self, event: dict[str, Any], issue: Any, reuse: str) -> None:
         project_id = int_or_none(event.get("project_id"))
         if project_id is None or reuse == "none":
             return
@@ -1689,6 +1769,37 @@ def ask_scope(run_id: str) -> dict[str, Any] | None:
     return answer
 
 
+def ask_scope_remembered(run_id: str) -> dict[str, Any] | None:
+    """The scope of the last run, kept: this one only confirms or changes it."""
+    saved = load_selected_scope()
+    if saved is None:
+        chosen = ask_scope(run_id)
+        if chosen is not None:
+            save_selected_scope(chosen)
+        return chosen
+
+    answer = ask_select(
+        "Where to look for issues:",
+        [
+            ("use", f"use {selected_scope_label(saved)}"),
+            ("change", "pick groups and projects again"),
+            ("skip", "this project, its group and what is assigned to me"),
+        ],
+        default="use",
+    )
+    if answer == "use":
+        return saved
+    if answer != "change":
+        return None
+
+    chosen = ask_scope(run_id)
+    if chosen is None:
+        # the picker was left without a selection: the saved one still stands
+        return saved
+    save_selected_scope(chosen)
+    return chosen
+
+
 def resolve_interactively(
     api: GitLabApi,
     event: dict[str, Any],
@@ -1703,7 +1814,7 @@ def resolve_interactively(
     if not scope.get("asked"):
         scope = dict(scope)
         scope["asked"] = True
-        chosen = ask_scope(run_id)
+        chosen = ask_scope_remembered(run_id)
         if chosen is not None:
             scope["groups"] = chosen["groups"]
             scope["projects"] = chosen["projects"]
@@ -1731,7 +1842,7 @@ def resolve_interactively(
     except OSError:
         pass
 
-    run_picker(run_id, activity_header(state))
+    run_picker(run_id)
 
     # a group picked inside the picker sticks for the rest of the run; a scope
     # nobody touched stays the one the caller had, project of the activity and all
@@ -1743,7 +1854,7 @@ def resolve_interactively(
     choice = read_json_file(pick_state_path(run_id, "choice"), {}) or {}
     action = str(choice.get("action") or "skip")
     if action != "use":
-        return (action, None, "none", scope)
+        return (action, None, str(choice.get("reuse") or "none"), scope)
 
     issue_data = choice.get("issue") or {}
     project_id = int_or_none(issue_data.get("project_id"))
@@ -1831,7 +1942,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--issue-refresh",
         action="store_true",
-        help="forget the cached group and project lists before listing them again",
+        help=(
+            "forget the cached group and project lists before listing them "
+            "again; the scope picked out of them is kept"
+        ),
     )
     parser.add_argument(
         "--issue-limit",
@@ -2969,6 +3083,7 @@ def run(args: argparse.Namespace, run_id: str) -> int:
         elif not tty_available():
             warning("--interactive requires a tty; falling back to warnings")
             interactive = False
+    sweep_pick_state()
     if args.issue_refresh:
         clear_cache()
     scope = scope_from_args(args)
@@ -3018,6 +3133,14 @@ def run(args: argparse.Namespace, run_id: str) -> int:
                     warning(f"No issue found for {summary}{url_suffix}")
                     break
                 remembered = reuse_map.lookup(event)
+                if remembered == REUSE_SKIP:
+                    url_suffix = f" ({url})" if url else ""
+                    warning(f"No issue found for {summary}{url_suffix}")
+                    verbose_log(
+                        args.verbose,
+                        f"activity={event.get('id')} skipped by an earlier choice",
+                    )
+                    break
                 if remembered is not None:
                     issues = [
                         IssueRef(
@@ -3051,6 +3174,8 @@ def run(args: argparse.Namespace, run_id: str) -> int:
                     )
                     continue
                 if action != "use" or picked is None:
+                    if action == "skip":
+                        reuse_map.remember(event, REUSE_SKIP, reuse)
                     url_suffix = f" ({url})" if url else ""
                     warning(f"No issue found for {summary}{url_suffix}")
                     break

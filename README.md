@@ -43,10 +43,11 @@ block as a timelog on each resolved issue.
 
 `--interactive` takes over where an activity resolves to nothing, which today is
 a `WARNING: No issue found for …` and nothing else: a picker opens on the issues
-of the configured groups and projects. Above the list stands the activity an
+of the configured groups and projects. Every preview leads with the activity an
 issue is being chosen for, in full - summary, project, time, kind, branch, commit
-and its URL - so the decision is made on the whole thing and not on one truncated
-line; `ctrl-a` opens that URL in the browser.
+and its URL - and shows the issue under the cursor below it, so the two are read
+against each other instead of the decision resting on one truncated line;
+`ctrl-a` opens the activity URL in the browser.
 
 `enter` uses the issue under the cursor and `alt-i` creates a new one - project,
 title, description, parent epic, labels and assignee are asked in turn, the
@@ -63,8 +64,10 @@ Afterwards two questions follow. The first offers to write the reference back to
 GitLab, as a comment on the commit of a push or on the merge request of a note,
 so the next run resolves the activity on its own. The second offers to use the
 same issue for every activity of the same kind in the same project - all commit
-pushes, all new branches, all comments - or for every activity in that project;
-that choice lives for the current run only and is never written to disk.
+pushes, all new branches, all comments - or for every activity in that project.
+Leaving an activity without an issue asks the same question, so a kind that is
+not worth booking is skipped once instead of once per activity. Both live for the
+current run only and are never written to disk.
 
 Without `--issue-group` or `--issue-project` the run asks where to look, once,
 the first time an activity actually needs the picker: a list of every group and
@@ -74,9 +77,11 @@ question, and the picker then offers the issues of the activity's own project, o
 its top-level group and the ones assigned to the user. Either way the activity's
 own project is always among them.
 
-That list is a dozen round trips, so it is kept in
-`~/.cache/git-activity-to-issue/<host>/` for a day; `--issue-refresh` forgets it
-and asks GitLab again.
+What was picked there is remembered, so the next run does not ask the long
+question again: it offers to use that scope, to pick again, or to skip. Both the
+listing and the choice live in `~/.cache/git-activity-to-issue/<host>/`; the
+listing is a dozen round trips and is refreshed after a day or on
+`--issue-refresh`, the choice stays until it is changed.
 
 `--interactive` falls back to the plain warnings when there is no terminal.
 ```bash
