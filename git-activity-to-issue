@@ -378,7 +378,6 @@ PICK_HELPERS = (
     "fzf-with-header",
     "prompt-input",
     "prompt-multiline",
-    "prompt-no-yes",
     "prompt-select",
 )
 
@@ -976,11 +975,6 @@ def ask_text(default: str = "") -> str | None:
     return answer
 
 
-def ask_no_yes(question: str) -> bool:
-    proc = subprocess.run(["prompt-no-yes", question], check=False)
-    return proc.returncode == 0
-
-
 def ask_select(question: str, entries: list[tuple[str, str]], default: str = "") -> str | None:
     cmd = ["prompt-select", "--prompt", question, "--return", "key"]
     if default:
@@ -1164,6 +1158,33 @@ def create_issue_interactively(
     return candidate
 
 
+def link_fields(event: dict[str, Any]) -> dict[str, Any]:
+    """What write_back_target needs of an activity, from the event itself."""
+    push_data = event.get("push_data")
+    if not isinstance(push_data, dict):
+        push_data = {}
+    note = event.get("note")
+    if not isinstance(note, dict):
+        note = {}
+    return {
+        "project_id": int_or_none(event.get("project_id")),
+        "target_type": event.get("target_type"),
+        "target_iid": int_or_none(event.get("target_iid")),
+        "commit_sha": str(
+            push_data.get("commit_to") or push_data.get("commit_from") or ""
+        ),
+        "noteable_type": note.get("noteable_type"),
+        "noteable_iid": int_or_none(note.get("noteable_iid")),
+    }
+
+
+def ref_from_web_url(web_url: str | None, iid: int) -> str:
+    path = urllib.parse.urlsplit(web_url or "").path
+    if "/-/" in path:
+        return f"{path.split('/-/', 1)[0].strip('/')}#{iid}"
+    return f"#{iid}"
+
+
 def write_back_target(
     state: dict[str, Any], candidate: dict[str, Any]
 ) -> tuple[str, str, str] | None:
@@ -1212,13 +1233,14 @@ def write_back_target(
     )
 
 
-def offer_write_back(api: GitLabApi, state: dict[str, Any], candidate: dict[str, Any]) -> None:
+def post_write_back(
+    api: GitLabApi, state: dict[str, Any], candidate: dict[str, Any]
+) -> None:
+    """Comment the issue reference where the resolver will read it next run."""
     target = write_back_target(state, candidate)
     if target is None:
         return
     label, path, field = target
-    if not ask_no_yes(f"Link this activity to {candidate['full_ref']} ({label})?"):
-        return
     body = candidate["full_ref"]
     activity_url = state.get("activity_url")
     if activity_url:
@@ -1229,6 +1251,27 @@ def offer_write_back(api: GitLabApi, state: dict[str, Any], candidate: dict[str,
         warning(f"cannot write the back reference: {exc}")
         return
     print(f"linked {candidate['full_ref']} ({label})", file=sys.stderr)
+
+
+def ask_write_back(state: dict[str, Any], candidate: dict[str, Any]) -> str:
+    """How far the back reference reaches: no, this activity, kind, project."""
+    target = write_back_target(state, candidate)
+    if target is None:
+        return "no"
+    label = target[0]
+    kind_label = str(state.get("kind_label") or "activities")
+    project_path = str(state.get("project_path") or "this project")
+    answer = ask_select(
+        f"Link to {candidate['full_ref']} in GitLab ({label}) for:",
+        [
+            ("no", "nothing, leave GitLab alone"),
+            ("none", "this activity"),
+            ("kind", f"every {kind_label} in {project_path} from here on"),
+            ("project", f"every activity in {project_path} from here on"),
+        ],
+        default="no",
+    )
+    return answer or "no"
 
 
 def ask_reuse(state: dict[str, Any], question: str) -> str:
@@ -1253,11 +1296,24 @@ def finish_choice(
     candidate: dict[str, Any],
     source: str,
 ) -> int:
-    offer_write_back(api, state, candidate)
+    # a link scope named for an earlier activity answers this one already
+    if state.get("link_remembered"):
+        link_reuse = "remembered"
+        post_write_back(api, state, candidate)
+    else:
+        link_reuse = ask_write_back(state, candidate)
+        if link_reuse != "no":
+            post_write_back(api, state, candidate)
     reuse = ask_reuse(state, f"Use {candidate['full_ref']} for:")
     write_json_file(
         pick_state_path(run_id, "choice"),
-        {"action": "use", "source": source, "reuse": reuse, "issue": candidate},
+        {
+            "action": "use",
+            "source": source,
+            "reuse": reuse,
+            "link_reuse": link_reuse,
+            "issue": candidate,
+        },
     )
     return 1
 
@@ -1468,6 +1524,7 @@ def build_pick_state(
     scope: dict[str, Any],
     initial_scope: dict[str, Any],
     verbose: bool,
+    link_remembered: bool = False,
 ) -> dict[str, Any]:
     project_id = int_or_none(event.get("project_id"))
     push_data = event.get("push_data")
@@ -1510,11 +1567,7 @@ def build_pick_state(
         "activity_url": url,
         "project_id": project_id,
         "project_path": project_path,
-        "target_type": event.get("target_type"),
-        "target_iid": int_or_none(event.get("target_iid")),
-        "commit_sha": str(push_data.get("commit_to") or push_data.get("commit_from") or ""),
-        "noteable_type": note.get("noteable_type"),
-        "noteable_iid": int_or_none(note.get("noteable_iid")),
+        **link_fields(event),
         "kind_key": kind_key,
         "kind_label": kind_label,
         "scope": scope,
@@ -1524,6 +1577,7 @@ def build_pick_state(
         "issue_title_default": title_default,
         "issue_description_default": description_default,
         "current_username": username,
+        "link_remembered": link_remembered,
         "verbose": verbose,
     }
 
@@ -1538,6 +1592,8 @@ class ReuseMap:
     def __init__(self) -> None:
         self.by_kind: dict[tuple[int, str], Any] = {}
         self.by_project: dict[int, Any] = {}
+        self.link_kinds: set[tuple[int, str]] = set()
+        self.link_projects: set[int] = set()
 
     def lookup(self, event: dict[str, Any]) -> Any:
         project_id = int_or_none(event.get("project_id"))
@@ -1551,13 +1607,33 @@ class ReuseMap:
 
     def remember(self, event: dict[str, Any], issue: Any, reuse: str) -> None:
         project_id = int_or_none(event.get("project_id"))
-        if project_id is None or reuse == "none":
+        if project_id is None or reuse not in ("kind", "project"):
             return
         if reuse == "project":
             self.by_project[project_id] = issue
             return
         kind_key, _ = activity_kind(event)
         self.by_kind[(project_id, kind_key)] = issue
+
+    def lookup_link(self, event: dict[str, Any]) -> bool:
+        """Whether this activity is to be commented on without asking again."""
+        project_id = int_or_none(event.get("project_id"))
+        if project_id is None:
+            return False
+        if project_id in self.link_projects:
+            return True
+        kind_key, _ = activity_kind(event)
+        return (project_id, kind_key) in self.link_kinds
+
+    def remember_link(self, event: dict[str, Any], link_reuse: str) -> None:
+        project_id = int_or_none(event.get("project_id"))
+        if project_id is None or link_reuse not in ("kind", "project"):
+            return
+        if link_reuse == "project":
+            self.link_projects.add(project_id)
+            return
+        kind_key, _ = activity_kind(event)
+        self.link_kinds.add((project_id, kind_key))
 
 
 LABEL_KEYS = "enter,esc"
@@ -1800,6 +1876,15 @@ def ask_scope_remembered(run_id: str) -> dict[str, Any] | None:
     return chosen
 
 
+@dataclass(frozen=True)
+class PickChoice:
+    action: str
+    issue: IssueRef | None
+    reuse: str
+    link_reuse: str
+    scope: dict[str, Any]
+
+
 def resolve_interactively(
     api: GitLabApi,
     event: dict[str, Any],
@@ -1809,8 +1894,9 @@ def resolve_interactively(
     scope: dict[str, Any],
     run_id: str,
     verbose: bool,
-) -> tuple[str, IssueRef | None, str, dict[str, Any]]:
-    """Open the picker for one activity: (action, issue, reuse, scope)."""
+    link_remembered: bool = False,
+) -> PickChoice:
+    """Open the picker for one activity and report what came out of it."""
     if not scope.get("asked"):
         scope = dict(scope)
         scope["asked"] = True
@@ -1829,6 +1915,7 @@ def resolve_interactively(
         scope=event_scope,
         initial_scope=event_scope,
         verbose=verbose,
+        link_remembered=link_remembered,
     )
     write_json_file(pick_state_path(run_id, "state"), state)
     try:
@@ -1853,14 +1940,16 @@ def resolve_interactively(
 
     choice = read_json_file(pick_state_path(run_id, "choice"), {}) or {}
     action = str(choice.get("action") or "skip")
+    reuse = str(choice.get("reuse") or "none")
+    link_reuse = str(choice.get("link_reuse") or "no")
     if action != "use":
-        return (action, None, str(choice.get("reuse") or "none"), scope)
+        return PickChoice(action, None, reuse, link_reuse, scope)
 
     issue_data = choice.get("issue") or {}
     project_id = int_or_none(issue_data.get("project_id"))
     iid = int_or_none(issue_data.get("iid"))
     if project_id is None or iid is None:
-        return ("skip", None, "none", scope)
+        return PickChoice("skip", None, "none", "no", scope)
     issue = IssueRef(
         project_id=project_id,
         iid=iid,
@@ -1868,7 +1957,7 @@ def resolve_interactively(
         title=issue_data.get("title") or None,
         web_url=issue_data.get("web_url") or None,
     )
-    return ("use", issue, str(choice.get("reuse") or "none"), scope)
+    return PickChoice("use", issue, reuse, link_reuse, scope)
 
 
 def parse_args() -> argparse.Namespace:
@@ -3132,6 +3221,7 @@ def run(args: argparse.Namespace, run_id: str) -> int:
                     url_suffix = f" ({url})" if url else ""
                     warning(f"No issue found for {summary}{url_suffix}")
                     break
+                link_remembered = reuse_map.lookup_link(event)
                 remembered = reuse_map.lookup(event)
                 if remembered == REUSE_SKIP:
                     url_suffix = f" ({url})" if url else ""
@@ -3151,13 +3241,27 @@ def run(args: argparse.Namespace, run_id: str) -> int:
                             web_url=remembered.web_url,
                         )
                     ]
+                    # the picker never opens for this one, so the back reference
+                    # the user asked for every such activity is written here
+                    if link_remembered:
+                        post_write_back(
+                            api,
+                            {**link_fields(event), "activity_url": url},
+                            {
+                                "project_id": remembered.project_id,
+                                "iid": remembered.iid,
+                                "full_ref": ref_from_web_url(
+                                    remembered.web_url, remembered.iid
+                                ),
+                            },
+                        )
                     verbose_log(
                         args.verbose,
                         f"activity={event.get('id')} reused "
                         f"{remembered.project_id}#{remembered.iid}",
                     )
                     break
-                action, picked, reuse, scope = resolve_interactively(
+                choice = resolve_interactively(
                     api,
                     event,
                     summary=summary,
@@ -3165,21 +3269,25 @@ def run(args: argparse.Namespace, run_id: str) -> int:
                     scope=scope,
                     run_id=run_id,
                     verbose=args.verbose,
+                    link_remembered=link_remembered,
                 )
-                if action == "retry":
+                scope = choice.scope
+                if choice.action == "retry":
                     api.cache.clear()
                     verbose_log(
                         args.verbose,
                         f"activity={event.get('id')} retrying after cache clear",
                     )
                     continue
-                if action != "use" or picked is None:
-                    if action == "skip":
-                        reuse_map.remember(event, REUSE_SKIP, reuse)
+                picked = choice.issue
+                if choice.action != "use" or picked is None:
+                    if choice.action == "skip":
+                        reuse_map.remember(event, REUSE_SKIP, choice.reuse)
                     url_suffix = f" ({url})" if url else ""
                     warning(f"No issue found for {summary}{url_suffix}")
                     break
-                reuse_map.remember(event, picked, reuse)
+                reuse_map.remember(event, picked, choice.reuse)
+                reuse_map.remember_link(event, choice.link_reuse)
                 # the picker is torn down and rebuilt around every choice, so
                 # what the child printed is gone; the URL of a created issue is
                 # the one thing worth keeping on the screen

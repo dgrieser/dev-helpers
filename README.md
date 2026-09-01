@@ -60,14 +60,19 @@ scopes the list to another group and keeps it there for the rest of the run,
 resolves the activity again - for a reference that was just fixed in GitLab -
 and `esc` leaves the activity without an issue, as before.
 
-Afterwards two questions follow. The first offers to write the reference back to
-GitLab, as a comment on the commit of a push or on the merge request of a note,
-so the next run resolves the activity on its own. The second offers to use the
-same issue for every activity of the same kind in the same project - all commit
-pushes, all new branches, all comments - or for every activity in that project.
-Leaving an activity without an issue asks the same question, so a kind that is
-not worth booking is skipped once instead of once per activity. Both live for the
-current run only and are never written to disk.
+Afterwards two questions follow, and both are asked for a scope rather than for
+one activity: nothing, this activity, every activity of the same kind in the same
+project - all commit pushes, all new branches, all comments - or every activity
+in that project.
+
+The first writes the reference back to GitLab, as a comment on the commit of a
+push or on the merge request of a note, so the next run resolves the activity on
+its own; answered for a kind or a project, every further activity it covers is
+commented on without asking again, the remembered issue included. The second uses
+the same issue again for the activities of that scope. Leaving an activity without
+an issue asks the second question as well, so a kind that is not worth booking is
+skipped once instead of once per activity. All of it lives for the current run
+only and is never written to disk.
 
 Without `--issue-group` or `--issue-project` the run asks where to look, once,
 the first time an activity actually needs the picker: a list of every group and
