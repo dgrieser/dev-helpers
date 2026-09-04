@@ -279,7 +279,12 @@ fetch_base() {
     git-color -C "${workdir}" fetch "${base_remote}" "${base_remote_ref}" 1>&2 ||
         fail "git fetch failed: ${base_remote} ${base_remote_ref}"
     if [ "${base_is_local}" = "1" ]; then
-        warning "Base ${base} is checked out elsewhere, only ${base_remote}/${base_remote_ref} was updated"
+        if git -C "${workdir}" rev-parse --verify --quiet "${base_remote}/${base_remote_ref}^{commit}" >/dev/null; then
+            base="${base_remote}/${base_remote_ref}"
+        else
+            base="$(git -C "${workdir}" rev-parse --verify --quiet "FETCH_HEAD^{commit}")" ||
+                fail "Cannot resolve fetched base: ${base_remote} ${base_remote_ref}"
+        fi
     fi
 }
 
