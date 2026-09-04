@@ -16,13 +16,16 @@ Commands:
     WORKSPACE_WORKTREE/<path under WORKSPACE>/BRANCH
     If BRANCH does not exist, ask before creating it.
   list                  List worktrees for the resolved workspace repository
+  go                    Print the path of an existing worktree, picked
+                        interactively when BRANCH is omitted
   delete                Delete the resolved mirrored worktree and print its main dir
   move-to-main          Move uncommitted changes from a mirrored worktree to its main tree
 
 If COMMAND is omitted, add is used.
 
 Options:
-  -b, --branch BRANCH    Branch to add/delete; defaults to current workspace branch
+  -b, --branch BRANCH    Branch to add/delete/go to; defaults to the current
+                         workspace branch (asked interactively for add/delete)
   -B, --base REF         Start point for a branch that has to be created;
                          asked interactively when omitted, defaulting to the
                          default remote branch
@@ -37,6 +40,10 @@ Environment:
   WORKSPACE_WORKTREE     Mirrored worktree root
 EOF
     exit 1
+}
+
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "${1} not found"
 }
 
 error() {
@@ -64,7 +71,7 @@ set_command() {
     fi
 
     case "${1}" in
-        add|list|delete|move-to-main)
+        add|list|go|delete|move-to-main)
             mode="${1}"
             command_seen=1
             ;;
@@ -412,14 +419,15 @@ add_worktree() {
     echo "${target}"
 }
 
-list_worktrees() {
+worktree_rows() {
     worktree_output="$(git -C "${workdir}" worktree list --porcelain)" ||
         fail "git worktree list failed"
     printf "%s\n" "${worktree_output}" |
         awk -v main="${workdir}" -v mirror_root="${workspace_worktree_root}" '
             /^worktree / {
                 path = substr($0, 10)
-                show = path != main && (path == mirror_root || index(path, mirror_root "/") == 1)
+                is_main = path == main ? 1 : 0
+                show = is_main || path == mirror_root || index(path, mirror_root "/") == 1
                 next
             }
             show && /^HEAD / {
@@ -429,16 +437,72 @@ list_worktrees() {
             show && /^branch / {
                 branch = substr($0, 8)
                 sub("^refs/heads/", "", branch)
-                printf "%s %s [%s]\n", path, head, branch
+                printf "%s\t%s\t%s\t%d\n", path, head, branch, is_main
                 show = 0
                 next
             }
             show && /^detached$/ {
-                printf "%s %s (detached HEAD)\n", path, head
+                printf "%s\t%s\t\t%d\n", path, head, is_main
                 show = 0
                 next
             }
         '
+}
+
+list_worktrees() {
+    rows="$(worktree_rows)" || exit 1
+    printf "%s\n" "${rows}" |
+        while IFS="$(printf "\t")" read -r path head branch is_main; do
+            [ -n "${path}" ] || continue
+            [ "${is_main}" = "1" ] && continue
+            if [ -n "${branch}" ]; then
+                printf "%s %s [%s]\n" "${path}" "${head}" "${branch}"
+            else
+                printf "%s %s (detached HEAD)\n" "${path}" "${head}"
+            fi
+        done
+}
+
+go_items() {
+    if [ "${source_kind}" = "mirror" ]; then
+        current_worktree="${source_mirror_worktree}"
+    else
+        current_worktree="${workdir}"
+    fi
+
+    rows="$(worktree_rows)" || exit 1
+    printf "%s\n" "${rows}" |
+        while IFS="$(printf "\t")" read -r path head branch is_main; do
+            [ -n "${path}" ] || continue
+            [ "${path}" = "${current_worktree}" ] && continue
+            if [ -n "${branch}" ]; then
+                title="${branch}"
+            else
+                title="${head} (detached HEAD)"
+            fi
+            [ "${is_main}" = "1" ] && title="${title} (main tree)"
+            printf "%s\t%s\n" "${path}" "${title}"
+        done
+}
+
+go_worktree() {
+    if [ -n "${branch_arg}" ]; then
+        target="$(target_path_for "${branch}")"
+        [ -d "${target}" ] || fail "Worktree does not exist: ${target}"
+        require_git_repo "${target}"
+        same_git_repo "${workdir}" "${target}" ||
+            fail "Target belongs to a different git repository: ${target}"
+        echo "${target}"
+        return 0
+    fi
+
+    need_cmd prompt-select
+    items="$(go_items)" || exit 1
+    [ -n "${items}" ] || fail "No other worktree to go to"
+    target="$(printf "%s\n" "${items}" |
+        prompt-select --prompt "Go to:" --delimiter "\t")" || abort
+    [ -n "${target}" ] || abort
+    echo "${target}"
 }
 
 delete_worktree() {
@@ -595,6 +659,10 @@ case "${mode}" in
     list)
         [ -z "${branch_arg}" ] || fail "--branch cannot be used with list"
         list_worktrees
+        ;;
+    go)
+        [ -z "${branch_arg}" ] || resolve_branch
+        go_worktree
         ;;
     delete)
         if [ "${source_kind}" != "mirror" ] || [ -n "${branch_arg}" ]; then

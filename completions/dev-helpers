@@ -615,7 +615,7 @@ _git-worktree()
     if [[ "${cur}" == -* ]]; then
         __dh_compgen "-b --branch -B --base --fetch --no-fetch -w --workdir -h --help"
     elif [ "${COMP_CWORD}" -eq 1 ]; then
-        __dh_compgen "add list delete move-to-main"
+        __dh_compgen "add list go delete move-to-main"
     fi
     return 0
 }
