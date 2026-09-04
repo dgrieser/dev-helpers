@@ -122,6 +122,9 @@ so; GitLab --auto-merge=false), leaving the merge to the provider until every
 requirement is met (--auto, on GitLab --auto-merge), or leaving the request
 alone.
 
+An auto-merge waits for the pipeline, so the pipelines of the source branch are
+shown with git-pipe once it is set.
+
 Actions:
   -c, --create            create a request from the current branch
   -a, --approve           approve the selected request
@@ -635,6 +638,23 @@ merge_blocked_reason() {
     esac
 }
 
+# an auto-merge leaves the merge to the provider, which runs it once the pipeline
+# of the source branch succeeded, so that pipeline is what to look at next.
+# git-pipe detects the provider the same way, so one call covers GitLab CI and
+# GitHub Actions, and it prints instead of opening the picker when the output is
+# not a terminal
+show_item_pipeline() {
+    local n="${1}"
+    local source_branch
+
+    command -v git-pipe >/dev/null 2>&1 || return 0
+    source_branch="$(item_json "${n}" | jq -r '.source // empty')"
+    [ -z "${source_branch}" ] && return 0
+    echo 1>&2
+    git-pipe status --ref "${source_branch}" --no-tags
+    return 0
+}
+
 # mode is empty for a plain merge, bypass to merge past the requirements and auto
 # to leave the merge to the provider until they are met
 merge_item() {
@@ -669,6 +689,8 @@ merge_item() {
         glab mr merge "${n}" "${merge_args[@]}" \
             || { error "Failed to merge $(item_ref "${n}")"; return 1; }
     fi
+    [ "${mode}" = "auto" ] && show_item_pipeline "${n}"
+    return 0
 }
 
 # a refused approval and a blocked merge both fall back to the same question:

@@ -382,6 +382,14 @@ rendering). Closing and deleting a request ask whether its source branch should
 be deleted locally and on the remote as well; deleting a request is GitLab only,
 because the GitHub API can not delete a pull request. `-n` acts on one request
 without the picker, `-p` prints the list.
+
+When the approval is refused - the request is your own or the approval rights
+are missing - and when the provider blocks the merge although the approval went
+through, the merge offers three ways on: merging past the requirements (GitHub
+`--admin`, GitLab `--auto-merge=false`), leaving the merge to the provider until
+every requirement is met (`--auto`, on GitLab `--auto-merge`), or leaving the
+request alone. An auto-merge waits for the pipeline, so the pipelines of the
+source branch are shown with [git-pipe](#git-pipe) once it is set.
 ```bash
 git-mr [-c|--create] [-a|--approve] [-M|--merge] [-C|--close] [-D|--delete] \
        [-m|--copy-message] [-i|--issue] [--feedback] [-u|--unresolved] [-r|--raw] \
@@ -428,6 +436,11 @@ Push current or named branch; optional push-only or force-with-lease.
 ```bash
 git-push [-p|--push-only] [-F|--force-with-lease] [<branch>]
 ```
+When the pushed branch is the checked out one, is not the default branch and has
+no open merge request or pull request, creating one is offered (default yes) and
+handed over to [git-mr](#git-mr) `--create`. The "To create a merge request"
+hint GitLab and GitHub answer such a push with settles the question for free;
+without it the provider is asked.
 
 ### git-reset-all
 Reset and clean all tracked and untracked changes (with confirm).

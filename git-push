@@ -24,9 +24,83 @@ fail() {
     exit 1
 }
 
+# the byte ranges of a CSI sequence only mean what they say in the C locale
+strip_ansi() {
+    LC_ALL=C sed -e 's|\x1b\[[0-9;:?]*[ -/]*[@-~]||g'
+}
+
+# what the remote said arrives on stderr, so the stream is teed through a fifo:
+# the terminal keeps seeing the push while it runs and the copy stays readable
+# afterwards
+push_with_log() {
+    local fifo rc tee_pid
+
+    push_log_dir="$(mktemp -d "${TMPDIR:-/tmp}/$(basename "${0}").XXXXXX")" \
+        || fail "Cannot create a temp directory"
+    trap 'rm -rf "${push_log_dir}"' EXIT
+    fifo="${push_log_dir}/stderr"
+    mkfifo "${fifo}" || fail "Cannot create a fifo"
+    push_log="${push_log_dir}/push"
+    tee "${push_log}" < "${fifo}" 1>&2 &
+    tee_pid="${!}"
+    "${@}" 2>"${fifo}"
+    rc="${?}"
+    wait "${tee_pid}"
+    return "${rc}"
+}
+
+request_noun() {
+    local url
+
+    url="$(git -C "${git_dir}" remote get-url origin 2>/dev/null)"
+    if [[ "${url}" == *github* ]] \
+        || [ -n "$(git -C "${git_dir}" config --get remote.origin.gh-resolved 2>/dev/null)" ]; then
+        echo "pull request"
+    else
+        echo "merge request"
+    fi
+}
+
+# GitLab answers a push with "To create a merge request for <branch>, visit:"
+# and GitHub with "Create a pull request for '<branch>' on GitHub by visiting:"
+# whenever the pushed branch has no open request, so the push output settles the
+# question for free. Only the presence of the hint is an answer though - GitHub
+# prints it for a branch it has just seen for the first time and for no other -
+# so without it the provider is asked, which git-pr does for both of them.
+# 0 the branch has no open request, 1 it has one, 2 unknown
+branch_has_no_request() {
+    local count
+
+    [ -n "${push_log}" ] && [ -r "${push_log}" ] \
+        && strip_ansi < "${push_log}" | grep -qiE 'create a (merge|pull) request' \
+        && return 0
+    count="$(git-pr --print --output json --branch "${BRANCH_SHORT}" 2>/dev/null \
+        | jq 'length' 2>/dev/null)"
+    [[ "${count}" =~ ^[0-9]+$ ]] || return 2
+    [ "${count}" -eq 0 ] && return 0
+    return 1
+}
+
+# a pushed branch is ready for review, so the request it is still missing is
+# offered right away. git-pr takes the source branch from the checkout, so the
+# handover only works for the branch that is checked out
+offer_request() {
+    local noun
+
+    [ "${BRANCH_SHORT}" = "$(git -C "${git_dir}" branch --show-current)" ] || return 0
+    [ "${BRANCH_SHORT}" = "$(git-default 2>/dev/null)" ] && return 0
+    branch_has_no_request || return 0
+    noun="$(request_noun)"
+    prompt-yes-no "No open ${noun} for \"${BRANCH_SHORT}\". Create one?" || return 0
+    git-pr --create
+}
+
 BRANCH=""
 PUSH_ONLY=0
 PUSH_FORCE_WITH_LEASE=0
+
+push_log_dir=""
+push_log=""
 
 while [ "$#" -gt 0 ]; do
     case "${1}" in
@@ -97,11 +171,13 @@ if [ "${PUSH_FORCE_WITH_LEASE}" -eq 0 ]; then
         PUSH_FORCE_WITH_LEASE=1
     fi
 fi
+push_rc=0
 if [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ]; then
-    git-color -C "${git_dir}" push --force-with-lease origin "${BRANCH}"
+    push_with_log git-color -C "${git_dir}" push --force-with-lease origin "${BRANCH}" || push_rc=1
 else
-    git-color -C "${git_dir}" push -u origin "${BRANCH}"
+    push_with_log git-color -C "${git_dir}" push -u origin "${BRANCH}" || push_rc=1
 fi
+[ "${push_rc}" -eq 0 ] && offer_request
 
 # the pipelines of interest after a push are the ones of the branch it went to,
 # so the tag queries are only latency here
