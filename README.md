@@ -353,26 +353,35 @@ detected from the remote, so `git-mr` and `git-pr` are the same command.
 Approve, merge, create, close, delete, copy a channel message, create an issue,
 or show the review feedback.
 
-Without an action a `prompt-select` menu offers every action plus the branch and
-state filter (`branch` opens a branch list, `states` toggles, both return to the
-menu). The requests are then listed in an fzf picker with the request and its
-diff in the preview: `enter` runs the chosen action (approve + merge by
-default), `ctrl-s`
-shows the request, `ctrl-d` its diff, `ctrl-o` opens it in the browser,
-`ctrl-y` copies a channel message, `ctrl-f` shows the feedback, `alt-a`
-approves, `alt-m` merges, `alt-i` creates an issue from it, `alt-c` closes it,
-`alt-x` deletes it, and `esc` goes back.
+Without an action a `prompt-select` menu asks for one of the three ways in:
+`create`, `show` or `copy`. Show and copy list the requests in an fzf picker
+with the request and its diff in the preview: `enter` runs the chosen action
+(show by default), `tab` switches the state filter (open, merged, closed, all),
+`ctrl-b` asks for the branch filter on a list of the repository's branches,
+`ctrl-d` shows the diff, `ctrl-o` opens it in the browser, `ctrl-y` copies a
+channel message, `ctrl-f` shows the comments, `alt-a` approves, `alt-m` merges,
+`alt-i` creates an issue from it, `alt-c` closes it, `alt-x` deletes it, and
+`esc` goes back. Every other action is a key of the picker, so the menu stays
+three lines long.
 
 All of those but the chosen action and creating an issue - both of which report
-something the picker would draw over - act inside the picker: showing the request,
-its diff or its feedback hands the terminal to the pager, opening the browser and
-copying the message keep the screen and report above the header, and approving,
-merging, closing and deleting reload the list so the new state shows. Only those
-four reload, since a reload is an API call.
+something the picker would draw over - act inside the picker: showing the diff
+or the comments hands the terminal to the pager, opening the browser and copying
+the message keep the screen and report above the header, and the two filters,
+approving, merging, closing and deleting reload the list so what changed shows.
+Only those reload, since a reload is an API call.
+
+`enter` shows the request the way its provider does - `glab mr view` or
+`gh pr view`, without the diff - and asks what to do with it: `Approve + Merge`,
+which `tab` switches to `Approve` or `Merge` alone, `Comments` or `Diff`.
+Reading the comments or the diff comes back to the question, `esc` returns to
+the picker. Getting the request in needs no confirmation of its own, since the
+question is asked on the view of the request.
 
 The context printed before the picker opens is off the screen while it runs, so
 the footer leads with the two filters that decide what the list holds: the branch
-filter and the state filter.
+filter and the state filter. A list left empty by them shows one row saying so,
+which is also the row the filters are pressed on to widen them again.
 
 By default the requests of the current branch are listed; on the default or
 production branch (`--prod-branch`) requests are filtered by their target
@@ -380,8 +389,9 @@ branch instead. `--feedback` prints the comments and review feedback as
 Markdown (`-u` hides resolved discussions, `-r` skips the terminal
 rendering). Closing and deleting a request ask whether its source branch should
 be deleted locally and on the remote as well; deleting a request is GitLab only,
-because the GitHub API can not delete a pull request. `-n` acts on one request
-without the picker, `-p` prints the list.
+because the GitHub API can not delete a pull request. `-n` shows one request
+without the picker, `-p` prints the list. `-A` starts with every state instead
+of the open ones.
 
 When the approval is refused - the request is your own or the approval rights
 are missing - and when the provider blocks the merge although the approval went

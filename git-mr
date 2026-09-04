@@ -19,16 +19,26 @@ C_RESET=$'\033[0m'
 
 LIST_HEADER=$'ID\tSTATE\tUPDATED\tAUTHOR\tBRANCHES\tTITLE'
 
-# the picker stays open for everything but its main action and creating an issue,
-# both of which report something the picker would draw over: reading a detail
-# hands the terminal over to the pager, approving reports through the message
-# above the header, and the prompting actions get the terminal as well. Only the
-# actions that change an item reload the list, since a reload is an API call.
+# the picker stays open for everything but its main action and creating an
+# issue, both of which report something the picker would draw over: reading a
+# detail hands the terminal over to the pager, opening the browser and copying
+# report through the message above the header, and the two filters change what
+# the list holds. Only a filter and the actions that change an item reload the
+# list, since a reload is an API call. The main action ends the picker, because
+# the branch filter asks its question on the input line and takes enter for its
+# answer, which leaves no enter to handle inside the picker.
 LIST_KEYS="enter,esc,ctrl-q,alt-i"
-LIST_EXEC_KEYS="ctrl-s,ctrl-d,ctrl-f"
+LIST_EXEC_KEYS="ctrl-d,ctrl-f"
 LIST_SILENT_KEYS="ctrl-o,ctrl-y"
-LIST_RELOAD_KEYS="alt-a"
+LIST_RELOAD_KEYS="tab,ctrl-b,alt-a"
 LIST_EXEC_RELOAD_KEYS="alt-m,alt-c,alt-x"
+
+# the row of the branch candidates that clears the branch filter
+ALL_BRANCHES_ROW="(all)"
+
+# the three ways to get a request in are one row of the question that follows a
+# shown request, cycled with tab
+SHOW_CYCLE="review|approve|merge"
 
 # an approval the provider refuses although the token is valid, because the
 # request is the user's own or the approval rights are missing
@@ -107,12 +117,16 @@ Work with GitLab merge requests and GitHub pull requests. The provider is
 detected from the remote, so ${APP_NAME} handles both; git-mr and git-pr are
 the same command.
 
-Without an action a prompt-select menu offers every action plus the branch and
-state filter; the filter entries change the filter and return to the menu. The
-requests themselves are listed in a picker with the request and its diff in the
-preview:
+Without an action a prompt-select menu asks for one of the three ways in:
+create, show or copy. Show and copy list the requests in a picker with the
+request and its diff in the preview, both filters among its keys:
 
-$(key_help "enter:the chosen action (approve + merge by default),ctrl-s:show the request,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the feedback,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
+$(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
+
+Showing a request prints the view of the provider, without its diff, and asks
+what to do with it: approve + merge (tab switches to approve or merge only),
+its comments or its diff. Reading one of those comes back to the question, esc
+returns to the picker.
 
 When the approval is refused, because the request is your own or the approval
 rights are missing, and when the provider blocks the merge although the approval
@@ -136,7 +150,7 @@ Actions:
   -m, --copy-message      copy a channel message for the selected request
   -i, --issue             create an issue from the selected request
       --feedback          print the comments and review feedback
-  <none>                  ask, or approve and merge with -n/--number
+  <none>                  ask, or show with -n/--number
 
 Options:
   -b, --branch <branch>   filter by branch (default: the current branch); with
@@ -145,7 +159,8 @@ Options:
       --prod-branch <b>   name of the production branch (default ${PROD_BRANCH_DEFAULT}); on the
                           default or production branch requests are filtered by
                           their target branch instead of their source branch
-  -A, --all               include every request state
+  -A, --all               start with every request state instead of open only;
+                          tab switches the state filter inside the picker
   -n, --number <id>       act on <id> and skip the picker
   -u, --unresolved        with --feedback, hide resolved discussions
   -r, --raw               with --feedback, print Markdown without rendering
@@ -344,7 +359,11 @@ resolve_branch_mode() {
 list_gitlab_json() {
     local args=("--output" "json" "-P" "${limit}")
 
-    [ "${all}" -eq 1 ] && args+=("--all")
+    case "${state}" in
+        merged) args+=("--merged") ;;
+        closed) args+=("--closed") ;;
+        all)    args+=("--all") ;;
+    esac
     if [ -n "${branch}" ]; then
         if [ "${branch_mode}" = "target" ]; then
             args+=("--target-branch" "${branch}")
@@ -370,11 +389,14 @@ list_github_json() {
     local args=("--repo" "${github_repo_selector}" "--limit" "${limit}"
                 "--json" "number,title,state,isDraft,author,headRefName,baseRefName,updatedAt,url")
 
-    if [ "${all}" -eq 1 ]; then
-        args+=("--state" "all")
-    else
-        args+=("--state" "open")
-    fi
+    case "${state}" in
+        merged) args+=("--state" "merged") ;;
+        # a merged pull request is a closed one as well, so the state alone would
+        # list the merged ones under the closed filter
+        closed) args+=("--state" "closed" "--search" "is:unmerged") ;;
+        all)    args+=("--state" "all") ;;
+        *)      args+=("--state" "open") ;;
+    esac
     if [ -n "${branch}" ]; then
         if [ "${branch_mode}" = "target" ]; then
             args+=("--base" "${branch}")
@@ -406,7 +428,7 @@ list_json() {
 
 list_by_source() {
     # shellcheck disable=SC2034
-    local branch="${1}" branch_mode="source" all=0
+    local branch="${1}" branch_mode="source" state="open"
     list_json
 }
 
@@ -435,8 +457,12 @@ list_print() {
         ] | @tsv
     ' <<< "${json}")"
 
+    # an empty list gets a row saying so, which is also the row the keys that
+    # need none - the filters above all - are pressed on: fzf skips a command
+    # carrying the placeholder of a row while there is none
     if [ -z "${rows}" ]; then
-        printf '%s\n' "${LIST_HEADER}" | render_table
+        printf '%s\n-\t-\t-\t-\t-\t%sNo %s found%s\n' \
+            "${LIST_HEADER}" "${C_LABEL}" "${NOUN_PLURAL}" "${C_RESET}" | render_table
         return 0
     fi
     printf '%s\n' "${LIST_HEADER}${NL}${rows}" | toage | render_table
@@ -518,18 +544,56 @@ preview_item() {
     item_diff "${n}"
 }
 
-show_details() {
+# what the provider shows on the request page, without its diff: it is the same
+# view its own client prints, so the request reads as it does everywhere else
+show_view() {
     local n="${1}"
-    local json
 
-    json="$(item_json "${n}")"
-    [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
-    {
-        print_item_summary "${json}"
-        jq -r 'if (.body // "") == "" then empty else "\n" + .body end' <<< "${json}"
-        printf '\n'
-        item_diff "${n}"
-    } | pager
+    if [ "${provider}" = "github" ]; then
+        gh pr view "${n}" --repo "${github_repo_selector}" 1>&2 \
+            || { error "Failed to read $(item_ref "${n}")"; return 1; }
+    else
+        glab mr view "${n}" 1>&2 \
+            || { error "Failed to read $(item_ref "${n}")"; return 1; }
+    fi
+}
+
+# the answers of the question that follows the view: the three ways to get the
+# request in share the first row, tab walks through them
+show_items() {
+    printf '%s\n' \
+        "review=Approve + Merge" \
+        "approve=Approve" \
+        "merge=Merge" \
+        "comments=Comments" \
+        "diff=Diff"
+}
+
+# the view of a request and what to do with it. Reading its comments or its diff
+# hands the terminal to the pager and comes back here, so the view is printed
+# again; getting the request in is what ends the question, and esc leaves it.
+show_request() {
+    local n="${1}"
+    local choice
+
+    need_cmd prompt-select
+    while true; do
+        echo 1>&2
+        show_view "${n}" || return 1
+        echo 1>&2
+        # esc steps back to the picker, so it is no abort worth a line of its own
+        choice="$(show_items | prompt-select --prompt "$(item_ref "${n}"):" \
+            --cycle "${SHOW_CYCLE}" --no-abort-message)" || return 2
+        case "${choice}" in
+            review|approve|merge)
+                run_action "${choice}" "${n}"
+                return "${?}"
+                ;;
+            comments) show_feedback "${n}" ;;
+            diff)     show_diff "${n}" ;;
+            *)        return 2 ;;
+        esac
+    done
 }
 
 show_diff() {
@@ -724,12 +788,8 @@ ask_merge_bypass() {
 
 approve_and_merge() {
     local n="${1}"
-    local json rc
+    local rc
 
-    json="$(item_json "${n}")"
-    [ -n "${json}" ] && print_item_summary "${json}"
-    echo 1>&2
-    prompt-yes-no "Approve and merge '$(item_ref "${n}")'?" || { echo "Abort." 1>&2; return 2; }
     approve_item "${n}"
     rc=$?
     if [ "${rc}" -eq 0 ]; then
@@ -1093,13 +1153,14 @@ create_request() {
 
 action_label() {
     case "${1}" in
+        show)     echo "show" ;;
         review)   echo "approve + merge" ;;
         approve)  echo "approve" ;;
         merge)    echo "merge" ;;
         close)    echo "close" ;;
         delete)   echo "delete" ;;
         copy)     echo "copy message" ;;
-        feedback) echo "feedback" ;;
+        feedback) echo "comments" ;;
         issue)    echo "issue" ;;
         create)   echo "create" ;;
         *)        echo "${1}" ;;
@@ -1113,6 +1174,7 @@ run_action() {
     local rc
 
     case "${act}" in
+        show)     show_request "${n}" ;;
         review)   approve_and_merge "${n}" ;;
         approve)
             approve_item "${n}"
@@ -1147,11 +1209,24 @@ branch_filter_label() {
 }
 
 state_filter_label() {
-    if [ "${all}" -eq 1 ]; then
-        echo "all states"
-    else
-        echo "open only"
-    fi
+    case "${state}" in
+        merged) echo "merged only" ;;
+        closed) echo "closed only" ;;
+        all)    echo "all states" ;;
+        *)      echo "open only" ;;
+    esac
+}
+
+# the state filter walks open -> merged -> closed -> all and around again, so one
+# key reaches every listing without a direction to remember
+cycle_state() {
+    case "${state}" in
+        open)   state="merged" ;;
+        merged) state="closed" ;;
+        closed) state="all" ;;
+        *)      state="open" ;;
+    esac
+    write_state
 }
 
 # the context printed before the picker opened is gone from the screen while it
@@ -1162,36 +1237,10 @@ list_footer() {
         "${C_LABEL}" "$(state_filter_label)" "${C_RESET}"
 }
 
-# the rows of the action menu; prompt-select colors the list itself, so the
-# rows stay plain and only the columns are padded
+# the three ways in, nothing else: every other action is a key of the picker,
+# and so are the two filters, which used to be entries here
 menu_items() {
-    local source_branch target_branch create_description
-
-    source_branch="$(git branch --show-current 2>/dev/null)"
-    target_branch="$(create_target_branch "${source_branch}")"
-    if [ -n "${source_branch}" ] && [ -n "${target_branch}" ] \
-        && [ "${source_branch}" != "${target_branch}" ]; then
-        create_description="create a ${NOUN} for ${source_branch} → ${target_branch}"
-    else
-        create_description="create a ${NOUN}: check out a feature branch first"
-    fi
-    # a pull request can not be deleted, so GitHub has no delete entry
-    {   printf '%s\t%s\n' \
-            "ACTION"   "DESCRIPTION" \
-            "review"   "approve, merge, or inspect a ${NOUN}" \
-            "create"   "${create_description}" \
-            "copy"     "copy a channel message for a ${NOUN}" \
-            "feedback" "show the comments and review feedback of a ${NOUN}" \
-            "issue"    "create an issue from a ${NOUN}" \
-            "close"    "close a ${NOUN} and optionally delete its source branch"
-        if [ "${provider}" != "github" ]; then
-            printf '%s\t%s\n' \
-                "delete" "delete a ${NOUN} and optionally delete its source branch"
-        fi
-        printf '%s\t%s\n' \
-            "branch"   "branch filter: $(branch_filter_label)" \
-            "states"   "state filter: $(state_filter_label)"
-    } | render_table
+    printf '%s\n' "create" "show" "copy"
 }
 
 print_context() {
@@ -1202,27 +1251,28 @@ print_context() {
     printf '%s%-10s%s%s\n' "${C_LABEL}" "States:" "${C_RESET}" "$(state_filter_label)"
 }
 
-pick_branch_filter() {
-    local choice branches
-    local all_branches="(all branches)"
-    local select_args=("--prompt" "Branch filter:" "--delimiter" "")
+# the candidates the branch filter is answered with, in the place of the list
+# while the question is open; the branches come newest first, the row that
+# clears the filter leads them
+pick_branches() {
+    printf '%s\n%s\n' "BRANCH" "${ALL_BRANCHES_ROW}"
+    git for-each-ref --sort=-committerdate \
+        --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
+        | sed -e 's|^origin/||' -e '/^HEAD$/d' \
+        | awk '!seen[$0]++'
+}
 
-    branches="$( { printf '%s\n' "${all_branches}"
-                   git for-each-ref --sort=-committerdate \
-                       --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
-                       | sed -e 's|^origin/||' -e '/^HEAD$/d' \
-                       | awk '!seen[$0]++'; } )"
-    # a filter that is not a branch of this repo has no item to start on
-    if [ -n "${branch}" ] && grep -qxF -- "${branch}" <<< "${branches}"; then
-        select_args+=("--default" "${branch}")
-    fi
+# the answer of the branch question: the row the cursor was on, or whatever was
+# typed, so a branch the list does not offer works as a filter as well
+set_branch_filter() {
+    local answer
 
-    choice="$(printf '%s\n' "${branches}" | prompt-select "${select_args[@]}")" || return 1
-    [ -z "${choice}" ] && return 1
-    if [ "${choice}" = "${all_branches}" ]; then
+    answer="$(awk '{print $1}' <<< "${1}")"
+    [ -z "${answer}" ] && return 0
+    if [ "${answer}" = "${ALL_BRANCHES_ROW}" ]; then
         branch=""
     else
-        branch="${choice}"
+        branch="${answer}"
     fi
     resolve_branch_mode
     write_state
@@ -1236,36 +1286,22 @@ has_requests() {
     [ -n "${count}" ] && [ "${count}" -gt 0 ]
 }
 
-# the menu keeps coming back until an action ran or it is left with esc; the
-# filter entries only change the state and redraw
+# the menu keeps coming back until an action ran or it is left with esc. An
+# empty list is no reason to keep the picker closed: both filters are keys of
+# it, so widening them is what it is opened for.
 run_menu() {
-    local choice rc
+    local choice
 
     while true; do
-        # the header row of the menu names the columns, so no prompt is needed
-        choice="$(menu_items | prompt-select --prompt "" \
-            --key-regex '^\S+' --header-lines 1)"
-        rc="${?}"
-        [ "${rc}" -ne 0 ] && return 0
+        choice="$(menu_items | prompt-select)" || return 0
         case "${choice}" in
-            branch)
-                pick_branch_filter
-                ;;
-            states)
-                all=$((1 - all))
-                write_state
-                ;;
             create)
                 create_request
                 return "${?}"
                 ;;
-            review|copy|feedback|issue|close|delete)
+            show|copy)
                 action="${choice}"
                 write_state
-                if ! has_requests; then
-                    warning "No ${NOUN_PLURAL} found"
-                    continue
-                fi
                 # the picker returns non-zero when it was left with esc, so the
                 # menu comes back instead of ending the run
                 pick_list && return 0
@@ -1282,19 +1318,26 @@ handle_list_key() {
     n="$(awk '{print $1}' <<< "${line}")"
 
     [ -z "${key}" ] && exit 255
+    # the filters and the way out act on no request of their own, so they come
+    # before the id is looked at: on an empty list, whose one row carries a dash
+    # instead of an id, the filters are what is needed
     case "${key}" in
         esc|ctrl-q)
             exit 255
+            ;;
+        tab)
+            cycle_state
+            exit 0
+            ;;
+        ctrl-b)
+            set_branch_filter "${FZF_WITH_HEADER_ANSWER}"
+            exit 0
             ;;
     esac
     [[ "${n}" =~ ^[0-9]+$ ]] || exit 0
 
     # read-only actions keep the picker open
     case "${key}" in
-        ctrl-s)
-            show_details "${n}"
-            exit 0
-            ;;
         ctrl-d)
             show_diff "${n}"
             exit 0
@@ -1304,7 +1347,7 @@ handle_list_key() {
             exit 0
             ;;
         ctrl-f)
-            run_action feedback "${n}"
+            show_feedback "${n}"
             exit 0
             ;;
     esac
@@ -1326,7 +1369,7 @@ handle_list_key() {
 }
 
 list_key_descs() {
-    printf 'enter:%s,ctrl-s:show,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:feedback,alt-a:approve,alt-m:merge,alt-i:issue,alt-c:close%s,esc:back' \
+    printf 'enter:%s,tab:state,ctrl-b:branch,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:comments,alt-a:approve,alt-m:merge,alt-i:issue,alt-c:close%s,esc:back' \
         "$(action_label "${action}")" \
         "$([ "${provider}" != "github" ] && printf ',alt-x:delete')"
 }
@@ -1338,6 +1381,8 @@ pick_list() {
                     --silent-keys "${LIST_SILENT_KEYS}" \
                     --reload-keys "${LIST_RELOAD_KEYS}" \
                     --exec-reload-keys "${LIST_EXEC_RELOAD_KEYS}" \
+                    --pick "ctrl-b:Branch:" \
+                    --pick-command "ctrl-b:${APP_NAME} --id ${id} --pick-branches" \
                     --command "${APP_NAME} --id ${id} --list-print" \
                     --footer-prefix "${APP_NAME} --id ${id} --list-footer" \
                     "${query}" \
@@ -1361,7 +1406,7 @@ write_state() {
         printf 'branch=%q\n' "${branch}"
         printf 'branch_mode=%q\n' "${branch_mode}"
         printf 'prod_branch=%q\n' "${prod_branch}"
-        printf 'all=%q\n' "${all}"
+        printf 'state=%q\n' "${state}"
         printf 'limit=%q\n' "${limit}"
         printf 'output=%q\n' "txt"
         printf 'raw=%q\n' "${raw}"
@@ -1376,7 +1421,6 @@ set_action() {
 }
 
 action=""
-all=0
 branch=""
 branch_mode="source"
 checkout=0
@@ -1402,6 +1446,7 @@ remote_host=""
 remote_repository=""
 remote_url=""
 repo_dir=""
+state="open"
 unresolved=0
 
 while [ "${#}" -gt 0 ]; do
@@ -1434,7 +1479,7 @@ while [ "${#}" -gt 0 ]; do
             set_action "feedback"
             ;;
         -A|--all)
-            all=1
+            state="all"
             ;;
         -b|--branch)
             shift
@@ -1487,6 +1532,9 @@ while [ "${#}" -gt 0 ]; do
         --list-footer)
             mode="list-footer"
             ;;
+        --pick-branches)
+            mode="pick-branches"
+            ;;
         --list-preview)
             mode="list-preview"
             shift
@@ -1538,6 +1586,10 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
             preview_item "${preview_arg}"
             exit 0
             ;;
+        pick-branches)
+            pick_branches
+            exit 0
+            ;;
         list-key)
             handle_list_key
             ;;
@@ -1545,12 +1597,12 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ]; then
 fi
 
 case "${mode}" in
-    list-print|list-footer|list-preview|list-key)
+    list-print|list-footer|list-preview|list-key|pick-branches)
         fail "No state for id ${id}"
         ;;
 esac
 
-[ "${all}" -eq 1 ] && [ "${action}" = "create" ] \
+[ "${state}" != "open" ] && [ "${action}" = "create" ] \
     && error "-A|--all can not be combined with -c|--create" && usage
 [ -n "${number}" ] && [ "${action}" = "create" ] \
     && error "-n|--number can not be combined with -c|--create" && usage
@@ -1622,7 +1674,7 @@ elif [ "${mode}" = "print" ] || { [ ! -t 1 ] && [ -z "${number}" ] && [ -z "${ac
     list_print
     exit_code="${?}"
 elif [ -n "${number}" ]; then
-    [ -z "${action}" ] && action="review"
+    [ -z "${action}" ] && action="show"
     run_action "${action}" "${number}"
     exit_code="${?}"
     [ "${exit_code}" -eq 2 ] && exit_code=1
