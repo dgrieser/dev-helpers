@@ -30,7 +30,8 @@ Options:
         --autostash     Stash local changes for the duration of the rebase
         --no-autostash  Refuse to start with local changes
                         (asked interactively when neither is given)
-    -p, --push          Hand the rebased branch to git-push without asking
+    -p, --push          Force push when the rebase is done without asking
+                        (git-push asks once otherwise)
     -P, --no-push       Do not offer the push
                         (offered by default)
     -y, --yes           Answer every question with its default; a stopped
@@ -581,7 +582,11 @@ finish_rebase() {
     fi
     # the literal commit, because the next git command clobbers ORIG_HEAD
     echo "Undo with: git reset --hard ${before_sha}" 1>&2
-    git-color -C "${git_dir}" status --short --branch 1>&2
+    print_divergence "${branch}"
+    # on a clean tree "status --short" says nothing, which is the normal case
+    # here; it earns its line when an autostash has just put changes back
+    [ -n "$(git -C "${git_dir}" status --porcelain)" ] \
+        && git-color -C "${git_dir}" status --short 1>&2
 
     [ "$(git -C "${git_dir}" config --bool --get rebase.updateRefs 2>/dev/null)" == "true" ] \
         && warning "rebase.updateRefs is on, other branches may have been rewritten too."
@@ -590,12 +595,31 @@ finish_rebase() {
     exit 0
 }
 
+# How far the branch now is from its remote, which is the reason the push has
+# to be forced. "git status --short --branch" says the same in a "##" line that
+# is the only output on a clean tree and means little on its own.
+print_divergence() {
+    local branch="${1}" counts behind ahead upstream
+
+    [ -n "${branch}" ] || return 0
+    upstream="$(git -C "${git_dir}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" \
+        || return 0
+    [ -n "${upstream}" ] || return 0
+    counts="$(git -C "${git_dir}" rev-list --left-right --count "${upstream}...HEAD" 2>/dev/null)" \
+        || return 0
+    behind="$(printf '%s' "${counts}" | awk '{print $1}')"
+    ahead="$(printf '%s' "${counts}" | awk '{print $2}')"
+    [[ "${behind}" =~ ^[0-9]+$ ]] && [[ "${ahead}" =~ ^[0-9]+$ ]] || return 0
+    echo "\"${branch}\" is now ${ahead} commit(s) ahead of and ${behind} behind \"${upstream}\"." 1>&2
+}
+
 # The rebase rewrote commits the remote may already have, so the branch has
 # diverged from it and only a forced push gets there. git-push -F carries the
 # lease, the request offer and the pipeline listing, so only the decision is
 # left here.
 offer_push() {
     local branch="${1}"
+    local push_args pushed_sha head_sha
 
     [ "${do_push}" -eq 0 ] && return 0
     if [ -z "${branch}" ]; then
@@ -618,12 +642,23 @@ offer_push() {
         return 0
     fi
 
-    if [ "${do_push}" -ne 1 ]; then
-        confirm "Push \"${branch}\" with --force-with-lease?" "yes" || return 0
-    fi
     need_cmd git-push
-    git-push -F "${branch}" \
-        || { warning "git-push did not push \"${branch}\"; the rebase itself is done."; return 0; }
+    # git-push asks before it pushes, so asking here as well would put the same
+    # question twice. --push and --yes answer it in advance, which is what
+    # git-push's --force-push stands for
+    push_args=("-F")
+    { [ "${do_push}" -eq 1 ] || [ "${assume_yes}" -eq 1 ]; } && push_args=("--force-push")
+    git-push "${push_args[@]}" "${branch}"
+
+    # git-push ends with the pipeline listing, so its exit status is that one's
+    # and not the push's - a push that went through still comes back non-zero
+    # when there is no forge to ask. A successful push moves the
+    # remote-tracking ref, so that is what is compared instead.
+    pushed_sha="$(git -C "${git_dir}" rev-parse --verify --quiet "refs/remotes/origin/${branch}")"
+    head_sha="$(git -C "${git_dir}" rev-parse --verify --quiet HEAD)"
+    [ -n "${pushed_sha}" ] && [ "${pushed_sha}" == "${head_sha}" ] && return 0
+    warning "\"${branch}\" did not reach origin; the rebase itself is done."
+    return 0
 }
 
 # --- main ------------------------------------------------------------------

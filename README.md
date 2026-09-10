@@ -444,11 +444,15 @@ git-pr [OPTIONS] [<project>]
 ### git-push
 Push current or named branch; optional push-only or force-with-lease.
 ```bash
-git-push [-p|--push-only] [-F|--force-with-lease] [<branch>]
+git-push [-p|--push-only] [-F|--force-with-lease] [--force-push] [<branch>]
 ```
 When the pushed branch is the checked out one, is not the default branch and has
 no open merge request or pull request, creating one is offered (default yes) and
-handed over to [git-mr](#git-mr) `--create`. The "To create a merge request"
+handed over to [git-mr](#git-mr) `--create`. `--force-push` is `--force-with-lease`
+for a caller that has settled the question already, such as
+[git-rebase](#git-rebase) `--push`, and skips only the question about the push
+itself - it still asks about the request, and refuses a tree with changes in it
+rather than committing them unasked. The "To create a merge request"
 hint GitLab and GitHub answer such a push with settles the question for free;
 without it the provider is asked.
 
@@ -482,11 +486,12 @@ carried through the rebase with `--autostash` after asking, counting tracked
 changes only, since untracked files are left alone by both the stash and the
 rebase.
 
-A finished rebase names the commit to `git reset --hard` back to and offers the
-force push it now needs, handed over to [git-push](#git-push) `-F`. That handover
-is skipped while the working tree has changes, because git-push commits what it
-finds before pushing, and for a branch that was never pushed, which needs no
-force.
+A finished rebase names the commit to `git reset --hard` back to, says how far
+the branch now is ahead of and behind its remote, and hands the force push it
+needs to [git-push](#git-push) `-F`, which asks the one question about it.
+`-p/--push` answers that question in advance. The handover is skipped while the
+working tree has changes, because git-push commits what it finds before pushing,
+and for a branch that was never pushed, which needs no force.
 
 ### git-reset-all
 Reset and clean all tracked and untracked changes (with confirm).

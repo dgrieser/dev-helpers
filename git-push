@@ -4,7 +4,7 @@ git() { LC_ALL=C command git -c color.ui=always "$@"; }
 git-color() { command git-color --color=always "$@"; }
 
 usage() {
-    echo "usage: $(basename "${0}") [-p|--push-only] [-F|--force-with-lease] [<branch>]" 1>&2
+    echo "usage: $(basename "${0}") [-p|--push-only] [-F|--force-with-lease] [--force-push] [<branch>]" 1>&2
     exit 1
 }
 
@@ -98,6 +98,7 @@ offer_request() {
 BRANCH=""
 PUSH_ONLY=0
 PUSH_FORCE_WITH_LEASE=0
+PUSH_CONFIRMED=0
 
 push_log_dir=""
 push_log=""
@@ -109,6 +110,13 @@ while [ "$#" -gt 0 ]; do
             ;;
         -F|--force-with-lease)
             PUSH_FORCE_WITH_LEASE=1
+            ;;
+        # --force-with-lease for a caller that has settled the question
+        # already, so the push is not asked about a second time. Still a lease,
+        # never a plain --force
+        --force-push)
+            PUSH_FORCE_WITH_LEASE=1
+            PUSH_CONFIRMED=1
             ;;
         *)
             if [ -z "${BRANCH}" ]; then
@@ -136,6 +144,13 @@ if [ -n "${BRANCH_FQ}" ]; then
     BRANCH="${BRANCH_FQ}"
 fi
 
+# the question this flag answers in advance is the one about the push, so it
+# must not hand over the authority to commit as well: without the prompt the
+# staging below would run unasked
+if [ "${PUSH_CONFIRMED}" -eq 1 ] && [ -n "$(git -C "${git_dir}" status --porcelain)" ]; then
+    fail "--force-push needs a clean tree, commit or stash the changes first."
+fi
+
 if [ "${PUSH_ONLY}" -eq 0 ] && [ -z "$(git -C "${git_dir}" status --porcelain)" ]; then
     echo "No changes to commit."
     PUSH_ONLY=1
@@ -144,7 +159,7 @@ fi
 message="Commit and push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_ONLY}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\"?"
 [ "${PUSH_FORCE_WITH_LEASE}" -eq 1 ] && message="Push to \"${BRANCH_SHORT}\" (force with lease)?"
-prompt-yes-no "${message}" || abort
+[ "${PUSH_CONFIRMED}" -eq 1 ] || prompt-yes-no "${message}" || abort
 git-color -C "${git_dir}" init
 ok=1
 if [ "${PUSH_ONLY}" -eq 0 ]; then
