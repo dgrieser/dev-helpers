@@ -3,8 +3,32 @@
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
 git-color() { command git-color --color=always "$@"; }
 
+APP_NAME="$(basename "${0}")"
+
 usage() {
-    echo "usage: $(basename "${0}") [-p|--push-only] [-F|--force-with-lease] [--force-push] [<branch>]" 1>&2
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [BRANCH]
+
+Commit and push a branch, then offer the request it is still missing.
+
+A clean working tree makes this a plain push. Otherwise the changes are staged
+with git-add and committed first. Once the push is through, a merge request or
+pull request is offered when the branch has none, and the pipelines of the
+branch are shown with git-pipe.
+
+BRANCH                        The branch to push; defaults to the checked out one.
+
+Options:
+  -p, --push-only             Push what is committed, without staging first
+  -F, --force-with-lease      Push with --force-with-lease, e.g. after a rebase.
+                              A diverged remote is offered this on its own.
+      --force-with-lease-yes  Like -F for a caller that has settled the
+                              question already, such as git-rebase --push: the
+                              question about the push is skipped and a tree
+                              with changes in it refused. Still a lease, never
+                              a plain --force.
+  -h, --help                  Show this help message and exit
+EOF
     exit 1
 }
 
@@ -105,6 +129,9 @@ push_log=""
 
 while [ "$#" -gt 0 ]; do
     case "${1}" in
+        -h|--help)
+            usage
+            ;;
         -p|--push-only)
             PUSH_ONLY=1
             ;;
@@ -114,9 +141,13 @@ while [ "$#" -gt 0 ]; do
         # --force-with-lease for a caller that has settled the question
         # already, so the push is not asked about a second time. Still a lease,
         # never a plain --force
-        --force-push)
+        --force-with-lease-yes)
             PUSH_FORCE_WITH_LEASE=1
             PUSH_CONFIRMED=1
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
             ;;
         *)
             if [ -z "${BRANCH}" ]; then
@@ -148,7 +179,7 @@ fi
 # must not hand over the authority to commit as well: without the prompt the
 # staging below would run unasked
 if [ "${PUSH_CONFIRMED}" -eq 1 ] && [ -n "$(git -C "${git_dir}" status --porcelain)" ]; then
-    fail "--force-push needs a clean tree, commit or stash the changes first."
+    fail "--force-with-lease-yes needs a clean tree, commit or stash the changes first."
 fi
 
 if [ "${PUSH_ONLY}" -eq 0 ] && [ -z "$(git -C "${git_dir}" status --porcelain)" ]; then

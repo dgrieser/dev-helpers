@@ -645,9 +645,9 @@ offer_push() {
     need_cmd git-push
     # git-push asks before it pushes, so asking here as well would put the same
     # question twice. --push and --yes answer it in advance, which is what
-    # git-push's --force-push stands for
+    # git-push's --force-with-lease-yes stands for
     push_args=("-F")
-    { [ "${do_push}" -eq 1 ] || [ "${assume_yes}" -eq 1 ]; } && push_args=("--force-push")
+    { [ "${do_push}" -eq 1 ] || [ "${assume_yes}" -eq 1 ]; } && push_args=("--force-with-lease-yes")
     git-push "${push_args[@]}" "${branch}"
 
     # git-push ends with the pipeline listing, so its exit status is that one's

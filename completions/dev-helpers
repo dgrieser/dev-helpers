@@ -537,7 +537,7 @@ _git-push()
     local cur prev
     __dh_init
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-p --push-only -F --force-with-lease --force-push -h --help"
+        __dh_compgen "-p --push-only -F --force-with-lease --force-with-lease-yes -h --help"
     else
         __dh_compgen "$(__dh_local_branches)"
     fi

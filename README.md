@@ -444,15 +444,15 @@ git-pr [OPTIONS] [<project>]
 ### git-push
 Push current or named branch; optional push-only or force-with-lease.
 ```bash
-git-push [-p|--push-only] [-F|--force-with-lease] [--force-push] [<branch>]
+git-push [-p|--push-only] [-F|--force-with-lease] [--force-with-lease-yes] [<branch>]
 ```
 When the pushed branch is the checked out one, is not the default branch and has
 no open merge request or pull request, creating one is offered (default yes) and
-handed over to [git-mr](#git-mr) `--create`. `--force-push` is `--force-with-lease`
-for a caller that has settled the question already, such as
-[git-rebase](#git-rebase) `--push`, and skips only the question about the push
-itself - it still asks about the request, and refuses a tree with changes in it
-rather than committing them unasked. The "To create a merge request"
+handed over to [git-mr](#git-mr) `--create`. `--force-with-lease-yes` is for a
+caller that has settled the question already, such as
+[git-rebase](#git-rebase) `--push`: it skips the question about the push and
+nothing else, so the request is still offered, and a tree with changes in it is
+refused rather than committed unasked. The "To create a merge request"
 hint GitLab and GitHub answer such a push with settles the question for free;
 without it the provider is asked.
 
