@@ -1,0 +1,762 @@
+#!/bin/bash
+
+git() { LC_ALL=C command git -c color.ui=always "$@"; }
+git-color() { command git-color --color=always "$@"; }
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] [BRANCH]
+
+Rebase the current branch onto BRANCH and work through the conflicts.
+
+An unfinished rebase is picked up where it stopped: its state is shown and
+continue, skip or abort is picked from a list, so the step a stopped rebase
+wants is never guessed. Otherwise BRANCH is asked for, defaulting to the
+default remote branch, and can be fetched beforehand. Conflicts are handed to
+git-add and the rebase goes on once the index has none left. A finished rebase
+leaves the branch diverged from its remote, so handing it to git-push for the
+force push it now needs is offered.
+
+BRANCH                  Branch, tag or commit to rebase onto. Asked for when
+                        omitted, defaulting to the default remote branch.
+
+Options:
+    -i, --interactive   Edit the list of commits before they are replayed
+        --fetch         Fetch BRANCH before the rebase
+        --no-fetch      Use BRANCH as it is
+                        (asked interactively when neither is given)
+        --autostash     Stash local changes for the duration of the rebase
+        --no-autostash  Refuse to start with local changes
+                        (asked interactively when neither is given)
+    -p, --push          Hand the rebased branch to git-push without asking
+    -P, --no-push       Do not offer the push
+                        (offered by default)
+    -y, --yes           Answer every question with its default; a stopped
+                        rebase is continued and conflicts are not opened
+    -h, --help          Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "${1} not found"
+}
+
+# Ask a yes/no question, honouring --yes. Ctrl-C always aborts.
+confirm() {
+    local answer_default="${2}"
+    [ "${assume_yes}" -eq 1 ] && return 0
+    if [ "${answer_default}" == "yes" ]; then
+        prompt-yes-no "${1}"
+    else
+        prompt-no-yes "${1}"
+    fi
+    local exit_code=$?
+    [ ${exit_code} -eq 130 ] && abort
+    return ${exit_code}
+}
+
+MAGENTA='\e[35m'
+NC='\e[0m'
+
+# --- rebase state ----------------------------------------------------------
+
+# The absolute path of a file in the git dir. --git-path answers relative to
+# the current directory, so the format has to be pinned: from a subdirectory a
+# bare "rebase-merge" comes back as "../.git/rebase-merge" and testing that
+# would look at the wrong place. It also knows which paths live in the git dir
+# of this worktree instead of the common one, which is where the state of a
+# rebase in a linked worktree sits.
+git_path() {
+    git -C "${git_dir}" rev-parse --path-format=absolute --git-path "${1}" 2>/dev/null
+}
+
+# The first line of a file in the state directory of the running rebase.
+state_file() {
+    local path="${rebase_dir}/${1}"
+
+    [ -r "${path}" ] || return 0
+    head -n 1 "${path}" | tr -d '\r\n'
+}
+
+# The commands still in a todo list: the lines that are neither blank nor a
+# comment. Commands, not commits, because exec and label lines are steps too.
+todo_count() {
+    local count
+
+    [ -r "${1}" ] || { echo 0; return 0; }
+    count="$(grep -cvE '^[[:space:]]*(#|$)' -- "${1}" 2>/dev/null)"
+    [[ "${count}" =~ ^[0-9]+$ ]] || count=0
+    echo "${count}"
+}
+
+# Read the state of an unfinished rebase into the rebase_* variables.
+# 0 when a rebase is in progress, 1 otherwise.
+#
+# The two backends keep their state in different directories, and the
+# "applying" marker is what tells a "git am" apart from a rebase that happens
+# to use the same one - the directory alone is not an answer.
+rebase_state() {
+    local dir
+
+    rebase_dir=""
+    rebase_backend=""
+    rebase_branch=""
+    rebase_onto=""
+    rebase_orig_head=""
+    rebase_step=0
+    rebase_total=0
+
+    dir="$(git_path rebase-apply)"
+    if [ -n "${dir}" ] && [ -d "${dir}" ]; then
+        [ -e "${dir}/applying" ] && return 1
+        rebase_dir="${dir}"
+        rebase_backend="apply"
+        rebase_step="$(state_file next)"
+        rebase_total="$(state_file last)"
+    else
+        dir="$(git_path rebase-merge)"
+        [ -n "${dir}" ] && [ -d "${dir}" ] || return 1
+        rebase_dir="${dir}"
+        rebase_backend="merge"
+        # the sequencer keeps done and git-rebase-todo, msgnum and end are the
+        # fallback for a state directory that has neither yet
+        rebase_step="$(todo_count "${dir}/done")"
+        rebase_total="$(( rebase_step + $(todo_count "${dir}/git-rebase-todo") ))"
+        if [ "${rebase_total}" -eq 0 ]; then
+            rebase_step="$(state_file msgnum)"
+            rebase_total="$(state_file end)"
+        fi
+    fi
+
+    rebase_branch="$(state_file head-name)"
+    rebase_branch="${rebase_branch#refs/heads/}"
+    rebase_onto="$(state_file onto)"
+    rebase_orig_head="$(state_file orig-head)"
+    [ -n "${rebase_orig_head}" ] || rebase_orig_head="$(state_file head)"
+    return 0
+}
+
+# Name the operation that is in progress instead of a rebase, if any. This is
+# only ever asked once no rebase state directory exists: the sequencer writes
+# CHERRY_PICK_HEAD while a "pick" of a rebase is stuck and MERGE_HEAD while a
+# "merge" of a --rebase-merges run is, so testing those files first would call
+# a perfectly ordinary rebase a cherry-pick.
+other_operation() {
+    local dir
+
+    dir="$(git_path rebase-apply)"
+    [ -n "${dir}" ] && [ -e "${dir}/applying" ] && { echo "git am"; return 0; }
+    [ -e "$(git_path MERGE_HEAD)" ] && { echo "merge"; return 0; }
+    [ -e "$(git_path REVERT_HEAD)" ] && { echo "revert"; return 0; }
+    [ -e "$(git_path CHERRY_PICK_HEAD)" ] && { echo "cherry-pick"; return 0; }
+    [ -e "$(git_path BISECT_LOG)" ] && { echo "bisect"; return 0; }
+    return 1
+}
+
+describe_commit() {
+    git -C "${git_dir}" log -1 --no-color --format='%h %s' "${1}" 2>/dev/null \
+        || echo "${1}"
+}
+
+unmerged_paths() {
+    git -C "${git_dir}" diff --no-color --name-only --diff-filter=U
+}
+
+# diff --diff-filter=U is what git-add lists as its "conflict" state, so both
+# tools agree on what counts as unresolved.
+has_unmerged() {
+    [ -n "$(unmerged_paths)" ]
+}
+
+print_state() {
+    local onto stopped conflicts path
+
+    onto="${rebase_onto}"
+    [ -n "${onto}" ] && onto="$(git -C "${git_dir}" rev-parse --short "${onto}" 2>/dev/null || echo "${onto}")"
+
+    printf 'Rebasing %s onto %s' "${rebase_branch:-HEAD}" "${onto:-?}" 1>&2
+    if [[ "${rebase_step}" =~ ^[0-9]+$ ]] && [[ "${rebase_total}" =~ ^[0-9]+$ ]] \
+        && [ "${rebase_total}" -gt 0 ]; then
+        printf ' (%s/%s)' "${rebase_step}" "${rebase_total}" 1>&2
+    fi
+    printf '\n' 1>&2
+
+    # REBASE_HEAD is set for a conflict and for an "edit" stop alike, and it is
+    # a full oid where stopped-sha is only an abbreviation
+    stopped="$(git -C "${git_dir}" rev-parse --verify --quiet REBASE_HEAD)"
+    [ -z "${stopped}" ] && stopped="$(state_file stopped-sha)"
+    [ -n "${stopped}" ] && echo "Stopped: $(describe_commit "${stopped}")" 1>&2
+
+    conflicts="$(unmerged_paths)"
+    if [ -n "${conflicts}" ]; then
+        while IFS= read -r path; do
+            printf "Conflict: %b%s%b\n" "${MAGENTA}" "${path}" "${NC}" 1>&2
+        done <<< "${conflicts}"
+    fi
+    echo 1>&2
+}
+
+# Which way out of a stopped rebase. All three are git's own, so this only
+# asks which one is meant.
+pick_action() {
+    local action
+
+    [ "${assume_yes}" -eq 1 ] && { echo "continue"; return 0; }
+
+    need_cmd prompt-select
+    # declared first and assigned after, so ${?} is prompt-select's status and
+    # not the status of "local"
+    action="$(printf '%s\t%s\n' \
+        "continue" "go on with the rebase" \
+        "skip"     "drop the commit the rebase stopped on" \
+        "abort"    "undo the rebase and put ${rebase_branch:-HEAD} back" \
+        | prompt-select --prompt "Resume rebase:" --delimiter '\t')"
+    [ "${?}" -eq 130 ] && abort
+    [ -n "${action}" ] || abort
+    echo "${action}"
+}
+
+do_abort() {
+    git-color -C "${git_dir}" rebase --abort 1>&2 \
+        || fail "git rebase --abort failed."
+    echo "Rebase aborted." 1>&2
+    # the branch is not rebased, so this is no success
+    exit 1
+}
+
+# The rebase is left where it is, so the way out is named instead of guessed.
+stop_hint() {
+    echo 1>&2
+    error "The rebase is still in progress."
+    error "Resolve the conflicts, then run \"${APP_NAME}\" again to go on."
+    error "To drop the current commit, run \"git rebase --skip\"."
+    [ "${rebase_backend}" == "merge" ] && [ "${rebase_total}" -gt "${rebase_step}" ] \
+        && error "To change what is left to do, run \"git rebase --edit-todo\"."
+    error "To undo everything, run \"git rebase --abort\"."
+    exit 1
+}
+
+# --- the base --------------------------------------------------------------
+
+# The branch to rebase onto. After a fetch the remote-tracking ref is the one
+# that moved, and a local branch of the same name may not even exist, so that
+# is the one offered when it is there.
+default_base() {
+    local branch current upstream
+
+    current="$(git -C "${git_dir}" branch --show-current)"
+    branch="$(git-default 2>/dev/null)"
+    if [ -n "${branch}" ] && [ "${branch}" != "${current}" ]; then
+        git -C "${git_dir}" show-ref --verify --quiet "refs/remotes/origin/${branch}" \
+            && echo "origin/${branch}" || echo "${branch}"
+        return 0
+    fi
+    # on the default branch itself, catching up with its own remote is meant
+    upstream="$(git -C "${git_dir}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"
+    [ -n "${upstream}" ] && { echo "${upstream}"; return 0; }
+    echo "${branch}"
+}
+
+# The refs worth offering. Remote branches keep their prefix: "origin/main" is
+# a ref git can resolve, a bare "main" only is one when the local branch exists
+# too, and after a fetch the prefixed one is the fresher of the two.
+ref_candidates() {
+    { git -C "${git_dir}" for-each-ref --sort=-committerdate \
+          --format='%(refname:short)' refs/heads refs/remotes
+      git -C "${git_dir}" tag --sort=-v:refname; } 2>/dev/null \
+        | sed -e '/^origin\/HEAD$/d' -e '/^HEAD$/d' \
+        | awk '!seen[$0]++'
+}
+
+resolve_base() {
+    if [ -n "${base_arg}" ]; then
+        base="${base_arg}"
+        return 0
+    fi
+    if [ "${assume_yes}" -eq 1 ]; then
+        base="$(default_base)"
+        [ -n "${base}" ] || fail "Cannot determine the branch to rebase onto."
+        return 0
+    fi
+    need_cmd prompt-complete
+    base="$(ref_candidates | prompt-complete --prompt "Rebase onto:" --prefill "$(default_base)")"
+    [ "${?}" -eq 130 ] && abort
+    [ -n "${base}" ] || abort
+}
+
+resolve_fetch() {
+    case "${fetch_arg}" in
+        yes) do_fetch=1; return 0 ;;
+        no)  do_fetch=0; return 0 ;;
+    esac
+
+    do_fetch=0
+    confirm "Fetch \"${base}\" before the rebase?" "yes" && do_fetch=1
+    return 0
+}
+
+# Fetching a base is only about the ref it names. A base that is already a
+# remote-tracking ref is current the moment the fetch is through and there is
+# nothing to re-resolve; a local branch is fast-forwarded to its remote, and
+# when it has diverged the remote-tracking ref stands in for it rather than the
+# rebase running onto yesterday's base.
+fetch_base() {
+    local remote ref upstream
+
+    remote="${base%%/*}"
+    if [ "${remote}" != "${base}" ] \
+        && git -C "${git_dir}" remote get-url "${remote}" >/dev/null 2>&1; then
+        git-color -C "${git_dir}" fetch "${remote}" "${base#*/}" 1>&2 \
+            || fail "Failed to fetch \"${base#*/}\" from \"${remote}\"."
+        return 0
+    fi
+
+    if ! git -C "${git_dir}" show-ref --verify --quiet "refs/heads/${base}"; then
+        warning "\"${base}\" is not a branch that can be fetched, using it as it is."
+        return 0
+    fi
+
+    upstream="$(git -C "${git_dir}" rev-parse --abbrev-ref --symbolic-full-name "${base}@{upstream}" 2>/dev/null)"
+    if [ -z "${upstream}" ]; then
+        warning "\"${base}\" has no upstream, nothing to fetch."
+        return 0
+    fi
+    remote="${upstream%%/*}"
+    ref="${upstream#*/}"
+
+    # a branch that is checked out somewhere cannot be fast-forwarded by a
+    # refspec, so only its remote-tracking ref is updated
+    if git -C "${git_dir}" worktree list --porcelain 2>/dev/null \
+        | grep -Fqx "branch refs/heads/${base}"; then
+        git-color -C "${git_dir}" fetch "${remote}" "${ref}" 1>&2 \
+            || fail "Failed to fetch \"${ref}\" from \"${remote}\"."
+        base="${upstream}"
+        return 0
+    fi
+
+    if ! git-color -C "${git_dir}" fetch "${remote}" "${ref}:${base}" 1>&2; then
+        warning "Could not fast-forward \"${base}\", using \"${upstream}\" instead."
+        base="${upstream}"
+    fi
+    return 0
+}
+
+resolve_base_ref() {
+    case "${base}" in
+        -*) fail "Not a valid branch, tag or commit: ${base}" ;;
+    esac
+    git -C "${git_dir}" rev-parse --verify --quiet "${base}^{commit}" >/dev/null \
+        || fail "Not a valid branch, tag or commit: ${base}"
+}
+
+# Rebasing onto a local branch that is behind its remote quietly replays the
+# work onto an old base, so at least say so.
+warn_stale_base() {
+    local behind
+
+    git -C "${git_dir}" show-ref --verify --quiet "refs/heads/${base}" || return 0
+    behind="$(git -C "${git_dir}" rev-list --count "${base}..${base}@{upstream}" 2>/dev/null)"
+    [[ "${behind}" =~ ^[0-9]+$ ]] && [ "${behind}" -gt 0 ] \
+        && warning "\"${base}\" is ${behind} commit(s) behind its remote."
+    return 0
+}
+
+# A dirty tree stops the rebase before it starts, so the changes are either
+# parked in the autostash or the run does not happen. Only tracked changes
+# count: --autostash leaves untracked files alone, and so does the rebase,
+# unless a replayed commit adds one of them, which git then refuses itself.
+resolve_autostash() {
+    local dirty=0
+
+    git -C "${git_dir}" diff --quiet || dirty=1
+    git -C "${git_dir}" diff --cached --quiet || dirty=1
+    [ -n "$(git -C "${git_dir}" ls-files --others --exclude-standard)" ] \
+        && warning "Untracked files stay where they are, a replayed commit may trip over them."
+
+    if [ "${dirty}" -eq 0 ]; then
+        [ "${autostash_arg}" == "no" ] && rebase_args+=("--no-autostash")
+        return 0
+    fi
+
+    case "${autostash_arg}" in
+        yes) rebase_args+=("--autostash"); return 0 ;;
+        no)  fail "The working tree has changes, commit or stash them first." ;;
+    esac
+
+    # git stashes on its own when this is set, so neither the question nor the
+    # option would mean anything
+    if [ "$(git -C "${git_dir}" config --bool --get rebase.autoStash 2>/dev/null)" == "true" ]; then
+        echo "Local changes are stashed for the rebase (rebase.autoStash)." 1>&2
+        return 0
+    fi
+
+    git-color -C "${git_dir}" status --short 1>&2
+    echo 1>&2
+    confirm "Stash changes before the rebase?" "yes" \
+        || fail "The working tree has changes, commit or stash them first."
+    rebase_args+=("--autostash")
+}
+
+# --- the loop --------------------------------------------------------------
+
+# What a rebase step is standing on. Two steps in a row with the same answer
+# mean the rebase is not moving on, and looping on that would ask the same
+# question forever.
+state_fingerprint() {
+    printf '%s|%s|%s' \
+        "$(git -C "${git_dir}" rev-parse --verify --quiet HEAD)" \
+        "${rebase_step}" \
+        "$(git -C "${git_dir}" rev-parse --verify --quiet REBASE_HEAD)"
+}
+
+# One step of the rebase. git-color reconnects the editor to the terminal for
+# the message --continue asks about and hands -i over to git untouched, so both
+# flavours work through it.
+run_step() {
+    case "${1}" in
+        start)    git-color -C "${git_dir}" rebase "${rebase_args[@]}" "${base}" 1>&2 ;;
+        continue) git-color -C "${git_dir}" rebase --continue 1>&2 ;;
+        skip)     git-color -C "${git_dir}" rebase --skip 1>&2 ;;
+    esac
+}
+
+# git refuses to continue while a tracked file is modified but not staged.
+check_continue_ready() {
+    git -C "${git_dir}" diff --quiet && return 0
+    error "There are unstaged changes, \"git rebase --continue\" will refuse to run."
+    return 1
+}
+
+# A resolution that took one side wholesale leaves the index equal to HEAD.
+# The merge backend drops such a commit by itself, the apply backend refuses
+# and asks for --skip, so only that one gets it handed to it. And only a
+# resolution just made can turn out empty: a rebase parked on an "edit" step
+# has an index equal to HEAD by definition and wants --continue, so --skip is
+# never guessed for one.
+continue_or_skip() {
+    git -C "${git_dir}" rev-parse --verify --quiet HEAD >/dev/null \
+        || { echo "continue"; return 0; }
+    if git -C "${git_dir}" diff-index --quiet --cached HEAD --; then
+        if [ "${rebase_backend}" == "apply" ]; then
+            warning "Nothing is left of the current commit, skipping it."
+            echo "skip"
+            return 0
+        fi
+        echo "Nothing is left of the current commit, it will be dropped." 1>&2
+    fi
+    echo "continue"
+}
+
+# git-add refuses to stage a file whose markers are still in it, but a file
+# staged some other way can carry them into the commit.
+check_markers() {
+    git -C "${git_dir}" diff --cached --no-color --check 2>/dev/null \
+        | grep -q 'leftover conflict marker' || return 0
+    warning "The staged changes still contain conflict markers."
+    confirm "Go on anyway?" "no"
+}
+
+# Drive the rebase to its end. Every stop decides from the state of the
+# repository what happened, never from the exit status: "git rebase" fails both
+# when it stops on a conflict and when it never started, and it succeeds even
+# when applying the autostash left conflicts behind.
+#
+# Every stop asks the same question, so a rebase that runs into one conflict
+# after the other is worked through with the same two key presses each time,
+# and skip and abort stay reachable at every one of them.
+resolve_loop() {
+    local action="${1}"
+    local fingerprint="" previous=""
+
+    if [ "${action}" == "resume" ]; then
+        # the caller has read and shown the state already
+        previous="$(state_fingerprint)"
+    else
+        run_step "${action}"
+        # finish_rebase never comes back, it ends the run either way
+        rebase_state || finish_rebase
+        previous="$(state_fingerprint)"
+        print_state
+    fi
+
+    while true; do
+        action="$(pick_action)"
+        case "${action}" in
+            abort)
+                do_abort
+                ;;
+            skip)
+                # --skip resets the working tree hard, so it is never one key
+                # press away
+                confirm "Skip the current commit? Changes to it are discarded." "no" \
+                    || abort
+                ;;
+            continue)
+                if has_unmerged; then
+                    if [ "${assume_yes}" -eq 1 ]; then
+                        warning "Not opening git-add because --yes was given."
+                        stop_hint
+                    fi
+                    confirm "Inspect the conflicts?" "yes" || stop_hint
+                    need_cmd git-add
+                    git-add
+                    # git-add reports how the picker was left, not whether
+                    # anything was resolved: esc still leaves a resolved tree
+                    # behind and enter an unresolved one, so the repository is
+                    # asked instead
+                    if has_unmerged; then
+                        error "Conflicts are still unresolved."
+                        stop_hint
+                    fi
+                    check_markers || stop_hint
+                fi
+                check_continue_ready || stop_hint
+                action="$(continue_or_skip)"
+                ;;
+        esac
+
+        run_step "${action}"
+        # finish_rebase never comes back, it ends the run either way
+        rebase_state || finish_rebase
+
+        fingerprint="$(state_fingerprint)"
+        if [ "${fingerprint}" == "${previous}" ]; then
+            error "The rebase did not move on."
+            stop_hint
+        fi
+        previous="${fingerprint}"
+        print_state
+    done
+}
+
+finish_rebase() {
+    local after_sha branch count
+
+    # applying the autostash can leave conflicts behind although the rebase
+    # itself reported success, and there is no rebase left to continue then
+    if has_unmerged; then
+        error "Applying the autostash left conflicts behind."
+        error "The rebase itself is done, the changes are still in the stash."
+        error "Resolve them, then drop the entry with: git stash drop"
+        exit 1
+    fi
+
+    after_sha="$(git -C "${git_dir}" rev-parse --verify --quiet HEAD)"
+    branch="$(git -C "${git_dir}" branch --show-current)"
+
+    # comparing the commits instead of reading git's "is up to date" line,
+    # which -i turns into "up to date, rebase forced" while still replaying
+    if [ "${after_sha}" == "${before_sha}" ]; then
+        echo "Already up to date, nothing was rewritten." 1>&2
+        exit 0
+    fi
+
+    count="$(git -C "${git_dir}" rev-list --count "${base}..HEAD" 2>/dev/null)"
+    echo 1>&2
+    if [ -n "${branch}" ]; then
+        echo "Rebased \"${branch}\"${count:+ (${count} commit(s))} onto \"${base}\"." 1>&2
+    else
+        echo "Rebased a detached HEAD onto \"${base}\"." 1>&2
+    fi
+    # the literal commit, because the next git command clobbers ORIG_HEAD
+    echo "Undo with: git reset --hard ${before_sha}" 1>&2
+    git-color -C "${git_dir}" status --short --branch 1>&2
+
+    [ "$(git -C "${git_dir}" config --bool --get rebase.updateRefs 2>/dev/null)" == "true" ] \
+        && warning "rebase.updateRefs is on, other branches may have been rewritten too."
+
+    offer_push "${branch}"
+    exit 0
+}
+
+# The rebase rewrote commits the remote may already have, so the branch has
+# diverged from it and only a forced push gets there. git-push -F carries the
+# lease, the request offer and the pipeline listing, so only the decision is
+# left here.
+offer_push() {
+    local branch="${1}"
+
+    [ "${do_push}" -eq 0 ] && return 0
+    if [ -z "${branch}" ]; then
+        warning "HEAD is detached, there is no branch to push."
+        return 0
+    fi
+    if ! git -C "${git_dir}" remote get-url origin >/dev/null 2>&1; then
+        warning "No \"origin\" remote, skipping the push."
+        return 0
+    fi
+    if ! git -C "${git_dir}" rev-parse --verify --quiet '@{upstream}' >/dev/null \
+        && ! git -C "${git_dir}" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+        echo "\"${branch}\" was never pushed, push it with git-push." 1>&2
+        return 0
+    fi
+    # git-push commits before it pushes whenever the tree is not clean, and an
+    # --autostash has just put changes back that are not meant to be committed
+    if [ -n "$(git -C "${git_dir}" status --porcelain)" ]; then
+        warning "The working tree has changes again, push with git-push once they are dealt with."
+        return 0
+    fi
+
+    if [ "${do_push}" -ne 1 ]; then
+        confirm "Push \"${branch}\" with --force-with-lease?" "yes" || return 0
+    fi
+    need_cmd git-push
+    git-push -F "${branch}" \
+        || { warning "git-push did not push \"${branch}\"; the rebase itself is done."; return 0; }
+}
+
+# --- main ------------------------------------------------------------------
+
+base_arg=""
+base=""
+interactive=0
+fetch_arg=""
+do_fetch=0
+autostash_arg=""
+do_push=-1
+assume_yes=0
+rebase_args=()
+before_sha=""
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -i|--interactive)
+            interactive=1
+            ;;
+        --fetch)
+            fetch_arg="yes"
+            ;;
+        --no-fetch)
+            fetch_arg="no"
+            ;;
+        --autostash)
+            autostash_arg="yes"
+            ;;
+        --no-autostash)
+            autostash_arg="no"
+            ;;
+        -p|--push)
+            do_push=1
+            ;;
+        -P|--no-push)
+            do_push=0
+            ;;
+        -y|-Y|--yes)
+            assume_yes=1
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            if [ -n "${base_arg}" ]; then
+                error "Unexpected argument: ${1}"
+                usage
+            fi
+            [ -z "${1}" ] && usage
+            base_arg="${1}"
+            ;;
+    esac
+    shift
+done
+
+if [ "${interactive}" -eq 1 ] && [ "${assume_yes}" -eq 1 ]; then
+    error "Cannot use --interactive with --yes"
+    usage
+fi
+
+need_cmd git-default
+need_cmd prompt-yes-no
+need_cmd prompt-no-yes
+
+# --yes means nobody is there to answer the message editor that --continue
+# opens on the merge backend; ":" is how git is told to use no editor
+[ "${assume_yes}" -eq 1 ] && export GIT_EDITOR=":"
+
+git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
+git -C "${git_dir}" rev-parse --verify --quiet HEAD >/dev/null \
+    || fail "No commit found, nothing to rebase."
+
+# the state of a running rebase is read before anything else, so a stopped
+# rebase is resumed instead of a second one being started on top of it
+if rebase_state; then
+    [ -z "${base_arg}" ] \
+        || warning "A rebase onto $(describe_commit "${rebase_onto}") is in progress, ignoring \"${base_arg}\"."
+    [ -z "${fetch_arg}" ] || warning "A rebase is in progress, ignoring --fetch/--no-fetch."
+    [ -z "${autostash_arg}" ] || warning "A rebase is in progress, ignoring --autostash/--no-autostash."
+    [ "${interactive}" -eq 0 ] \
+        || warning "A rebase is in progress, ignoring --interactive; use \"git rebase --edit-todo\"."
+
+    before_sha="${rebase_orig_head}"
+    # the state file holds a full oid, which is not what a message wants
+    base="$(git -C "${git_dir}" rev-parse --short "${rebase_onto}" 2>/dev/null)"
+    [ -n "${base}" ] || base="${rebase_onto}"
+    print_state
+    resolve_loop resume
+    exit 0
+fi
+
+other="$(other_operation)" \
+    && fail "A ${other} is in progress, finish or abort it first."
+has_unmerged \
+    && fail "The index has unresolved conflicts, resolve them first."
+
+current="$(git -C "${git_dir}" branch --show-current)"
+if [ -z "${current}" ]; then
+    warning "HEAD is detached, the result will not be on any branch."
+    confirm "Rebase anyway?" "no" || abort
+fi
+
+resolve_base
+[ -n "${current}" ] && [ "${base}" == "${current}" ] \
+    && fail "Cannot rebase \"${current}\" onto itself."
+
+resolve_fetch
+[ "${do_fetch}" -eq 1 ] && fetch_base
+resolve_base_ref
+[ "${do_fetch}" -eq 1 ] || warn_stale_base
+
+[ "${base}" == "${current}" ] && fail "Cannot rebase \"${current}\" onto itself."
+
+count="$(git -C "${git_dir}" rev-list --count "${base}..HEAD" 2>/dev/null)"
+[ -z "${count}" ] && count=0
+if [ "${count}" -eq 0 ]; then
+    echo "Nothing to replay, \"${current:-HEAD}\" is already on \"${base}\"." 1>&2
+    exit 0
+fi
+
+[ "${interactive}" -eq 1 ] && rebase_args+=("--interactive")
+resolve_autostash
+
+echo "Branch: ${current:-HEAD}" 1>&2
+echo "Onto:   ${base} ($(describe_commit "${base}"))" 1>&2
+git-color -C "${git_dir}" log --oneline "${base}..HEAD" 1>&2
+echo 1>&2
+confirm "Rebase ${count} commit(s) of \"${current:-HEAD}\" onto \"${base}\"?" "yes" || abort
+
+before_sha="$(git -C "${git_dir}" rev-parse --verify --quiet HEAD)"
+resolve_loop start

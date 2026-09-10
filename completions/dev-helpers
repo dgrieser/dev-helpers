@@ -545,6 +545,19 @@ _git-push()
 }
 complete -F _git-push git-push
 
+_git-rebase()
+{
+    local cur prev
+    __dh_init
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "-i --interactive --fetch --no-fetch --autostash --no-autostash -p --push -P --no-push -y --yes -h --help"
+    else
+        __dh_compgen "$(__dh_all_branches) $(__dh_tags)"
+    fi
+    return 0
+}
+complete -F _git-rebase git-rebase
+
 _git-rm-branches()
 {
     local cur prev

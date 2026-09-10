@@ -452,6 +452,42 @@ handed over to [git-mr](#git-mr) `--create`. The "To create a merge request"
 hint GitLab and GitHub answer such a push with settles the question for free;
 without it the provider is asked.
 
+### git-rebase
+Rebase the current branch onto another one, or pick up a rebase that stopped.
+```bash
+git-rebase [-i|--interactive] [--fetch|--no-fetch] [--autostash|--no-autostash] [-p|--push] [-P|--no-push] [-y|--yes] [BRANCH]
+```
+The state of a running rebase is read before anything else, so the same command
+starts one and finishes one. At every stop the branch, the commit it is going
+onto, how far it got and the conflicting paths are shown, and a `prompt-select`
+menu offers continue, skip or abort, so the step a stopped rebase wants is never
+guessed. Skipping asks again, because `git rebase --skip` discards the working
+tree changes of the commit it drops.
+
+Continuing with conflicts in the index hands them to [git-add](#git-add) (asked,
+default yes) and goes on once the index has no unmerged paths left. git-add
+reports how its picker was left and not whether anything was resolved, so the
+index is what decides; when conflicts remain the rebase is left in progress and
+running `git-rebase` again picks it up where it stopped. A resolution that took
+one side wholesale leaves nothing to commit, which the apply backend has to be
+told to skip and the merge backend drops by itself.
+
+Without `BRANCH` the base is asked for, defaulting to the remote-tracking branch
+of the default branch reported by [git-default](#git-default) - after a fetch
+that is the ref that moved, a local branch of the same name may be an old copy or
+missing altogether. Fetching it is offered (default yes) and fast-forwards a
+local base, falling back to its remote-tracking ref when the two have diverged;
+skipping the fetch reports how far a stale base is behind. Local changes are
+carried through the rebase with `--autostash` after asking, counting tracked
+changes only, since untracked files are left alone by both the stash and the
+rebase.
+
+A finished rebase names the commit to `git reset --hard` back to and offers the
+force push it now needs, handed over to [git-push](#git-push) `-F`. That handover
+is skipped while the working tree has changes, because git-push commits what it
+finds before pushing, and for a branch that was never pushed, which needs no
+force.
+
 ### git-reset-all
 Reset and clean all tracked and untracked changes (with confirm).
 ```bash
