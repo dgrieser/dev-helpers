@@ -537,7 +537,8 @@ that hold no worktree at all are ignored silently.
 
 `go` prints the path of an existing worktree, so `cd "$(git-worktree go)"` changes
 into it; without `-b/--branch` a `prompt-select` menu lists the other worktrees of
-the repository, including the main tree.
+the repository, including the main tree. For `go`, `-b/--branch` completes the
+branches that already have a worktree instead of every local branch.
 
 When `add` has to create the branch, the start point is taken from `-B/--base`
 (asked interactively when omitted, defaulting to the default remote branch) and
