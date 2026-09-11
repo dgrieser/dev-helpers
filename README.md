@@ -528,6 +528,13 @@ Manage mirrored git worktrees under `$WORKSPACE_WORKTREE`.
 ```bash
 git-worktree [add|list|go|delete|move-to-main] [-b <branch>] [-B <base>] [--fetch|--no-fetch] [-w <dir>]
 ```
+`list` prints the main tree of the resolved repository together with every
+mirrored worktree it has under `$WORKSPACE_WORKTREE`, and works the same from the
+main tree and from a mirrored worktree. It also looks at the branch directories in
+the repository's mirrored directory: one that belongs to the repository but is no
+longer registered as a worktree is listed as `(unregistered)`, while directories
+that hold no worktree at all are ignored silently.
+
 `go` prints the path of an existing worktree, so `cd "$(git-worktree go)"` changes
 into it; without `-b/--branch` a `prompt-select` menu lists the other worktrees of
 the repository, including the main tree.

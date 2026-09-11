@@ -15,7 +15,9 @@ Commands:
   add                   Add mirrored worktree for BRANCH at:
     WORKSPACE_WORKTREE/<path under WORKSPACE>/BRANCH
     If BRANCH does not exist, ask before creating it.
-  list                  List worktrees for the resolved workspace repository
+  list                  List the main tree and every mirrored worktree of the
+                        resolved repository, including mirrored dirs that the
+                        repository no longer registers as a worktree
   go                    Print the path of an existing worktree, picked
                         interactively when BRANCH is omitted
   delete                Delete the resolved mirrored worktree and print its main dir
@@ -423,11 +425,11 @@ worktree_rows() {
     worktree_output="$(git -C "${workdir}" worktree list --porcelain)" ||
         fail "git worktree list failed"
     printf "%s\n" "${worktree_output}" |
-        awk -v main="${workdir}" -v mirror_root="${workspace_worktree_root}" '
+        awk -v main="${workdir}" -v mirror_dir="$(mirror_dir_for_workdir)" '
             /^worktree / {
                 path = substr($0, 10)
                 is_main = path == main ? 1 : 0
-                show = is_main || path == mirror_root || index(path, mirror_root "/") == 1
+                show = is_main || index(path, mirror_dir "/") == 1
                 next
             }
             show && /^HEAD / {
@@ -449,18 +451,62 @@ worktree_rows() {
         '
 }
 
+format_worktree_row() {
+    if [ -n "${3}" ]; then
+        entry="$(printf "%s %s [%s]" "${1}" "${2}" "${3}")"
+    else
+        entry="$(printf "%s %s (detached HEAD)" "${1}" "${2}")"
+    fi
+    if [ "${4}" = "1" ]; then
+        entry="${entry} (main tree)"
+    fi
+    echo "${entry}"
+}
+
+mirror_dir_for_workdir() {
+    rel="$(relative_to "${workdir}" "${workspace_root}")"
+    if [ -n "${rel}" ]; then
+        echo "${workspace_worktree_root}/${rel}"
+    else
+        echo "${workspace_worktree_root}"
+    fi
+}
+
+mirror_gitdir_of() {
+    [ -f "${1}/.git" ] || return 1
+    sed -n "s/^gitdir: //p" "${1}/.git" | head -n 1
+}
+
+unregistered_mirror_worktrees() {
+    mirror_dir="$(mirror_dir_for_workdir)"
+    [ -d "${mirror_dir}" ] || return 0
+    repo_common_dir="$(git_common_dir "${workdir}")" || return 0
+
+    find "${mirror_dir}" -mindepth 2 -name .git -print 2>/dev/null |
+        sed "s|/\.git$||" |
+        sort |
+        while IFS= read -r candidate; do
+            printf "%s\n" "${1}" | grep -Fqx "${candidate}" && continue
+            candidate_gitdir="$(mirror_gitdir_of "${candidate}")" || continue
+            case "${candidate_gitdir}" in
+                "${repo_common_dir}"/*)
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+            printf "%s (unregistered)\n" "${candidate}"
+        done
+}
+
 list_worktrees() {
     rows="$(worktree_rows)" || exit 1
     printf "%s\n" "${rows}" |
         while IFS="$(printf "\t")" read -r path head branch is_main; do
             [ -n "${path}" ] || continue
-            [ "${is_main}" = "1" ] && continue
-            if [ -n "${branch}" ]; then
-                printf "%s %s [%s]\n" "${path}" "${head}" "${branch}"
-            else
-                printf "%s %s (detached HEAD)\n" "${path}" "${head}"
-            fi
+            format_worktree_row "${path}" "${head}" "${branch}" "${is_main}"
         done
+    unregistered_mirror_worktrees "$(printf "%s\n" "${rows}" | cut -f1)"
 }
 
 go_items() {
