@@ -553,19 +553,19 @@ member role are taken from there), added to every subgroup that is neither
 excluded nor already linked, and with `--remove-from-parent` deleted from
 `<group>` afterwards. Nothing is changed without `--apply`.
 ```bash
-gitlab-move-ldap-sync <group> --cn <CN> [--cn <CN> ...] [--exclude <subgroup>] \
+gitlab-move-ldap-sync <group> --cn <CN> [--cn <CN> ...] [--exclude <name>] \
                       [--provider <id>] [--apply] [--remove-from-parent] \
-                      [--force-sync|--no-sync] \
+                      [--share-projects <group>] [--force-sync|--no-sync] \
                       [--watch] [--watch-interval <sec>] [--watch-timeout <sec>]
 ```
 Requires `glab` and `jq`, and an account that may administer the LDAP group
 links of the groups involved.
 
 All requested links are resolved on the parent before anything is written, and
-an `--exclude` naming a subgroup that does not exist is an error rather than a
-silently included group. A CN that is already gone from the parent but present
-on every target counts as moved and is skipped, so a re-run after a partial run
-is safe. A subgroup that already has the link keeps it untouched, and a
+an `--exclude` naming neither an existing subgroup nor an existing direct
+project is an error rather than a silently included group. A CN that is already
+gone from the parent but present on every target counts as moved and is skipped,
+so a re-run after a partial run is safe. A subgroup that already has the link keeps it untouched, and a
 differing access level there is reported instead of overwritten.
 
 Two effects worth knowing before `--apply`: a group that receives its first
@@ -579,6 +579,20 @@ repeat with `--remove-from-parent`.
 Every group that was changed is synced with `POST /groups/:id/ldap_sync`
 unless `--no-sync` is given. The sync is asynchronous; the script prints the
 command to check the resulting member counts afterwards.
+
+The projects that sit **directly** in `<group>` are the part of the tree the
+move leaves behind: GitLab has no LDAP group links on projects, so they cannot
+take the link over from their parent and lose its members once it is gone. Every
+run lists them with a warning for that reason. `--share-projects <group>` gives
+them the members anyway, by sharing each of them with a group that already
+carries the same link(s) — create that group once, link the CNs there, and the
+script checks it really has them before it shares anything. Projects that are
+already shared with it are left alone, a share with a different access level is
+reported instead of overwritten, and `--exclude` skips a project just as it skips
+a subgroup. The share is capped at one access level, so the highest of the moved
+links is used; a member still only gets what their own link grants. Projects
+inside the subgroups need nothing — they inherit from the subgroup that now has
+the link.
 
 `--force-sync` syncs `<group>` and every target subgroup instead, whether they
 were changed or not, and refuses to be combined with `--no-sync`. That is how a

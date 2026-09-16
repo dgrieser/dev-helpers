@@ -669,7 +669,7 @@ _gitlab-move-ldap-sync()
     local cur prev
     __dh_init
     case "${prev}" in
-        --cn|--exclude)
+        --cn|--exclude|--share-projects)
             return 0 ;;
         --provider)
             __dh_compgen "ldapmain"
@@ -682,7 +682,7 @@ _gitlab-move-ldap-sync()
             return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "--cn --exclude --provider --apply --remove-from-parent --force-sync --no-sync --watch --watch-interval --watch-timeout -h --help"
+        __dh_compgen "--cn --exclude --provider --apply --remove-from-parent --share-projects --force-sync --no-sync --watch --watch-interval --watch-timeout -h --help"
     fi
     # the only positional argument is the group path, which is not completed
     return 0

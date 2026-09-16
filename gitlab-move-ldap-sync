@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Move LDAP group links from a GitLab group to its subgroups.
 #
+# Projects cannot hold an LDAP link, so the projects that sit directly in the
+# parent group are served by --share-projects: they are shared with a group that
+# carries the same link(s).
+#
 # For every --cn: read the link from the parent group (access level is taken
 # from there), add it to each subgroup that is not excluded and does not have
 # it yet, and with --remove-from-parent delete it from the parent afterwards.
@@ -13,10 +17,14 @@ Usage: $(basename "$0") <group> --cn <CN> [--cn <CN> ...] [options]
 
   <group>                 Parent group path, e.g. asylum. Required.
   --cn <CN>               LDAP group CN to move. Repeatable, at least one.
-  --exclude <subgroup>    Subgroup path relative to <group> to skip. Repeatable.
+  --exclude <name>        Subgroup or direct project to skip, path relative to
+                          <group>. Repeatable.
   --provider <id>         LDAP provider id. Default: ldapmain
   --apply                 Perform changes. Without it: dry run.
   --remove-from-parent    Delete the link(s) from <group> after the subgroups are done.
+  --share-projects <grp>  Share every project directly under <group> with <grp>,
+                          which has to carry every --cn already. Projects cannot
+                          hold an LDAP link, this gives them the members anyway.
   --force-sync            Sync <group> and every target subgroup, changed or not.
   --no-sync               Do not trigger POST /groups/:id/ldap_sync on touched groups.
   --watch                 After the syncs, follow the membership of the synced
@@ -32,6 +40,7 @@ Examples:
   $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace --apply --remove-from-parent
   $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace --apply --force-sync
   $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace --apply --watch
+  $(basename "$0") asylum --cn M_Plattform_Viewer --share-projects asylum/ldap-viewer --apply
 USAGE
 }
 
@@ -41,6 +50,7 @@ EXCLUDES=()
 PROVIDER="ldapmain"
 APPLY=0
 REMOVE_FROM_PARENT=0
+SHARE_PROJECTS=""
 SYNC=1
 FORCE_SYNC=0
 WATCH=0
@@ -61,6 +71,8 @@ while [[ $# -gt 0 ]]; do
     --provider=*)         PROVIDER="${1#*=}"; shift ;;
     --apply)              APPLY=1; shift ;;
     --remove-from-parent) REMOVE_FROM_PARENT=1; shift ;;
+    --share-projects)     need_arg "$@"; SHARE_PROJECTS="$2"; shift 2 ;;
+    --share-projects=*)   SHARE_PROJECTS="${1#*=}"; shift ;;
     --force-sync)         FORCE_SYNC=1; shift ;;
     --no-sync)            SYNC=0; shift ;;
     --watch)              WATCH=1; shift ;;
@@ -163,11 +175,23 @@ for sg in "${subgroups[@]}"; do
 done
 [[ ${#targets[@]} -gt 0 ]] || { echo "no target subgroups left under $PARENT" >&2; exit 1; }
 
-# Every excluded name must exist, otherwise a typo would silently include a group.
+# The projects that sit directly in the parent. They cannot hold an LDAP link,
+# so they are the part of the tree that loses the members when the link leaves
+# the parent, and the only thing --share-projects can do for them is a group
+# share. They are read in every run so that the warning below is always shown.
+mapfile -t projects < <(glab api --paginate "groups/${parent_enc}/projects?per_page=100" 2>/dev/null \
+  | jq -rs '[.[] | arrays] | add // [] | .[] | "\(.id)\t\(.path_with_namespace)"' | sort -t$'\t' -k2)
+project_paths=()
+for entry in ${projects[@]+"${projects[@]}"}; do project_paths+=("${entry#*$'\t'}"); done
+
+# Every excluded name must exist, otherwise a typo would silently include a
+# group or a project.
 for ex in "${EXCLUDES[@]}"; do
   found=0
-  for sg in "${subgroups[@]}"; do [[ "$sg" == "$PARENT/$ex" || "$sg" == "$ex" ]] && found=1; done
-  [[ "$found" == "1" ]] || { echo "excluded subgroup does not exist: $ex" >&2; exit 1; }
+  for name in "${subgroups[@]}" ${project_paths[@]+"${project_paths[@]}"}; do
+    [[ "$name" == "$PARENT/$ex" || "$name" == "$ex" ]] && found=1
+  done
+  [[ "$found" == "1" ]] || { echo "excluded subgroup or project does not exist: $ex" >&2; exit 1; }
 done
 
 # 2. Resolve every requested link on the parent before touching anything.
@@ -197,8 +221,39 @@ for cn in "${CNS[@]}"; do
   fi
 done
 if [[ ${#active_cns[@]} -eq 0 ]]; then
-  [[ "$FORCE_SYNC" == "1" ]] || { echo "nothing to do"; exit 0; }
-  echo "nothing to add, syncing only"
+  [[ "$FORCE_SYNC" == "1" || -n "$SHARE_PROJECTS" ]] || { echo "nothing to do"; exit 0; }
+  echo "nothing to add, the rest is done anyway"
+fi
+
+# 2a. The group that carries the link for the projects has to exist and to have
+#     every requested CN already, otherwise the share would hand out nothing.
+#     The share is capped at one access level, so the highest of the links is
+#     used: a member keeps the level of their own link, which is never higher.
+carrier_id=""
+share_access=""
+if [[ -n "$SHARE_PROJECTS" ]]; then
+  carrier="$(glab api "groups/$(enc "$SHARE_PROJECTS")" 2>/dev/null)" \
+    || { echo "share group not found or no access: $SHARE_PROJECTS" >&2; exit 1; }
+  carrier_id="$(jq -r '.id // empty' <<<"$carrier")"
+  [[ "$carrier_id" =~ ^[0-9]+$ ]] \
+    || { echo "share group not found or no access: $SHARE_PROJECTS" >&2; exit 1; }
+  carrier_links="$(links_of "$SHARE_PROJECTS")"
+  missing=()
+  for cn in "${CNS[@]}"; do
+    a="$(access_in "$carrier_links" "$cn")"
+    if [[ -z "$a" ]]; then
+      missing+=("$cn")
+    elif [[ -z "$share_access" || "$a" -gt "$share_access" ]]; then
+      share_access="$a"
+    fi
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "share group $SHARE_PROJECTS does not have the link(s): ${missing[*]}" >&2
+    echo "add them there first, for example:" >&2
+    echo "  glab api -X POST groups/$(enc "$SHARE_PROJECTS")/ldap_group_links -f cn=${missing[0]} -f provider=$PROVIDER -F group_access=${ACCESS[${missing[0]}]:-20}" >&2
+    exit 1
+  fi
+  echo "share group $SHARE_PROJECTS id=$carrier_id group_access=$share_access"
 fi
 
 # 3. Add each link to each target, skip what is already there.
@@ -232,7 +287,49 @@ for sg in "${targets[@]}"; do
   done
 done
 
-# 4. Remove from parent.
+# 4. The projects directly in the parent. They cannot hold an LDAP link, so
+#    either they are shared with the carrier group, or they simply lose the
+#    members once the link is gone from the parent - which is worth a warning,
+#    because nothing else in the output mentions them.
+if [[ ${#projects[@]} -eq 0 ]]; then
+  echo "note  no project sits directly in $PARENT"
+elif [[ -z "$SHARE_PROJECTS" ]]; then
+  echo
+  echo "WARNING: ${#projects[@]} project(s) sit directly in $PARENT and cannot hold an LDAP link:" >&2
+  for path in "${project_paths[@]}"; do echo "  $path" >&2; done
+  if [[ "$REMOVE_FROM_PARENT" == "1" ]]; then
+    echo "They lose the members of ${CNS[*]} as soon as the link is removed from $PARENT." >&2
+  else
+    echo "They keep the members only as long as the link stays on $PARENT." >&2
+  fi
+  echo "Use --share-projects <group> to give them the members through a group share." >&2
+  echo
+else
+  for entry in "${projects[@]}"; do
+    pid="${entry%%$'\t'*}"
+    ppath="${entry#*$'\t'}"
+    if is_excluded "$ppath"; then
+      echo "skip  $ppath (excluded)"
+      continue
+    fi
+    shared="$(glab api "projects/${pid}" 2>/dev/null \
+      | jq -r --argjson g "$carrier_id" '.shared_with_groups // [] | .[] | select(.group_id == $g) | .group_access_level')" \
+      || shared=""
+    if [[ -n "$shared" ]]; then
+      if [[ "$shared" == "$share_access" ]]; then
+        echo "have  $ppath (already shared with $SHARE_PROJECTS, group_access=$shared)"
+      else
+        echo "have  $ppath (already shared with $SHARE_PROJECTS with group_access=$shared, wanted $share_access, left untouched)"
+      fi
+      continue
+    fi
+    echo "share $ppath with $SHARE_PROJECTS group_access=$share_access"
+    run glab api -X POST "projects/${pid}/share" -F "group_id=${carrier_id}" -F "group_access=${share_access}" \
+      && touched["$SHARE_PROJECTS"]=1
+  done
+fi
+
+# 5. Remove from parent.
 if [[ "$REMOVE_FROM_PARENT" == "1" ]]; then
   for cn in "${active_cns[@]}"; do
     before="$(glab api --paginate "groups/${parent_enc}/members?per_page=100" 2>/dev/null \
@@ -244,14 +341,14 @@ if [[ "$REMOVE_FROM_PARENT" == "1" ]]; then
   done
 fi
 
-# 5. Trigger LDAP sync, once per group: on the groups that got a change, or with
+# 6. Trigger LDAP sync, once per group: on the groups that got a change, or with
 #    --force-sync on the parent and every target whether it changed or not. That
 #    is the way to catch up on a sync that failed in an earlier run, because a
 #    re-run finds the links in place and changes nothing.
 sync_groups=()
 if [[ "$SYNC" == "1" ]]; then
   if [[ "$FORCE_SYNC" == "1" ]]; then
-    mapfile -t sync_groups < <(printf '%s\n' "$PARENT" "${targets[@]}" | sort -u)
+    mapfile -t sync_groups < <(printf '%s\n' "$PARENT" "${targets[@]}" ${SHARE_PROJECTS:+"$SHARE_PROJECTS"} | sort -u)
   elif [[ ${#touched[@]} -gt 0 ]]; then
     mapfile -t sync_groups < <(printf '%s\n' "${!touched[@]}" | sort)
   fi
@@ -261,7 +358,7 @@ fi
 # watched too.
 watch_groups=("${sync_groups[@]}")
 if [[ "$WATCH" == "1" && ${#watch_groups[@]} -eq 0 ]]; then
-  mapfile -t watch_groups < <(printf '%s\n' "$PARENT" "${targets[@]}" | sort -u)
+  mapfile -t watch_groups < <(printf '%s\n' "$PARENT" "${targets[@]}" ${SHARE_PROJECTS:+"$SHARE_PROJECTS"} | sort -u)
 fi
 
 # The membership before the syncs are triggered is the baseline --watch reports
@@ -282,7 +379,7 @@ if [[ ${#sync_groups[@]} -gt 0 ]]; then
   echo "  glab api --paginate 'groups/${parent_enc}/members?per_page=100' | jq -s 'add | map(.access_level) | group_by(.) | map({(.[0]|tostring): length}) | add'"
 fi
 
-# 6. Follow the membership of the watched groups. There is no API for the state
+# 7. Follow the membership of the watched groups. There is no API for the state
 #    of an LDAP sync, so the members themselves are the progress: every poll
 #    prints who was added and who was removed since the poll before. A group is
 #    done once it comes back unchanged WATCH_SETTLE times in a row.
@@ -332,7 +429,7 @@ if [[ "$WATCH" == "1" ]]; then
   fi
 fi
 
-# 7. Report what did not work. Re-running the script adds the links that are
+# 8. Report what did not work. Re-running the script adds the links that are
 #    still missing, but it only syncs the groups it changes, so a sync that
 #    failed on its own needs --force-sync or the printed command.
 if [[ ${#FAILED[@]} -gt 0 ]]; then

@@ -48,10 +48,21 @@ RC_SELF_APPROVE=3
 # not satisfied
 RC_MERGE_BLOCKED=4
 
+# the picker was killed, ctrl-c above all, which ends the run instead of
+# stepping back the way esc does
+RC_INTERRUPTED=130
+
 # the GitLab merge statuses a merge can still be attempted or queued for; a
 # conflict, a draft or a request another merge request blocks is not among them,
 # no flag gets around those
 GITLAB_BLOCKED_STATUSES="not_approved ci_must_pass ci_still_running discussions_not_resolved requested_changes status_checks_must_pass external_status_checks approvals_syncing jira_association_missing"
+
+# the states of a pipeline that is not done yet, and of one that ended without
+# success; everything else counts as green. GitLab reports one status per
+# request, GitHub one per check of the head commit, so both vocabularies are
+# listed together
+PIPELINE_RUNNING_STATES="created waiting_for_resource preparing pending running scheduled queued in_progress requested waiting expected"
+PIPELINE_UNSUCCESSFUL_STATES="failed canceled cancelled manual blocked failure error timed_out startup_failure action_required stale"
 
 JQ_STATE_COLOR='
     def statecolor:
@@ -134,7 +145,11 @@ went through, the approve + merge and the merge action offer three ways on:
 merging past the requirements (GitHub --admin, which needs the permission to do
 so; GitLab --auto-merge=false), leaving the merge to the provider until every
 requirement is met (--auto, on GitLab --auto-merge), or leaving the request
-alone.
+alone. Above that question stand the state of the pipeline and what the provider
+still waits for, so the question is answered against what is actually blocking.
+A running pipeline is the one the provider waits for, so waiting is the
+preselected answer while one runs. When the provider blocks nothing, the refused
+approval was not required for the merge, and a plain merge leads the answers.
 
 An auto-merge waits for the pipeline, so the pipelines of the source branch are
 shown with git-pipe once it is set.
@@ -234,13 +249,13 @@ set_provider_labels() {
         NOUN_PLURAL="pull requests"
         ABBR="PR"
         SIGIL="#"
-        PROVIDER_LABEL="GitHub"
+        CI_LABEL="Checks"
     else
         NOUN="merge request"
         NOUN_PLURAL="merge requests"
         ABBR="MR"
         SIGIL="!"
-        PROVIDER_LABEL="GitLab"
+        CI_LABEL="Pipeline"
     fi
 }
 
@@ -702,6 +717,143 @@ merge_blocked_reason() {
     esac
 }
 
+# the statuses that say the merge goes through; every other status the provider
+# reports is something in the way, whether a flag gets around it or not
+GITLAB_MERGEABLE_STATUSES="mergeable"
+GITHUB_MERGEABLE_STATUSES="CLEAN HAS_HOOKS UNSTABLE"
+
+# the statuses of a provider that has not made up its mind yet; it settles on a
+# real one within a read or two, and taking the first for an answer would read
+# as if nothing were in the way
+GITLAB_TRANSIENT_STATUSES="checking unchecked preparing"
+GITHUB_TRANSIENT_STATUSES="UNKNOWN"
+
+# the status the provider reports for the merge, read again while it is still
+# working it out
+merge_status() {
+    local attempts=0
+    local status
+
+    while [ "${attempts}" -lt 3 ]; do
+        attempts=$((attempts + 1))
+        [ "${attempts}" -gt 1 ] && sleep 1
+        if [ "${provider}" = "github" ]; then
+            status="$(gh pr view "${1}" --repo "${github_repo_selector}" \
+                --json mergeStateStatus --jq '.mergeStateStatus // empty' 2>/dev/null)" || return 1
+            case " ${GITHUB_TRANSIENT_STATUSES} " in
+                *" ${status} "*) continue ;;
+            esac
+        else
+            status="$(glab mr view "${1}" --output json 2>/dev/null \
+                | jq -r '.detailed_merge_status // empty')" || return 1
+            case " ${GITLAB_TRANSIENT_STATUSES} " in
+                *" ${status} "*) continue ;;
+            esac
+        fi
+        printf '%s\n' "${status}"
+        return 0
+    done
+    # still undecided, which is no statement about the merge either way
+    return 0
+}
+
+# what stands between the request and its merge, named the way the provider
+# names it: GitLab answers with its detailed merge status, GitHub with its
+# review decision and the state of the target branch. An empty answer means the
+# provider reports nothing in the way, so a merge without a flag goes through
+merge_requirement() {
+    local n="${1}"
+    local pipeline_state="${2}"
+    local status decision
+
+    if [ "${provider}" = "github" ]; then
+        decision="$(gh pr view "${n}" --repo "${github_repo_selector}" \
+            --json reviewDecision --jq '.reviewDecision // empty' 2>/dev/null)" || return 0
+        case "${decision}" in
+            REVIEW_REQUIRED)   printf 'not_approved\n'; return 0 ;;
+            CHANGES_REQUESTED) printf 'requested_changes\n'; return 0 ;;
+        esac
+        status="$(merge_status "${n}")" || return 0
+        case " ${GITHUB_MERGEABLE_STATUSES} " in
+            *" ${status} "*) return 0 ;;
+        esac
+        # the state of the target branch says a check is in the way, the state
+        # of the checks says which
+        if [ "${status}" = "BLOCKED" ]; then
+            case "${pipeline_state}" in
+                running)      printf 'ci_still_running\n'; return 0 ;;
+                unsuccessful) printf 'ci_must_pass\n'; return 0 ;;
+            esac
+        fi
+        [ -n "${status}" ] && printf '%s\n' "$(tr '[:upper:]' '[:lower:]' <<< "${status}")"
+        return 0
+    fi
+    status="$(merge_status "${n}")" || return 0
+    case " ${GITLAB_MERGEABLE_STATUSES} " in
+        *" ${status} "*) return 0 ;;
+    esac
+    [ -n "${status}" ] && printf '%s\n' "${status}"
+    return 0
+}
+
+# one reported status mapped onto the three outcomes the merge question cares
+# about: something is still coming, something ended without success, or it is
+# green
+pipeline_state_of() {
+    local status="${1}"
+
+    [ -z "${status}" ] && { printf 'none\n'; return 0; }
+    case " ${PIPELINE_RUNNING_STATES} " in
+        *" ${status} "*) printf 'running\n'; return 0 ;;
+    esac
+    case " ${PIPELINE_UNSUCCESSFUL_STATES} " in
+        *" ${status} "*) printf 'unsuccessful\n'; return 0 ;;
+    esac
+    printf 'success\n'
+}
+
+# the state of the pipeline of a request: running, success, unsuccessful or
+# none. Only a running pipeline is something an auto-merge waits for, one that
+# ended without success never lets it fire, and without a pipeline there is
+# nothing to wait for at all, so the merge question reads differently for each.
+# GitHub answers with one entry per check of the head commit, which is running
+# while any check is and unsuccessful when any check ended badly
+item_pipeline_state() {
+    local n="${1}"
+    local statuses status state
+    local result="none"
+
+    if [ "${provider}" = "github" ]; then
+        statuses="$(gh pr view "${n}" --repo "${github_repo_selector}" --json statusCheckRollup --jq '
+            .statusCheckRollup[]?
+            | (if .status == "COMPLETED" then (.conclusion // "") else (.status // .state // "") end)
+            | ascii_downcase' 2>/dev/null)" || return 0
+    else
+        statuses="$(glab mr view "${n}" --output json 2>/dev/null \
+            | jq -r '(.head_pipeline.status // .pipeline.status // empty) | ascii_downcase')" || return 0
+    fi
+
+    while IFS= read -r status; do
+        [ -z "${status}" ] && continue
+        state="$(pipeline_state_of "${status}")"
+        case "${state}" in
+            running)      printf 'running\n'; return 0 ;;
+            unsuccessful) result="unsuccessful" ;;
+            success)      [ "${result}" = "none" ] && result="success" ;;
+        esac
+    done <<< "${statuses}"
+    printf '%s\n' "${result}"
+}
+
+pipeline_state_label() {
+    case "${1}" in
+        running)      printf 'running\n' ;;
+        success)      printf 'succeeded\n' ;;
+        unsuccessful) printf 'did not succeed\n' ;;
+        *)            printf 'none\n' ;;
+    esac
+}
+
 # an auto-merge leaves the merge to the provider, which runs it once the pipeline
 # of the source branch succeeded, so that pipeline is what to look at next.
 # git-pipe detects the provider the same way, so one call covers GitLab CI and
@@ -758,28 +910,62 @@ merge_item() {
 }
 
 # a refused approval and a blocked merge both fall back to the same question:
-# merge past the requirements, wait for them, or leave the request alone
+# merge past the requirements, wait for them, or leave the request alone. When
+# the provider reports nothing blocking, the approval it refused was not
+# required for the merge, so the merge that needs no flag leads the answers. The
+# other answers name the flag they run, what they are answered against stands
+# above them
 bypass_items() {
+    local plain="${1}"
+
+    [ "${plain}" -eq 1 ] && printf '%s\t%s\n' "merge" "Merge"
     if [ "${provider}" = "github" ]; then
         printf '%s\t%s\n' \
-            "bypass" "merge now, bypassing the branch protection rules (--admin)" \
-            "auto"   "let ${PROVIDER_LABEL} merge it once every requirement is met (--auto)"
+            "bypass" "Force merge (--admin)" \
+            "auto"   "Set auto-merge (--auto)"
     else
         printf '%s\t%s\n' \
-            "bypass" "merge now, without waiting for the pipeline (--auto-merge=false)" \
-            "auto"   "let ${PROVIDER_LABEL} merge it once the pipeline succeeds (--auto-merge)"
+            "bypass" "Force merge (--auto-merge=false)" \
+            "auto"   "Set auto-merge (--auto-merge)"
     fi
-    printf '%s\t%s\n' "abort" "leave the ${NOUN} as it is"
+    printf '%s\t%s\n' "abort" "Leave the ${NOUN} as it is"
 }
 
+# the state of the request as the provider sees it leads the question: its
+# pipeline, and what it still waits for. A running pipeline is the one case
+# where waiting is the answer that does what the target branch asks for, so the
+# cursor starts on it. A plain merge that comes back blocked asks again, without
+# offering itself a second time
 ask_merge_bypass() {
     local n="${1}"
-    local choice
+    local retry="${2:-0}"
+    local choice pipeline_state requirement prompt rc
+    local plain=0
+    local select_args=()
 
     need_cmd prompt-select
-    choice="$(bypass_items | prompt-select --prompt "Merge '$(item_ref "${n}")' anyway?" \
-        --delimiter '\t')" || { echo "Abort." 1>&2; return 2; }
+    pipeline_state="$(item_pipeline_state "${n}")"
+    requirement="$(merge_requirement "${n}" "${pipeline_state}")"
+    [ -z "${requirement}" ] && [ "${retry}" -eq 0 ] && plain=1
+    printf '%s%s:%s %s\n' "${C_LABEL}" "${CI_LABEL}" "${C_RESET}" \
+        "$(pipeline_state_label "${pipeline_state}")" 1>&2
+    if [ -n "${requirement}" ]; then
+        printf '%sBlocked:%s %s\n' "${C_LABEL}" "${C_RESET}" "${requirement//_/ }" 1>&2
+        prompt="Merge '$(item_ref "${n}")' anyway?"
+    else
+        printf '%sBlocked:%s nothing\n' "${C_LABEL}" "${C_RESET}" 1>&2
+        prompt="Merge '$(item_ref "${n}")'?"
+    fi
+    [ "${pipeline_state}" = "running" ] && select_args+=("--default" "auto")
+    choice="$(bypass_items "${plain}" | prompt-select --prompt "${prompt}" \
+        --delimiter '\t' "${select_args[@]}")" || { echo "Abort." 1>&2; return 2; }
     case "${choice}" in
+        merge)
+            merge_item "${n}"
+            rc=$?
+            [ "${rc}" -eq "${RC_MERGE_BLOCKED}" ] && { ask_merge_bypass "${n}" 1; rc=$?; }
+            return "${rc}"
+            ;;
         bypass) merge_item "${n}" bypass ;;
         auto)   merge_item "${n}" auto ;;
         *)      echo "Abort." 1>&2; return 2 ;;
@@ -800,6 +986,8 @@ approve_and_merge() {
         return "${rc}"
     fi
     [ "${rc}" -ne "${RC_SELF_APPROVE}" ] && return 1
+    # the approval is refused, the merge may still be allowed: the question that
+    # follows offers a plain merge when the provider blocks nothing
     ask_merge_bypass "${n}"
 }
 
@@ -1290,7 +1478,7 @@ has_requests() {
 # empty list is no reason to keep the picker closed: both filters are keys of
 # it, so widening them is what it is opened for.
 run_menu() {
-    local choice
+    local choice rc
 
     while true; do
         choice="$(menu_items | prompt-select)" || return 0
@@ -1302,9 +1490,12 @@ run_menu() {
             show|copy)
                 action="${choice}"
                 write_state
+                pick_list
+                rc=$?
                 # the picker returns non-zero when it was left with esc, so the
-                # menu comes back instead of ending the run
-                pick_list && return 0
+                # menu comes back instead of ending the run; ctrl-c ends it
+                [ "${rc}" -eq 0 ] && return 0
+                [ "${rc}" -eq "${RC_INTERRUPTED}" ] && return "${rc}"
                 ;;
         esac
     done
@@ -1543,7 +1734,9 @@ while [ "${#}" -gt 0 ]; do
         --list-key)
             mode="list-key"
             shift
-            [ -z "${1}" ] && fail "Missing argument for key"
+            # the key result of a picker that was left without a key is empty,
+            # which is an argument like any other; only none at all is a bug
+            [ "${#}" -eq 0 ] && fail "Missing argument for key"
             key_result="${1}"
             ;;
         --id)
