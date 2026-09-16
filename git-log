@@ -67,6 +67,12 @@ enter steps into a commit and opens a file picker with the changed files on
 the left and the diff of the selected file in the preview:
 $(key_help "${FILES_KEY_DESCS}")
 
+alt-v opens the file in vimdiff with the newer of the two versions in the left
+window. With the commit checked out that window is the working tree file
+itself, so the change can be edited in place; for any other commit a prompt
+asks whether to diff the working tree file against the commit, which is
+editable too, or to show the change the commit made, which is readonly.
+
 esc leaves the file picker and returns to the commit list; backspace erases the
 search query there, the same way it does in the commit list.
 
@@ -459,32 +465,78 @@ edit_file() {
     vim "+${lineno}" "${file}"
 }
 
+# write the version of a file at a revision to a file; an empty revision and a
+# file that is missing at that revision both give an empty file to diff against
+write_blob() {
+    local rev="${1}" path="${2}" out="${3}"
+
+    mkdir -p "$(dirname "${out}")"
+    if [ -n "${rev}" ]; then
+        git -C "${repo_root_dir}" show "${rev}:${path}" > "${out}" 2>/dev/null || : > "${out}"
+    else
+        : > "${out}"
+    fi
+}
+
+# the left window holds the newer of the two versions, the same way git-diff
+# --vim lays it out; closing one window quits vim so the picker comes back
+# right away
+open_vimdiff() {
+    local left="${1}" right="${2}" editable="${3}"
+    local ro_args=(-c 'windo setlocal readonly nomodifiable' -c 'wincmd h')
+
+    # only the right window is history then, the left one is the working tree
+    # file and keeps its default modifiable state
+    [ "${editable}" -eq 1 ] \
+        && ro_args=(-c 'wincmd l' -c 'setlocal readonly nomodifiable' -c 'wincmd h')
+
+    vim -d "${left}" "${right}" "${ro_args[@]}" \
+        -c 'autocmd WinClosed * ++nested qall' \
+        -c 'redraw!'
+}
+
+# with the commit checked out its version of the file is the one in the working
+# tree, so that one is opened in place of a copy of it and the change can be
+# edited right there. For any other commit the choice is between the working
+# tree file, editable, and the change the commit made, readonly. A file that is
+# not in the working tree has no editable side and is always shown as history.
 vimdiff_file() {
     local path="${1}"
-    local parent tmp_root old new
+    local file tmp_root short base choice editable=0
 
     need_cmd vim
-    parent="$(parent_of "${commit}")"
+    file="${repo_root_dir}/${path}"
+    short="$(git rev-parse --short "${commit}")"
+
+    if [ -f "${file}" ]; then
+        if [ "$(git rev-parse --verify --quiet HEAD 2>/dev/null)" = "${commit}" ]; then
+            editable=1
+            base="$(parent_of "${commit}")"
+        else
+            need_cmd prompt-select
+            choice="$(printf '%s\t%s\n' \
+                "current" "the working tree file against ${short}, editable" \
+                "commit"  "the change ${short} made, readonly" \
+                | prompt-select --prompt "Diff:" --delimiter '\t')"
+            [ -z "${choice}" ] && return 0
+            if [ "${choice}" = "current" ]; then
+                editable=1
+                base="${commit}"
+            fi
+        fi
+    fi
+
     tmp_root="$(mktemp -d)" || fail "Cannot create a temp directory"
     trap 'rm -rf "${tmp_root}"' EXIT
 
-    old="${tmp_root}/before/${path}"
-    new="${tmp_root}/after/${path}"
-    mkdir -p "$(dirname "${old}")" "$(dirname "${new}")"
-    # a file that is missing on either side diffs against an empty file
-    if [ -n "${parent}" ]; then
-        git -C "${repo_root_dir}" show "${parent}:${path}" > "${old}" 2>/dev/null || : > "${old}"
+    if [ "${editable}" -eq 1 ]; then
+        write_blob "${base}" "${path}" "${tmp_root}/${path}"
+        open_vimdiff "${file}" "${tmp_root}/${path}" 1
     else
-        : > "${old}"
+        write_blob "$(parent_of "${commit}")" "${path}" "${tmp_root}/before/${path}"
+        write_blob "${commit}" "${path}" "${tmp_root}/after/${path}"
+        open_vimdiff "${tmp_root}/after/${path}" "${tmp_root}/before/${path}" 0
     fi
-    git -C "${repo_root_dir}" show "${commit}:${path}" > "${new}" 2>/dev/null || : > "${new}"
-
-    # both sides are history, so neither is editable; closing one window quits
-    # vim so the picker comes back right away
-    vim -d "${old}" "${new}" \
-        -c 'windo setlocal readonly nomodifiable' -c 'wincmd h' \
-        -c 'autocmd WinClosed * ++nested qall' \
-        -c 'redraw!'
 }
 
 write_state() {

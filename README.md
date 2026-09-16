@@ -323,6 +323,13 @@ the file's diff as a patch, and `alt-r` reverts just that file's change. `esc`
 returns to the commit list. Merge commits are shown against their first
 parent.
 
+vimdiff puts the newer of the two versions in the left window, the way
+`git-diff --vim` does. With the commit checked out that window is the working
+tree file itself, so the change can be edited in place; for any other commit a
+prompt asks whether to diff the working tree file against the commit, editable
+as well, or to show the change the commit made, readonly. A file that is not in
+the working tree is always shown as history.
+
 Reading a commit or a file acts inside the picker instead of ending it: the pager,
 the editor and vimdiff get the terminal handed over and come back to the same
 picker, the browser is opened without touching the screen at all, and reverting a
