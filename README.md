@@ -544,3 +544,36 @@ When `add` has to create the branch, the start point is taken from `-B/--base`
 (asked interactively when omitted, defaulting to the default remote branch) and
 the base can be fetched beforehand (asked interactively when neither `--fetch`
 nor `--no-fetch` is given).
+
+### gitlab-move-ldap-sync
+Move LDAP group links from a GitLab group down to its subgroups, so that the
+members they bring in are no longer inherited by every subgroup of the parent.
+For each `--cn` the link is read from `<group>` (the access level and the
+member role are taken from there), added to every subgroup that is neither
+excluded nor already linked, and with `--remove-from-parent` deleted from
+`<group>` afterwards. Nothing is changed without `--apply`.
+```bash
+gitlab-move-ldap-sync <group> --cn <CN> [--cn <CN> ...] [--exclude <subgroup>] \
+                      [--provider <id>] [--apply] [--remove-from-parent] [--no-sync]
+```
+Requires `glab` and `jq`, and an account that may administer the LDAP group
+links of the groups involved.
+
+All requested links are resolved on the parent before anything is written, and
+an `--exclude` naming a subgroup that does not exist is an error rather than a
+silently included group. A CN that is already gone from the parent but present
+on every target counts as moved and is skipped, so a re-run after a partial run
+is safe. A subgroup that already has the link keeps it untouched, and a
+differing access level there is reported instead of overwritten.
+
+Two effects worth knowing before `--apply`: a group that receives its first
+LDAP link becomes LDAP-managed, which means its owners can no longer add or
+remove members by hand and members not matched by any link are dropped at the
+next sync — the script prints the current direct members of such a group.
+Removing a link from the parent likewise drops the members it brought in, so
+run the move first, wait for the sync, verify the subgroups, and only then
+repeat with `--remove-from-parent`.
+
+Every touched group is synced with `POST /groups/:id/ldap_sync` unless
+`--no-sync` is given. The sync is asynchronous; the script prints the command
+to check the resulting member counts afterwards.

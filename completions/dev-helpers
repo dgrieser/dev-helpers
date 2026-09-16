@@ -663,3 +663,22 @@ _git-worktree()
     return 0
 }
 complete -F _git-worktree git-worktree
+
+_gitlab-move-ldap-sync()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        --cn|--exclude)
+            return 0 ;;
+        --provider)
+            __dh_compgen "ldapmain"
+            return 0 ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "--cn --exclude --provider --apply --remove-from-parent --no-sync -h --help"
+    fi
+    # the only positional argument is the group path, which is not completed
+    return 0
+}
+complete -F _gitlab-move-ldap-sync gitlab-move-ldap-sync
