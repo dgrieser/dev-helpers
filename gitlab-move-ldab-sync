@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# Move LDAP group links from a GitLab group to its subgroups.
+#
+# For every --cn: read the link from the parent group (access level is taken
+# from there), add it to each subgroup that is not excluded and does not have
+# it yet, and with --remove-from-parent delete it from the parent afterwards.
+# Nothing is changed unless --apply is given.
+set -euo pipefail
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") <group> --cn <CN> [--cn <CN> ...] [options]
+
+  <group>                 Parent group path, e.g. asylum. Required.
+  --cn <CN>               LDAP group CN to move. Repeatable, at least one.
+  --exclude <subgroup>    Subgroup path relative to <group> to skip. Repeatable.
+  --provider <id>         LDAP provider id. Default: ldapmain
+  --apply                 Perform changes. Without it: dry run.
+  --remove-from-parent    Delete the link(s) from <group> after the subgroups are done.
+  --no-sync               Do not trigger POST /groups/:id/ldap_sync on touched groups.
+  -h, --help              This text.
+
+Examples:
+  $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace
+  $(basename "$0") asylum --cn M_Plattform_Viewer --cn Abt_Infrastruktur --exclude teamspace --apply
+  $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace --apply --remove-from-parent
+USAGE
+}
+
+PARENT=""
+CNS=()
+EXCLUDES=()
+PROVIDER="ldapmain"
+APPLY=0
+REMOVE_FROM_PARENT=0
+SYNC=1
+
+need_arg() { [[ $# -ge 2 && -n "$2" ]] || { echo "option $1 needs a value" >&2; exit 2; }; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cn)                 need_arg "$@"; CNS+=("$2"); shift 2 ;;
+    --cn=*)               CNS+=("${1#*=}"); shift ;;
+    --exclude)            need_arg "$@"; EXCLUDES+=("$2"); shift 2 ;;
+    --exclude=*)          EXCLUDES+=("${1#*=}"); shift ;;
+    --provider)           need_arg "$@"; PROVIDER="$2"; shift 2 ;;
+    --provider=*)         PROVIDER="${1#*=}"; shift ;;
+    --apply)              APPLY=1; shift ;;
+    --remove-from-parent) REMOVE_FROM_PARENT=1; shift ;;
+    --no-sync)            SYNC=0; shift ;;
+    -h|--help)            usage; exit 0 ;;
+    -*)                   echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)
+      if [[ -n "$PARENT" ]]; then
+        echo "unexpected argument: $1 (group already set to $PARENT)" >&2; usage >&2; exit 2
+      fi
+      PARENT="$1"; shift ;;
+  esac
+done
+
+[[ -n "$PARENT" ]]        || { echo "group argument is required" >&2; usage >&2; exit 2; }
+[[ ${#CNS[@]} -gt 0 ]]    || { echo "at least one --cn is required" >&2; usage >&2; exit 2; }
+
+need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
+need glab; need jq
+
+enc() { jq -rn --arg s "$1" '$s|@uri'; }
+
+run() {
+  if [[ "$APPLY" == "1" ]]; then
+    "$@"
+  else
+    echo "  [dry-run] $*"
+  fi
+}
+
+# Links of a group as a JSON array. The API answers 404 with an object when a
+# group has no links, so anything that is not an array becomes [].
+links_of() {
+  local out
+  out="$(glab api "groups/$(enc "$1")/ldap_group_links" 2>/dev/null || true)"
+  jq -c 'if type == "array" then . else [] end' <<<"${out:-null}"
+}
+
+# group_access of a cn/provider link inside a JSON array, empty when absent.
+access_in() {
+  jq -r --arg cn "$2" --arg p "$PROVIDER" '.[] | select(.cn == $cn and .provider == $p) | .group_access' <<<"$1"
+}
+
+is_excluded() {
+  local sg="$1" ex
+  for ex in "${EXCLUDES[@]}"; do
+    [[ "$sg" == "$PARENT/$ex" || "$sg" == "$ex" ]] && return 0
+  done
+  return 1
+}
+
+parent_enc="$(enc "$PARENT")"
+glab api "groups/${parent_enc}" >/dev/null 2>&1 || { echo "group not found or no access: $PARENT" >&2; exit 1; }
+
+[[ "$APPLY" == "1" ]] || echo "DRY RUN (add --apply to change anything)"
+echo "group=$PARENT provider=$PROVIDER exclude=${EXCLUDES[*]:-none}"
+
+# 1. Subgroups and their current links. --paginate prints one JSON array per
+#    page, jq -s add merges them.
+mapfile -t subgroups < <(glab api --paginate "groups/${parent_enc}/subgroups?per_page=100" \
+  | jq -rs 'add | .[].full_path' | sort)
+targets=()
+declare -A sg_links=()
+for sg in "${subgroups[@]}"; do
+  if is_excluded "$sg"; then
+    echo "skip  $sg (excluded)"
+    continue
+  fi
+  targets+=("$sg")
+  sg_links["$sg"]="$(links_of "$sg")"
+done
+[[ ${#targets[@]} -gt 0 ]] || { echo "no target subgroups left under $PARENT" >&2; exit 1; }
+
+# Every excluded name must exist, otherwise a typo would silently include a group.
+for ex in "${EXCLUDES[@]}"; do
+  found=0
+  for sg in "${subgroups[@]}"; do [[ "$sg" == "$PARENT/$ex" || "$sg" == "$ex" ]] && found=1; done
+  [[ "$found" == "1" ]] || { echo "excluded subgroup does not exist: $ex" >&2; exit 1; }
+done
+
+# 2. Resolve every requested link on the parent before touching anything.
+#    A link that is gone from the parent but present on every target counts as
+#    already moved and is skipped; anything else is an error.
+parent_links="$(links_of "$PARENT")"
+declare -A ACCESS=() MEMBER_ROLE=()
+active_cns=()
+for cn in "${CNS[@]}"; do
+  link="$(jq -c --arg cn "$cn" --arg p "$PROVIDER" '.[] | select(.cn == $cn and .provider == $p)' <<<"$parent_links")"
+  if [[ -n "$link" ]]; then
+    ACCESS["$cn"]="$(jq -r '.group_access' <<<"$link")"
+    MEMBER_ROLE["$cn"]="$(jq -r '.member_role_id // empty' <<<"$link")"
+    echo "link  $PARENT cn=$cn group_access=${ACCESS[$cn]}${MEMBER_ROLE[$cn]:+ member_role_id=${MEMBER_ROLE[$cn]}}"
+    active_cns+=("$cn")
+    continue
+  fi
+  missing=()
+  for sg in "${targets[@]}"; do
+    [[ -n "$(access_in "${sg_links[$sg]}" "$cn")" ]] || missing+=("$sg")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    echo "done  cn=$cn not on $PARENT, already present on all targets, skip"
+  else
+    echo "link cn=$cn provider=$PROVIDER not found on $PARENT and missing on: ${missing[*]}" >&2
+    exit 1
+  fi
+done
+[[ ${#active_cns[@]} -gt 0 ]] || { echo "nothing to do"; exit 0; }
+
+# 3. Add each link to each target, skip what is already there.
+declare -A touched=()
+for sg in "${targets[@]}"; do
+  sg_enc="$(enc "$sg")"
+  first_link=1
+  [[ "$(jq 'length' <<<"${sg_links[$sg]}")" == "0" ]] || first_link=0
+  for cn in "${active_cns[@]}"; do
+    existing="$(access_in "${sg_links[$sg]}" "$cn")"
+    if [[ -n "$existing" ]]; then
+      if [[ "$existing" == "${ACCESS[$cn]}" ]]; then
+        echo "have  $sg cn=$cn (already linked, group_access=$existing)"
+      else
+        echo "have  $sg cn=$cn (already linked with group_access=$existing, parent has ${ACCESS[$cn]}, left untouched)"
+      fi
+      continue
+    fi
+    if [[ "$first_link" == "1" ]]; then
+      # First LDAP link on this group: at next sync, direct members not in the
+      # LDAP group are removed unless they are the last Owner or overridden.
+      direct="$(glab api "groups/${sg_enc}/members?per_page=100" | jq -r '.[] | "\(.username):\(.access_level)"' | paste -sd' ' -)"
+      echo "note  $sg gets its first LDAP link, direct members now: ${direct:-none}"
+      first_link=0
+    fi
+    echo "add   $sg cn=$cn group_access=${ACCESS[$cn]}"
+    args=(-X POST "groups/${sg_enc}/ldap_group_links" -f "cn=$cn" -f "provider=$PROVIDER" -F "group_access=${ACCESS[$cn]}")
+    [[ -n "${MEMBER_ROLE[$cn]}" ]] && args+=(-F "member_role_id=${MEMBER_ROLE[$cn]}")
+    run glab api "${args[@]}"
+    touched["$sg"]=1
+  done
+done
+
+# 4. Remove from parent.
+if [[ "$REMOVE_FROM_PARENT" == "1" ]]; then
+  for cn in "${active_cns[@]}"; do
+    before="$(glab api --paginate "groups/${parent_enc}/members?per_page=100" \
+      | jq -s --argjson a "${ACCESS[$cn]}" 'add | [.[] | select(.access_level == $a)] | length')"
+    echo "remove $PARENT cn=$cn (members with access_level=${ACCESS[$cn]} before: $before)"
+    run glab api -X DELETE "groups/${parent_enc}/ldap_group_links" -f "cn=$cn" -f "provider=$PROVIDER"
+    touched["$PARENT"]=1
+  done
+fi
+
+# 5. Trigger LDAP sync on every touched group, once each.
+if [[ "$SYNC" == "1" && ${#touched[@]} -gt 0 ]]; then
+  for g in $(printf '%s\n' "${!touched[@]}" | sort); do
+    echo "sync  $g"
+    if [[ "$APPLY" == "1" ]]; then
+      glab api -X POST "groups/$(enc "$g")/ldap_sync" >/dev/null
+    else
+      echo "  [dry-run] glab api -X POST groups/$(enc "$g")/ldap_sync"
+    fi
+  done
+  echo "sync is asynchronous. Check later with:"
+  echo "  glab api --paginate 'groups/${parent_enc}/members?per_page=100' | jq -s 'add | map(.access_level) | group_by(.) | map({(.[0]|tostring): length}) | add'"
+fi
