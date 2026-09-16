@@ -354,8 +354,10 @@ Approve, merge, create, close, delete, copy a channel message, create an issue,
 or show the review feedback.
 
 Without an action a `prompt-select` menu asks for one of the three ways in:
-`create`, `show` or `copy`. Show and copy list the requests in an fzf picker
-with the request and its diff in the preview: `enter` runs the chosen action
+`create`, `show` or `copy`. It starts on `show` when the branch filter has an
+open request and on `create` when it has none, so the usual case is one `enter`
+away. Show and copy list the requests in an fzf picker with the request and its
+diff in the preview: `enter` runs the chosen action
 (show by default), `tab` switches the state filter (open, merged, closed, all),
 `ctrl-b` asks for the branch filter on a list of the repository's branches,
 `ctrl-d` shows the diff, `ctrl-o` opens it in the browser, `ctrl-y` copies a

@@ -129,8 +129,10 @@ detected from the remote, so ${APP_NAME} handles both; git-mr and git-pr are
 the same command.
 
 Without an action a prompt-select menu asks for one of the three ways in:
-create, show or copy. Show and copy list the requests in a picker with the
-request and its diff in the preview, both filters among its keys:
+create, show or copy. It starts on show when the branch filter has an open
+request and on create when it has none. Show and copy list the requests in a
+picker with the request and its diff in the preview, both filters among its
+keys:
 
 $(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
@@ -1474,14 +1476,35 @@ has_requests() {
     [ -n "${count}" ] && [ "${count}" -gt 0 ]
 }
 
+# whether the branch filter has an open request, whatever the state filter
+# holds: an open request is the one still worth showing, approving or merging,
+# and the one that makes creating another unnecessary
+has_open_requests() {
+    # shellcheck disable=SC2034
+    local state="open" count
+
+    count="$(list_json | jq 'length')"
+    [ -n "${count}" ] && [ "${count}" -gt 0 ]
+}
+
 # the menu keeps coming back until an action ran or it is left with esc. An
 # empty list is no reason to keep the picker closed: both filters are keys of
 # it, so widening them is what it is opened for.
 run_menu() {
-    local choice rc
+    local choice rc preselected
+
+    # the list decides which way in the menu starts on: with an open request
+    # there is one to show, without one there is one to create. The answer is an
+    # API call, so it is taken once, before the menu opens, and the filters the
+    # picker changes stay with the picker
+    if has_open_requests; then
+        preselected="show"
+    else
+        preselected="create"
+    fi
 
     while true; do
-        choice="$(menu_items | prompt-select)" || return 0
+        choice="$(menu_items | prompt-select --default "${preselected}")" || return 0
         case "${choice}" in
             create)
                 create_request
