@@ -674,9 +674,15 @@ _gitlab-move-ldap-sync()
         --provider)
             __dh_compgen "ldapmain"
             return 0 ;;
+        --watch-interval)
+            __dh_compgen "5 10 30 60"
+            return 0 ;;
+        --watch-timeout)
+            __dh_compgen "60 300 600 1800"
+            return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "--cn --exclude --provider --apply --remove-from-parent --no-sync -h --help"
+        __dh_compgen "--cn --exclude --provider --apply --remove-from-parent --force-sync --no-sync --watch --watch-interval --watch-timeout -h --help"
     fi
     # the only positional argument is the group path, which is not completed
     return 0

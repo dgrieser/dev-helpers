@@ -17,13 +17,21 @@ Usage: $(basename "$0") <group> --cn <CN> [--cn <CN> ...] [options]
   --provider <id>         LDAP provider id. Default: ldapmain
   --apply                 Perform changes. Without it: dry run.
   --remove-from-parent    Delete the link(s) from <group> after the subgroups are done.
+  --force-sync            Sync <group> and every target subgroup, changed or not.
   --no-sync               Do not trigger POST /groups/:id/ldap_sync on touched groups.
+  --watch                 After the syncs, follow the membership of the synced
+                          groups and print who is added and removed, until
+                          nothing changes any more.
+  --watch-interval <sec>  Seconds between two polls. Default: 10
+  --watch-timeout <sec>   Give up watching after this many seconds. Default: 300
   -h, --help              This text.
 
 Examples:
   $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace
   $(basename "$0") asylum --cn M_Plattform_Viewer --cn Abt_Infrastruktur --exclude teamspace --apply
   $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace --apply --remove-from-parent
+  $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace --apply --force-sync
+  $(basename "$0") asylum --cn M_Plattform_Viewer --exclude teamspace --apply --watch
 USAGE
 }
 
@@ -34,6 +42,12 @@ PROVIDER="ldapmain"
 APPLY=0
 REMOVE_FROM_PARENT=0
 SYNC=1
+FORCE_SYNC=0
+WATCH=0
+WATCH_INTERVAL=10
+WATCH_TIMEOUT=300
+# polls a group has to come back unchanged before it counts as done
+WATCH_SETTLE=2
 
 need_arg() { [[ $# -ge 2 && -n "$2" ]] || { echo "option $1 needs a value" >&2; exit 2; }; }
 
@@ -47,7 +61,13 @@ while [[ $# -gt 0 ]]; do
     --provider=*)         PROVIDER="${1#*=}"; shift ;;
     --apply)              APPLY=1; shift ;;
     --remove-from-parent) REMOVE_FROM_PARENT=1; shift ;;
+    --force-sync)         FORCE_SYNC=1; shift ;;
     --no-sync)            SYNC=0; shift ;;
+    --watch)              WATCH=1; shift ;;
+    --watch-interval)     need_arg "$@"; WATCH_INTERVAL="$2"; shift 2 ;;
+    --watch-interval=*)   WATCH_INTERVAL="${1#*=}"; shift ;;
+    --watch-timeout)      need_arg "$@"; WATCH_TIMEOUT="$2"; shift 2 ;;
+    --watch-timeout=*)    WATCH_TIMEOUT="${1#*=}"; shift ;;
     -h|--help)            usage; exit 0 ;;
     -*)                   echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     *)
@@ -60,18 +80,32 @@ done
 
 [[ -n "$PARENT" ]]        || { echo "group argument is required" >&2; usage >&2; exit 2; }
 [[ ${#CNS[@]} -gt 0 ]]    || { echo "at least one --cn is required" >&2; usage >&2; exit 2; }
+[[ "$SYNC" == "1" || "$FORCE_SYNC" == "0" ]] \
+  || { echo "--force-sync and --no-sync exclude each other" >&2; exit 2; }
+[[ "$WATCH_INTERVAL" =~ ^[0-9]+$ && "$WATCH_INTERVAL" -gt 0 ]] \
+  || { echo "--watch-interval needs a positive number of seconds" >&2; exit 2; }
+[[ "$WATCH_TIMEOUT" =~ ^[0-9]+$ && "$WATCH_TIMEOUT" -gt 0 ]] \
+  || { echo "--watch-timeout needs a positive number of seconds" >&2; exit 2; }
 
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
 need glab; need jq
 
 enc() { jq -rn --arg s "$1" '$s|@uri'; }
 
+# Commands that fail are reported and collected instead of ending the script,
+# so one unreachable group does not stop the work on the remaining ones. The
+# collected commands are printed again at the end.
+FAILED=()
 run() {
-  if [[ "$APPLY" == "1" ]]; then
-    "$@"
-  else
+  if [[ "$APPLY" != "1" ]]; then
     echo "  [dry-run] $*"
+    return 0
   fi
+  local err
+  err="$("$@" 2>&1 >/dev/null)" && return 0
+  echo "error $(tr '\n' ' ' <<<"$err" | tr -s ' ' | sed 's/^ *//; s/ *$//')" >&2
+  FAILED+=("$*")
+  return 1
 }
 
 # Links of a group as a JSON array. The API answers 404 with an object when a
@@ -81,6 +115,18 @@ links_of() {
   out="$(glab api "groups/$(enc "$1")/ldap_group_links" 2>/dev/null || true)"
   jq -c 'if type == "array" then . else [] end' <<<"${out:-null}"
 }
+
+# Members of a group as sorted "username:access_level" lines. Only real arrays
+# from the pages are used, so an error answer yields an empty list.
+members_of() {
+  glab api --paginate "groups/$(enc "$1")/members?per_page=100" 2>/dev/null \
+    | jq -rs '[.[] | arrays] | add // [] | .[] | "\(.username):\(.access_level)"' 2>/dev/null \
+    | sort || true
+}
+
+# printf for a possibly empty list: no line at all instead of one empty line.
+lines() { [[ -n "$1" ]] && printf '%s\n' "$1"; return 0; }
+count() { [[ -n "$1" ]] && wc -l <<<"$1" || echo 0; }
 
 # group_access of a cn/provider link inside a JSON array, empty when absent.
 access_in() {
@@ -150,7 +196,10 @@ for cn in "${CNS[@]}"; do
     exit 1
   fi
 done
-[[ ${#active_cns[@]} -gt 0 ]] || { echo "nothing to do"; exit 0; }
+if [[ ${#active_cns[@]} -eq 0 ]]; then
+  [[ "$FORCE_SYNC" == "1" ]] || { echo "nothing to do"; exit 0; }
+  echo "nothing to add, syncing only"
+fi
 
 # 3. Add each link to each target, skip what is already there.
 declare -A touched=()
@@ -171,39 +220,126 @@ for sg in "${targets[@]}"; do
     if [[ "$first_link" == "1" ]]; then
       # First LDAP link on this group: at next sync, direct members not in the
       # LDAP group are removed unless they are the last Owner or overridden.
-      direct="$(glab api "groups/${sg_enc}/members?per_page=100" | jq -r '.[] | "\(.username):\(.access_level)"' | paste -sd' ' -)"
+      direct="$(glab api "groups/${sg_enc}/members?per_page=100" 2>/dev/null | jq -r '.[] | "\(.username):\(.access_level)"' | paste -sd' ' -)" \
+        || direct="unknown (member listing failed)"
       echo "note  $sg gets its first LDAP link, direct members now: ${direct:-none}"
       first_link=0
     fi
     echo "add   $sg cn=$cn group_access=${ACCESS[$cn]}"
     args=(-X POST "groups/${sg_enc}/ldap_group_links" -f "cn=$cn" -f "provider=$PROVIDER" -F "group_access=${ACCESS[$cn]}")
     [[ -n "${MEMBER_ROLE[$cn]}" ]] && args+=(-F "member_role_id=${MEMBER_ROLE[$cn]}")
-    run glab api "${args[@]}"
-    touched["$sg"]=1
+    run glab api "${args[@]}" && touched["$sg"]=1
   done
 done
 
 # 4. Remove from parent.
 if [[ "$REMOVE_FROM_PARENT" == "1" ]]; then
   for cn in "${active_cns[@]}"; do
-    before="$(glab api --paginate "groups/${parent_enc}/members?per_page=100" \
-      | jq -s --argjson a "${ACCESS[$cn]}" 'add | [.[] | select(.access_level == $a)] | length')"
+    before="$(glab api --paginate "groups/${parent_enc}/members?per_page=100" 2>/dev/null \
+      | jq -s --argjson a "${ACCESS[$cn]}" 'add | [.[] | select(.access_level == $a)] | length')" \
+      || before="unknown"
     echo "remove $PARENT cn=$cn (members with access_level=${ACCESS[$cn]} before: $before)"
-    run glab api -X DELETE "groups/${parent_enc}/ldap_group_links" -f "cn=$cn" -f "provider=$PROVIDER"
-    touched["$PARENT"]=1
+    run glab api -X DELETE "groups/${parent_enc}/ldap_group_links" -f "cn=$cn" -f "provider=$PROVIDER" \
+      && touched["$PARENT"]=1
   done
 fi
 
-# 5. Trigger LDAP sync on every touched group, once each.
-if [[ "$SYNC" == "1" && ${#touched[@]} -gt 0 ]]; then
-  for g in $(printf '%s\n' "${!touched[@]}" | sort); do
+# 5. Trigger LDAP sync, once per group: on the groups that got a change, or with
+#    --force-sync on the parent and every target whether it changed or not. That
+#    is the way to catch up on a sync that failed in an earlier run, because a
+#    re-run finds the links in place and changes nothing.
+sync_groups=()
+if [[ "$SYNC" == "1" ]]; then
+  if [[ "$FORCE_SYNC" == "1" ]]; then
+    mapfile -t sync_groups < <(printf '%s\n' "$PARENT" "${targets[@]}" | sort -u)
+  elif [[ ${#touched[@]} -gt 0 ]]; then
+    mapfile -t sync_groups < <(printf '%s\n' "${!touched[@]}" | sort)
+  fi
+fi
+# The groups to follow with --watch: the ones that are synced here, or with
+# --no-sync the parent and every target, so that a sync started elsewhere can be
+# watched too.
+watch_groups=("${sync_groups[@]}")
+if [[ "$WATCH" == "1" && ${#watch_groups[@]} -eq 0 ]]; then
+  mapfile -t watch_groups < <(printf '%s\n' "$PARENT" "${targets[@]}" | sort -u)
+fi
+
+# The membership before the syncs are triggered is the baseline --watch reports
+# against, so it has to be read first.
+declare -A before_members=()
+if [[ "$WATCH" == "1" && "$APPLY" == "1" ]]; then
+  for g in "${watch_groups[@]}"; do
+    before_members["$g"]="$(members_of "$g")"
+  done
+fi
+
+if [[ ${#sync_groups[@]} -gt 0 ]]; then
+  for g in "${sync_groups[@]}"; do
     echo "sync  $g"
-    if [[ "$APPLY" == "1" ]]; then
-      glab api -X POST "groups/$(enc "$g")/ldap_sync" >/dev/null
-    else
-      echo "  [dry-run] glab api -X POST groups/$(enc "$g")/ldap_sync"
-    fi
+    run glab api -X POST "groups/$(enc "$g")/ldap_sync" || true
   done
   echo "sync is asynchronous. Check later with:"
   echo "  glab api --paginate 'groups/${parent_enc}/members?per_page=100' | jq -s 'add | map(.access_level) | group_by(.) | map({(.[0]|tostring): length}) | add'"
+fi
+
+# 6. Follow the membership of the watched groups. There is no API for the state
+#    of an LDAP sync, so the members themselves are the progress: every poll
+#    prints who was added and who was removed since the poll before. A group is
+#    done once it comes back unchanged WATCH_SETTLE times in a row.
+if [[ "$WATCH" == "1" ]]; then
+  if [[ "$APPLY" != "1" ]]; then
+    echo "  [dry-run] watch ${#watch_groups[@]} group(s) every ${WATCH_INTERVAL}s for up to ${WATCH_TIMEOUT}s"
+  else
+    echo
+    echo "watch ${#watch_groups[@]} group(s) every ${WATCH_INTERVAL}s, up to ${WATCH_TIMEOUT}s (ctrl-c to stop)"
+    for g in "${watch_groups[@]}"; do
+      echo "watch $g: $(count "${before_members[$g]}") member(s) before the sync"
+    done
+    declare -A quiet=()
+    started="$SECONDS"
+    while :; do
+      sleep "$WATCH_INTERVAL"
+      elapsed=$(( SECONDS - started ))
+      pending=0
+      for g in "${watch_groups[@]}"; do
+        [[ "${quiet[$g]:-0}" -ge "$WATCH_SETTLE" ]] && continue
+        now="$(members_of "$g")"
+        if [[ "$now" == "${before_members[$g]}" ]]; then
+          quiet["$g"]=$(( ${quiet[$g]:-0} + 1 ))
+        else
+          added="$(comm -13 <(lines "${before_members[$g]}") <(lines "$now") | sed 's/^/+/' | paste -sd' ' -)"
+          removed="$(comm -23 <(lines "${before_members[$g]}") <(lines "$now") | sed 's/^/-/' | paste -sd' ' -)"
+          change="$added"
+          [[ -n "$removed" ]] && change="${change:+$change }$removed"
+          printf 'watch %3ds %s %s\n' "$elapsed" "$g" "$change"
+          before_members["$g"]="$now"
+          quiet["$g"]=0
+        fi
+        [[ "${quiet[$g]:-0}" -ge "$WATCH_SETTLE" ]] || pending=$(( pending + 1 ))
+      done
+      if [[ "$pending" -eq 0 ]]; then
+        printf 'watch %3ds settled, no change any more\n' "$elapsed"
+        for g in "${watch_groups[@]}"; do
+          echo "watch $g: $(count "${before_members[$g]}") member(s) now"
+        done
+        break
+      fi
+      if [[ "$elapsed" -ge "$WATCH_TIMEOUT" ]]; then
+        printf 'watch %3ds giving up, %d group(s) still changing\n' "$elapsed" "$pending" >&2
+        break
+      fi
+    done
+  fi
+fi
+
+# 7. Report what did not work. Re-running the script adds the links that are
+#    still missing, but it only syncs the groups it changes, so a sync that
+#    failed on its own needs --force-sync or the printed command.
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+  echo >&2
+  echo "${#FAILED[@]} call(s) failed, repeat with:" >&2
+  for cmd in "${FAILED[@]}"; do
+    echo "  $cmd" >&2
+  done
+  exit 1
 fi

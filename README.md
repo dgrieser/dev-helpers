@@ -554,7 +554,9 @@ excluded nor already linked, and with `--remove-from-parent` deleted from
 `<group>` afterwards. Nothing is changed without `--apply`.
 ```bash
 gitlab-move-ldap-sync <group> --cn <CN> [--cn <CN> ...] [--exclude <subgroup>] \
-                      [--provider <id>] [--apply] [--remove-from-parent] [--no-sync]
+                      [--provider <id>] [--apply] [--remove-from-parent] \
+                      [--force-sync|--no-sync] \
+                      [--watch] [--watch-interval <sec>] [--watch-timeout <sec>]
 ```
 Requires `glab` and `jq`, and an account that may administer the LDAP group
 links of the groups involved.
@@ -574,6 +576,36 @@ Removing a link from the parent likewise drops the members it brought in, so
 run the move first, wait for the sync, verify the subgroups, and only then
 repeat with `--remove-from-parent`.
 
-Every touched group is synced with `POST /groups/:id/ldap_sync` unless
-`--no-sync` is given. The sync is asynchronous; the script prints the command
-to check the resulting member counts afterwards.
+Every group that was changed is synced with `POST /groups/:id/ldap_sync`
+unless `--no-sync` is given. The sync is asynchronous; the script prints the
+command to check the resulting member counts afterwards.
+
+`--force-sync` syncs `<group>` and every target subgroup instead, whether they
+were changed or not, and refuses to be combined with `--no-sync`. That is how a
+sync is caught up on: a re-run finds the links already in place, changes
+nothing and would therefore sync nothing.
+
+`--watch` follows what the syncs do. GitLab exposes no state of a running LDAP
+sync, so the membership itself is the progress: the members of every synced
+group are read once before the syncs are triggered, and every poll afterwards
+prints the users that appeared and disappeared since the poll before, with
+their access level, not just a count.
+
+```
+watch  10s asylum/charts +m.mustermann:20 +e.beispiel:20
+watch  20s asylum -m.mustermann:20 -e.beispiel:20
+watch  40s settled, no change any more
+```
+
+A group counts as done once two polls in a row come back unchanged, and the run
+ends when every group is done or `--watch-timeout` (default 300 seconds) is
+reached; `--watch-interval` (default 10 seconds) is the time between two polls.
+With `--no-sync` the watch still works and follows `<group>` and every target,
+which is useful when the sync was started somewhere else.
+
+No single failure stops the run: a group that cannot be linked, unlinked or
+synced is reported and the remaining groups are still worked on. At the end
+every failed call is listed again as the command that repeats it, and the
+script exits with status 1. Re-running the script adds the links that are
+still missing; for a sync that failed on its own, use `--force-sync` or the
+printed command.
