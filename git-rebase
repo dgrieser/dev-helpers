@@ -9,7 +9,9 @@ usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} [OPTIONS] [BRANCH]
 
-Rebase the current branch onto BRANCH and work through the conflicts.
+Replay the commits of the current branch on top of BRANCH and work through
+the conflicts. Only the current branch is moved, BRANCH itself stays where it
+is.
 
 An unfinished rebase is picked up where it stopped: its state is shown and
 continue, skip or abort is picked from a list, so the step a stopped rebase
@@ -19,8 +21,9 @@ git-add and the rebase goes on once the index has none left. A finished rebase
 leaves the branch diverged from its remote, so handing it to git-push for the
 force push it now needs is offered.
 
-BRANCH                  Branch, tag or commit to rebase onto. Asked for when
-                        omitted, defaulting to the default remote branch.
+BRANCH                  Branch, tag or commit to use as the new base. Asked
+                        for when omitted, defaulting to the default remote
+                        branch.
 
 Options:
     -i, --interactive   Edit the list of commits before they are replayed
@@ -196,7 +199,7 @@ print_state() {
     onto="${rebase_onto}"
     [ -n "${onto}" ] && onto="$(git -C "${git_dir}" rev-parse --short "${onto}" 2>/dev/null || echo "${onto}")"
 
-    printf 'Rebasing %s onto %s' "${rebase_branch:-HEAD}" "${onto:-?}" 1>&2
+    printf 'Replaying %s on top of %s' "${rebase_branch:-HEAD}" "${onto:-?}" 1>&2
     if [[ "${rebase_step}" =~ ^[0-9]+$ ]] && [[ "${rebase_total}" =~ ^[0-9]+$ ]] \
         && [ "${rebase_total}" -gt 0 ]; then
         printf ' (%s/%s)' "${rebase_step}" "${rebase_total}" 1>&2
@@ -297,11 +300,11 @@ resolve_base() {
     fi
     if [ "${assume_yes}" -eq 1 ]; then
         base="$(default_base)"
-        [ -n "${base}" ] || fail "Cannot determine the branch to rebase onto."
+        [ -n "${base}" ] || fail "Cannot determine the new base."
         return 0
     fi
     need_cmd prompt-complete
-    base="$(ref_candidates | prompt-complete --prompt "Rebase onto:" --prefill "$(default_base)")"
+    base="$(ref_candidates | prompt-complete --prompt "New base:" --prefill "$(default_base)")"
     [ "${?}" -eq 130 ] && abort
     [ -n "${base}" ] || abort
 }
@@ -576,9 +579,9 @@ finish_rebase() {
     count="$(git -C "${git_dir}" rev-list --count "${base}..HEAD" 2>/dev/null)"
     echo 1>&2
     if [ -n "${branch}" ]; then
-        echo "Rebased \"${branch}\"${count:+ (${count} commit(s))} onto \"${base}\"." 1>&2
+        echo "Replayed${count:+ ${count} commit(s) of} \"${branch}\" on top of \"${base}\"." 1>&2
     else
-        echo "Rebased a detached HEAD onto \"${base}\"." 1>&2
+        echo "Replayed a detached HEAD on top of \"${base}\"." 1>&2
     fi
     # the literal commit, because the next git command clobbers ORIG_HEAD
     echo "Undo with: git reset --hard ${before_sha}" 1>&2
@@ -740,7 +743,7 @@ git -C "${git_dir}" rev-parse --verify --quiet HEAD >/dev/null \
 # rebase is resumed instead of a second one being started on top of it
 if rebase_state; then
     [ -z "${base_arg}" ] \
-        || warning "A rebase onto $(describe_commit "${rebase_onto}") is in progress, ignoring \"${base_arg}\"."
+        || warning "A rebase on top of $(describe_commit "${rebase_onto}") is in progress, ignoring \"${base_arg}\"."
     [ -z "${fetch_arg}" ] || warning "A rebase is in progress, ignoring --fetch/--no-fetch."
     [ -z "${autostash_arg}" ] || warning "A rebase is in progress, ignoring --autostash/--no-autostash."
     [ "${interactive}" -eq 0 ] \
@@ -768,14 +771,14 @@ fi
 
 resolve_base
 [ -n "${current}" ] && [ "${base}" == "${current}" ] \
-    && fail "Cannot rebase \"${current}\" onto itself."
+    && fail "Cannot use \"${current}\" as its own base."
 
 resolve_fetch
 [ "${do_fetch}" -eq 1 ] && fetch_base
 resolve_base_ref
 [ "${do_fetch}" -eq 1 ] || warn_stale_base
 
-[ "${base}" == "${current}" ] && fail "Cannot rebase \"${current}\" onto itself."
+[ "${base}" == "${current}" ] && fail "Cannot use \"${current}\" as its own base."
 
 count="$(git -C "${git_dir}" rev-list --count "${base}..HEAD" 2>/dev/null)"
 [ -z "${count}" ] && count=0
@@ -787,11 +790,14 @@ fi
 [ "${interactive}" -eq 1 ] && rebase_args+=("--interactive")
 resolve_autostash
 
-echo "Branch: ${current:-HEAD}" 1>&2
-echo "Onto:   ${base} ($(describe_commit "${base}"))" 1>&2
+echo "Branch:   ${current:-HEAD}" 1>&2
+echo "New base: ${base} ($(describe_commit "${base}"))" 1>&2
+echo 1>&2
+echo "These ${count} commit(s) of \"${current:-HEAD}\" are replayed on top of \"${base}\"," 1>&2
+echo "which itself is not changed:" 1>&2
 git-color -C "${git_dir}" log --oneline "${base}..HEAD" 1>&2
 echo 1>&2
-confirm "Rebase ${count} commit(s) of \"${current:-HEAD}\" onto \"${base}\"?" "yes" || abort
+confirm "Replay ${count} commit(s) of \"${current:-HEAD}\" on top of \"${base}\"?" "yes" || abort
 
 before_sha="$(git -C "${git_dir}" rev-parse --verify --quiet HEAD)"
 resolve_loop start

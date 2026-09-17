@@ -466,7 +466,9 @@ hint GitLab and GitHub answer such a push with settles the question for free;
 without it the provider is asked.
 
 ### git-rebase
-Rebase the current branch onto another one, or pick up a rebase that stopped.
+Replay the commits of the current branch on top of another branch, or pick up a
+rebase that stopped. Only the current branch is moved, the base it is replayed
+on top of stays where it is.
 ```bash
 git-rebase [-i|--interactive] [--fetch|--no-fetch] [--autostash|--no-autostash] [-p|--push] [-P|--no-push] [-y|--yes] [BRANCH]
 ```
