@@ -244,7 +244,8 @@ list_gitlab_pipelines_json() {
     if [ "${#statuses[@]}" -eq 0 ]; then
         qs="$(build_qs "${common[@]}")"
         part="$(glab api "${page_flag[@]}" "${base}${qs}")" || return 1
-        # --paginate emits one array per page; slurp them into a single array
+        # --paginate emits one array per page in older glab and one merged array
+        # in current glab; slurping handles both
         part="$(jq -s 'add // []' <<< "${part}")"
         [ "${paginate}" -eq 0 ] && [ "$(jq 'length' <<< "${part}")" -ge "${per_page}" ] && TRUNCATED=1
         out="${part}"

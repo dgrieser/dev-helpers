@@ -56,7 +56,11 @@ project_id() {
 }
 
 list_packages_json() {
-    glab api "projects/$(project_id)/packages" --paginate && return 0 || return 1
+    local out=""
+    out="$(glab api "projects/$(project_id)/packages" --paginate)" || return 1
+    # --paginate emits one array per page in older glab and one merged array in
+    # current glab; slurping handles both
+    jq -s 'add // []' <<< "${out}"
 }
 
 filter_packages_json() {

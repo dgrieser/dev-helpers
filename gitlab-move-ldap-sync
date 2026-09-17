@@ -159,10 +159,11 @@ glab api "groups/${parent_enc}" >/dev/null 2>&1 || { echo "group not found or no
 [[ "$APPLY" == "1" ]] || echo "DRY RUN (add --apply to change anything)"
 echo "group=$PARENT provider=$PROVIDER exclude=${EXCLUDES[*]:-none}"
 
-# 1. Subgroups and their current links. --paginate prints one JSON array per
-#    page, jq -s add merges them.
+# 1. Subgroups and their current links. --paginate prints either one JSON array
+#    per page or a single merged array, depending on the glab version, so the
+#    pages are slurped and merged for both.
 mapfile -t subgroups < <(glab api --paginate "groups/${parent_enc}/subgroups?per_page=100" \
-  | jq -rs 'add | .[].full_path' | sort)
+  | jq -rs '[.[] | arrays] | add // [] | .[].full_path' | sort)
 targets=()
 declare -A sg_links=()
 for sg in "${subgroups[@]}"; do
@@ -333,7 +334,7 @@ fi
 if [[ "$REMOVE_FROM_PARENT" == "1" ]]; then
   for cn in "${active_cns[@]}"; do
     before="$(glab api --paginate "groups/${parent_enc}/members?per_page=100" 2>/dev/null \
-      | jq -s --argjson a "${ACCESS[$cn]}" 'add | [.[] | select(.access_level == $a)] | length')" \
+      | jq -s --argjson a "${ACCESS[$cn]}" '[.[] | arrays] | add // [] | [.[] | select(.access_level == $a)] | length')" \
       || before="unknown"
     echo "remove $PARENT cn=$cn (members with access_level=${ACCESS[$cn]} before: $before)"
     run glab api -X DELETE "groups/${parent_enc}/ldap_group_links" -f "cn=$cn" -f "provider=$PROVIDER" \

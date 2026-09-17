@@ -56,12 +56,20 @@ project_id() {
 }
 
 list_repositories_json() {
-    glab api "projects/$(project_id)/registry/repositories" --paginate && return 0 || return 1
+    local out=""
+    out="$(glab api "projects/$(project_id)/registry/repositories" --paginate)" || return 1
+    # --paginate emits one array per page in older glab and one merged array in
+    # current glab; slurping handles both
+    jq -s 'add // []' <<< "${out}"
 }
 
 list_repository_tags_json() {
     local repository_id="${1}"
-    glab api "projects/$(project_id)/registry/repositories/${repository_id}/tags" --paginate 2>/dev/null
+    local out=""
+    out="$(glab api "projects/$(project_id)/registry/repositories/${repository_id}/tags" --paginate 2>/dev/null)" || return 1
+    # --paginate emits one array per page in older glab and one merged array in
+    # current glab; slurping handles both
+    jq -s 'add // []' <<< "${out}"
 }
 
 filter_tags_json() {
@@ -87,7 +95,7 @@ filter_tags_json() {
 
     while IFS=$'\t' read -r repository_id repository; do
         [ -z "${repository_id}" ] && continue
-        tags="$(list_repository_tags_json "${repository_id}")"
+        tags="$(list_repository_tags_json "${repository_id}")" || continue
         [ -z "${tags}" ] && continue
         out="$(jq \
             --argjson acc "${out}" \
