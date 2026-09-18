@@ -33,6 +33,14 @@ fail() {
     exit 1
 }
 
+# the picker comes back the moment a key that was handed the terminal is through,
+# so a message of one of them is only read if it is waited for
+notify() {
+    error "${1}"
+    read -rsn 1 -p "Press any key to continue"
+    echo 1>&2
+}
+
 RED='\e[31m'
 GREEN='\e[32m'
 YELLOW='\e[33m'
@@ -141,6 +149,18 @@ is_conflict() {
     return ${exit_code}
 }
 
+# a submodule is a gitlink in the index, and that is what tells it apart from the
+# files the picker edits, diffs and deletes: git lists it as a single path like
+# any other change
+is_submodule() {
+    local path="${1}"; shift
+    local entry=""
+    # the entry of the path itself decides it, so the lookup is scoped to it
+    # instead of walking the index of the whole repo
+    IFS= read -r -d '' entry < <(${SUBMODULE_LIST_CMD} -- "${path}")
+    [[ "${entry}" == 160000\ * ]] && [[ "${entry#*$'\t'}" == "${path}" ]]
+}
+
 has_conflict_markers() {
     local path="${1}"; shift
     git -C "${GIT_DIR}" diff --no-color --check -- "${path}" | grep -q 'leftover conflict marker'
@@ -241,12 +261,17 @@ UNSTAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --'
 STAGED_LIST_CMD='git --no-pager -C '"${GIT_DIR}"' diff --cached --name-only -z'
 STAGED_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --cached --'
 
+SUBMODULE_LIST_CMD='git -C '"${GIT_DIR}"' ls-files --stage -z'
+
 CONFLICT_LIST_CMD='git -C '"${GIT_DIR}"' diff --name-only --diff-filter=U -z'
 CONFLICT_DIFF_CMD='git --no-pager -C '"${GIT_DIR}"' diff --color=always --'
 
 STAGE_CMD='git -C '"${GIT_DIR}"' add --'
 UNSTAGE_CMD='git -C '"${GIT_DIR}"' restore --staged --'
-RESET_CMD='git -C '"${GIT_DIR}"' restore --'
+# without --recurse-submodules git-restore leaves a submodule alone and says
+# nothing about it: neither the commit it is checked out at nor the changes inside
+# it are reverted. For every other path the flag does nothing
+RESET_CMD='git -C '"${GIT_DIR}"' restore --recurse-submodules --'
 IGNORE_CMD='git-ignore'
 
 PREVIEW_COMMAND='case {2} in'
@@ -269,11 +294,19 @@ if [ -n "${key_result}" ]; then
             exit 1
             ;;
         ctrl-e)
-            edit_file "${current_state}" "${path}"
+            if is_submodule "${path}"; then
+                notify "Not editing '${path}': is a submodule"
+            else
+                edit_file "${current_state}" "${path}"
+            fi
             exit 0
             ;;
         alt-v)
-            vimdiff_file "${path}"
+            if is_submodule "${path}"; then
+                notify "Not diffing '${path}': is a submodule"
+            else
+                vimdiff_file "${path}"
+            fi
             exit 0
             ;;
         alt-+|insert|+)
@@ -322,7 +355,9 @@ if [ -n "${unstage_path}" ]; then
 fi
 if [ -n "${delete_path}" ]; then
     # if staged, unstage AND delete file; if not staged, delete file only
-    if is_untracked "${delete_path}"; then
+    if is_submodule "${delete_path}"; then
+        error "Not deleting '${delete_path}': is a submodule"
+    elif is_untracked "${delete_path}"; then
         (
             cd "${GIT_DIR}"
             ${RM_CMD} "${delete_path}"
