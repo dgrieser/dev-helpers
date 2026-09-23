@@ -367,13 +367,14 @@ away. Show lists the requests in an fzf picker with the request and its diff in
 the preview: `enter` runs the chosen action (show by default), `tab` switches the state filter (open, merged, closed, all),
 `ctrl-b` asks for the branch filter on a list of the repository's branches,
 `ctrl-d` shows the diff, `ctrl-o` opens it in the browser, `ctrl-y` copies a
-channel message, `ctrl-f` shows the comments, `alt-a` approves, `alt-m` merges,
+channel message, `ctrl-f` shows the comments, `ctrl-s` switches to its source
+branch, `alt-a` approves, `alt-m` merges,
 `alt-i` creates an issue from it, `alt-c` closes it, `alt-x` deletes it, and
 `esc` goes back. Every other action is a key of the picker or an answer of the
 shown request, so the menu stays two lines long.
 
-All of those but the chosen action and creating an issue - both of which report
-something the picker would draw over - act inside the picker: showing the diff
+All of those but the chosen action, creating an issue and switching to the
+branch - all of which report something the picker would draw over - act inside the picker: showing the diff
 or the comments hands the terminal to the pager, opening the browser and copying
 the message keep the screen and report above the header, and the two filters,
 approving, merging, closing and deleting reload the list so what changed shows.

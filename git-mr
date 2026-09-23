@@ -19,15 +19,16 @@ C_RESET=$'\033[0m'
 
 LIST_HEADER=$'ID\tSTATE\tUPDATED\tAUTHOR\tBRANCHES\tTITLE'
 
-# the picker stays open for everything but its main action and creating an
-# issue, both of which report something the picker would draw over: reading a
+# the picker stays open for everything but its main action, creating an issue and
+# switching to the branch of a request, all of which report something the picker
+# would draw over: reading a
 # detail hands the terminal over to the pager, opening the browser and copying
 # report through the message above the header, and the two filters change what
 # the list holds. Only a filter and the actions that change an item reload the
 # list, since a reload is an API call. The main action ends the picker, because
 # the branch filter asks its question on the input line and takes enter for its
 # answer, which leaves no enter to handle inside the picker.
-LIST_KEYS="enter,esc,ctrl-q,alt-i"
+LIST_KEYS="enter,esc,ctrl-q,ctrl-s,alt-i"
 LIST_EXEC_KEYS="ctrl-d,ctrl-f"
 LIST_SILENT_KEYS="ctrl-o,ctrl-y"
 LIST_RELOAD_KEYS="tab,ctrl-b,alt-a"
@@ -133,7 +134,7 @@ create or show. It starts on show when the branch filter has an open request
 and on create when it has none. Show lists the requests in a picker with the
 request and its diff in the preview, both filters among its keys:
 
-$(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
+$(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,ctrl-s:switch to its source branch,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
 Showing a request prints the view of the provider, without its diff, and asks
 what to do with it: approve + merge (tab switches to approve or merge only),
@@ -1032,6 +1033,31 @@ delete_source_branch() {
     return "${rc}"
 }
 
+# the source branch of a request is fetched from its remote when it is not local
+# yet, and pulled after the checkout when it is, so what is checked out is what
+# the request holds
+checkout_item() {
+    local n="${1}"
+    local source_branch remote
+
+    source_branch="$(item_json "${n}" | jq -r '.source // empty')"
+    if [ -z "${source_branch}" ] || [ "${source_branch}" = "-" ]; then
+        error "Failed to determine the source branch of ${NOUN} ${n}"
+        return 1
+    fi
+    need_cmd git-checkout
+    if ! git show-ref --verify --quiet "refs/heads/${source_branch}"; then
+        remote="$(item_remote)"
+        git-color fetch "${remote}" "${source_branch}:refs/remotes/${remote}/${source_branch}" 1>&2 \
+            || { error "Failed to fetch ${source_branch} from ${remote}"; return 1; }
+        git-checkout "${source_branch}" 1>&2 || return 1
+        return 0
+    fi
+    git-checkout "${source_branch}" 1>&2 || return 1
+    git-color pull 1>&2 || warning "Failed to pull ${source_branch}"
+    return 0
+}
+
 # a closed or deleted request leaves its source branch behind; the default and
 # the production branch are never offered
 ask_delete_source_branch() {
@@ -1576,6 +1602,7 @@ handle_list_key() {
     case "${key}" in
         enter)  run_action "${action}" "${n}" ;;
         ctrl-y) run_action copy "${n}" ;;
+        ctrl-s) checkout_item "${n}" ;;
         alt-a)  run_action approve "${n}" ;;
         alt-m)  run_action merge "${n}" ;;
         alt-i)  run_action issue "${n}" ;;
@@ -1590,7 +1617,7 @@ handle_list_key() {
 }
 
 list_key_descs() {
-    printf 'enter:%s,tab:state,ctrl-b:branch,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:comments,alt-a:approve,alt-m:merge,alt-i:issue,alt-c:close%s,esc:back' \
+    printf 'enter:%s,tab:state,ctrl-b:branch,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:comments,ctrl-s:switch,alt-a:approve,alt-m:merge,alt-i:issue,alt-c:close%s,esc:back' \
         "$(action_label "${action}")" \
         "$([ "${provider}" != "github" ] && printf ',alt-x:delete')"
 }
