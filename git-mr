@@ -128,18 +128,17 @@ Work with GitLab merge requests and GitHub pull requests. The provider is
 detected from the remote, so ${APP_NAME} handles both; git-mr and git-pr are
 the same command.
 
-Without an action a prompt-select menu asks for one of the three ways in:
-create, show or copy. It starts on show when the branch filter has an open
-request and on create when it has none. Show and copy list the requests in a
-picker with the request and its diff in the preview, both filters among its
-keys:
+Without an action a prompt-select menu asks for one of the two ways in:
+create or show. It starts on show when the branch filter has an open request
+and on create when it has none. Show lists the requests in a picker with the
+request and its diff in the preview, both filters among its keys:
 
 $(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
 Showing a request prints the view of the provider, without its diff, and asks
 what to do with it: approve + merge (tab switches to approve or merge only),
-its comments or its diff. Reading one of those comes back to the question, esc
-returns to the picker.
+copy a channel message, its comments or its diff. Copying and reading one of
+those come back to the question, esc returns to the picker.
 
 When the approval is refused, because the request is your own or the approval
 rights are missing, and when the provider blocks the merge although the approval
@@ -582,22 +581,28 @@ show_items() {
         "review=Approve + Merge" \
         "approve=Approve" \
         "merge=Merge" \
+        "copy=Copy message" \
         "comments=Comments" \
         "diff=Diff"
 }
 
 # the view of a request and what to do with it. Reading its comments or its diff
 # hands the terminal to the pager and comes back here, so the view is printed
-# again; getting the request in is what ends the question, and esc leaves it.
+# again; copying the message keeps the screen, so the view stays and the line
+# reporting the copy stands above the question. Getting the request in is what
+# ends the question, and esc leaves it.
 show_request() {
     local n="${1}"
-    local choice
+    local choice redraw=1
 
     need_cmd prompt-select
     while true; do
-        echo 1>&2
-        show_view "${n}" || return 1
-        echo 1>&2
+        if [ "${redraw}" -eq 1 ]; then
+            echo 1>&2
+            show_view "${n}" || return 1
+            echo 1>&2
+        fi
+        redraw=1
         # esc steps back to the picker, so it is no abort worth a line of its own
         choice="$(show_items | prompt-select --prompt "$(item_ref "${n}"):" \
             --cycle "${SHOW_CYCLE}" --no-abort-message)" || return 2
@@ -606,6 +611,7 @@ show_request() {
                 run_action "${choice}" "${n}"
                 return "${?}"
                 ;;
+            copy)     copy_message "${n}"; redraw=0 ;;
             comments) show_feedback "${n}" ;;
             diff)     show_diff "${n}" ;;
             *)        return 2 ;;
@@ -1427,10 +1433,11 @@ list_footer() {
         "${C_LABEL}" "$(state_filter_label)" "${C_RESET}"
 }
 
-# the three ways in, nothing else: every other action is a key of the picker,
-# and so are the two filters, which used to be entries here
+# the two ways in, nothing else: every other action is a key of the picker or
+# an answer of the question that follows a shown request, and so are the two
+# filters, which used to be entries here
 menu_items() {
-    printf '%s\n' "create" "show" "copy"
+    printf '%s\n' "create" "show"
 }
 
 print_context() {
@@ -1510,7 +1517,7 @@ run_menu() {
                 create_request
                 return "${?}"
                 ;;
-            show|copy)
+            show)
                 action="${choice}"
                 write_state
                 pick_list

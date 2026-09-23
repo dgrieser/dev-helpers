@@ -360,18 +360,17 @@ detected from the remote, so `git-mr` and `git-pr` are the same command.
 Approve, merge, create, close, delete, copy a channel message, create an issue,
 or show the review feedback.
 
-Without an action a `prompt-select` menu asks for one of the three ways in:
-`create`, `show` or `copy`. It starts on `show` when the branch filter has an
-open request and on `create` when it has none, so the usual case is one `enter`
-away. Show and copy list the requests in an fzf picker with the request and its
-diff in the preview: `enter` runs the chosen action
-(show by default), `tab` switches the state filter (open, merged, closed, all),
+Without an action a `prompt-select` menu asks for one of the two ways in:
+`create` or `show`. It starts on `show` when the branch filter has an open
+request and on `create` when it has none, so the usual case is one `enter`
+away. Show lists the requests in an fzf picker with the request and its diff in
+the preview: `enter` runs the chosen action (show by default), `tab` switches the state filter (open, merged, closed, all),
 `ctrl-b` asks for the branch filter on a list of the repository's branches,
 `ctrl-d` shows the diff, `ctrl-o` opens it in the browser, `ctrl-y` copies a
 channel message, `ctrl-f` shows the comments, `alt-a` approves, `alt-m` merges,
 `alt-i` creates an issue from it, `alt-c` closes it, `alt-x` deletes it, and
-`esc` goes back. Every other action is a key of the picker, so the menu stays
-three lines long.
+`esc` goes back. Every other action is a key of the picker or an answer of the
+shown request, so the menu stays two lines long.
 
 All of those but the chosen action and creating an issue - both of which report
 something the picker would draw over - act inside the picker: showing the diff
@@ -382,9 +381,9 @@ Only those reload, since a reload is an API call.
 
 `enter` shows the request the way its provider does - `glab mr view` or
 `gh pr view`, without the diff - and asks what to do with it: `Approve + Merge`,
-which `tab` switches to `Approve` or `Merge` alone, `Comments` or `Diff`.
-Reading the comments or the diff comes back to the question, `esc` returns to
-the picker. Getting the request in needs no confirmation of its own, since the
+which `tab` switches to `Approve` or `Merge` alone, `Copy message`, `Comments`
+or `Diff`. Copying the channel message or reading the comments or the diff comes
+back to the question, `esc` returns to the picker. Getting the request in needs no confirmation of its own, since the
 question is asked on the view of the request.
 
 The context printed before the picker opens is off the screen while it runs, so
