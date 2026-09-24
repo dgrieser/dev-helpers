@@ -65,6 +65,9 @@ GITLAB_BLOCKED_STATUSES="not_approved ci_must_pass ci_still_running discussions_
 PIPELINE_RUNNING_STATES="created waiting_for_resource preparing pending running scheduled queued in_progress requested waiting expected"
 PIPELINE_UNSUCCESSFUL_STATES="failed canceled cancelled manual blocked failure error timed_out startup_failure action_required stale"
 
+# how often a pipeline that is waited for before the merge is asked about
+PIPELINE_POLL_SECONDS=10
+
 JQ_STATE_COLOR='
     def statecolor:
         if . == "open" or . == "opened" then "\u001b[32m"
@@ -138,8 +141,9 @@ $(key_help "enter:the chosen action (show by default),tab:switch the state filte
 
 Showing a request prints the view of the provider, without its diff, and asks
 what to do with it: approve + merge (tab switches to approve or merge only),
-copy a channel message, its comments or its diff. Copying and reading one of
-those come back to the question, esc returns to the picker.
+copy a channel message, its comments or its diff. Copying the message ends
+there, reading the comments or the diff comes back to the question, esc returns
+to the picker.
 
 When the approval is refused, because the request is your own or the approval
 rights are missing, and when the provider blocks the merge although the approval
@@ -149,8 +153,10 @@ so; GitLab --auto-merge=false), leaving the merge to the provider until every
 requirement is met (--auto, on GitLab --auto-merge), or leaving the request
 alone. Above that question stand the state of the pipeline and what the provider
 still waits for, so the question is answered against what is actually blocking.
-A running pipeline is the one the provider waits for, so waiting is the
-preselected answer while one runs. When the provider blocks nothing, the refused
+While a pipeline runs, waiting for it leads the answers and is preselected:
+the pipeline is polled until it is done, then the request is merged, or force
+merged when something besides the pipeline still blocks it. A pipeline that
+ends without success brings the question back. When the provider blocks nothing, the refused
 approval was not required for the merge, and a plain merge leads the answers.
 
 An auto-merge waits for the pipeline, so the pipelines of the source branch are
@@ -589,21 +595,17 @@ show_items() {
 
 # the view of a request and what to do with it. Reading its comments or its diff
 # hands the terminal to the pager and comes back here, so the view is printed
-# again; copying the message keeps the screen, so the view stays and the line
-# reporting the copy stands above the question. Getting the request in is what
-# ends the question, and esc leaves it.
+# again. Copying the message or getting the request in is what ends the
+# question, and esc leaves it.
 show_request() {
     local n="${1}"
-    local choice redraw=1
+    local choice
 
     need_cmd prompt-select
     while true; do
-        if [ "${redraw}" -eq 1 ]; then
-            echo 1>&2
-            show_view "${n}" || return 1
-            echo 1>&2
-        fi
-        redraw=1
+        echo 1>&2
+        show_view "${n}" || return 1
+        echo 1>&2
         # esc steps back to the picker, so it is no abort worth a line of its own
         choice="$(show_items | prompt-select --prompt "$(item_ref "${n}"):" \
             --cycle "${SHOW_CYCLE}" --no-abort-message)" || return 2
@@ -612,7 +614,10 @@ show_request() {
                 run_action "${choice}" "${n}"
                 return "${?}"
                 ;;
-            copy)     copy_message "${n}"; redraw=0 ;;
+            copy)
+                copy_message "${n}"
+                return "${?}"
+                ;;
             comments) show_feedback "${n}" ;;
             diff)     show_diff "${n}" ;;
             *)        return 2 ;;
@@ -926,18 +931,59 @@ merge_item() {
 # above them
 bypass_items() {
     local plain="${1}"
+    local wait="${2:-}"
+    local bypass_flag auto_flag
 
-    [ "${plain}" -eq 1 ] && printf '%s\t%s\n' "merge" "Merge"
     if [ "${provider}" = "github" ]; then
-        printf '%s\t%s\n' \
-            "bypass" "Force merge (--admin)" \
-            "auto"   "Set auto-merge (--auto)"
+        bypass_flag="--admin"
+        auto_flag="--auto"
     else
-        printf '%s\t%s\n' \
-            "bypass" "Force merge (--auto-merge=false)" \
-            "auto"   "Set auto-merge (--auto-merge)"
+        bypass_flag="--auto-merge=false"
+        auto_flag="--auto-merge"
     fi
+    case "${wait}" in
+        wait)        printf '%s\t%s\n' "wait" "Wait for ${CI_LABEL,,}, then merge" ;;
+        wait_bypass) printf '%s\t%s\n' "wait_bypass" "Wait for ${CI_LABEL,,}, then force merge (${bypass_flag})" ;;
+    esac
+    [ "${plain}" -eq 1 ] && printf '%s\t%s\n' "merge" "Merge"
+    printf '%s\t%s\n' \
+        "bypass" "Force merge (${bypass_flag})" \
+        "auto"   "Set auto-merge (${auto_flag})"
     printf '%s\t%s\n' "abort" "Leave the ${NOUN} as it is"
+}
+
+# a running pipeline is polled until it is done; the state it ends in is printed,
+# the caller decides what follows from it. Ctrl-C leaves the request alone
+wait_for_item_pipeline() {
+    local n="${1}"
+    local state
+    local started="${SECONDS}"
+
+    printf 'Waiting for %s of %s (ctrl-c to abort)...\n' \
+        "${CI_LABEL,,}" "$(item_ref "${n}")" 1>&2
+    while :; do
+        state="$(item_pipeline_state "${n}")"
+        [ "${state}" != "running" ] && break
+        [ -t 2 ] && printf '\r%s%s:%s running (%ds)' "${C_LABEL}" "${CI_LABEL}" "${C_RESET}" \
+            "$((SECONDS - started))" 1>&2
+        sleep "${PIPELINE_POLL_SECONDS}"
+    done
+    [ -t 2 ] && printf '\r\033[K' 1>&2
+    printf '%s%s:%s %s\n' "${C_LABEL}" "${CI_LABEL}" "${C_RESET}" \
+        "$(pipeline_state_label "${state}")" 1>&2
+    printf '%s\n' "${state}"
+}
+
+# waiting only makes a plain merge possible when the pipeline is all the
+# provider waits for; anything else still blocks it once the pipeline is done,
+# so the wait then leads into the forced merge
+wait_mode() {
+    local requirement="${1}"
+
+    case "${requirement}" in
+        ""|ci_still_running|ci_must_pass|status_checks_must_pass) printf 'wait\n' ;;
+        *) printf 'wait_bypass\n' ;;
+    esac
 }
 
 # the state of the request as the provider sees it leads the question: its
@@ -948,8 +994,9 @@ bypass_items() {
 ask_merge_bypass() {
     local n="${1}"
     local retry="${2:-0}"
-    local choice pipeline_state requirement prompt rc
+    local choice pipeline_state requirement prompt rc state
     local plain=0
+    local wait=""
     local select_args=()
 
     need_cmd prompt-select
@@ -965,10 +1012,27 @@ ask_merge_bypass() {
         printf '%sBlocked:%s nothing\n' "${C_LABEL}" "${C_RESET}" 1>&2
         prompt="Merge '$(item_ref "${n}")'?"
     fi
-    [ "${pipeline_state}" = "running" ] && select_args+=("--default" "auto")
-    choice="$(bypass_items "${plain}" | prompt-select --prompt "${prompt}" \
+    if [ "${pipeline_state}" = "running" ]; then
+        wait="$(wait_mode "${requirement}")"
+        select_args+=("--default" "${wait}")
+    fi
+    choice="$(bypass_items "${plain}" "${wait}" | prompt-select --prompt "${prompt}" \
         --delimiter '\t' "${select_args[@]}")" || { echo "Abort." 1>&2; return 2; }
     case "${choice}" in
+        wait|wait_bypass)
+            state="$(wait_for_item_pipeline "${n}")"
+            # a pipeline that ended without success is a new situation, the
+            # question is asked again against it
+            [ "${state}" = "unsuccessful" ] && { ask_merge_bypass "${n}" 1; return "${?}"; }
+            if [ "${choice}" = "wait_bypass" ]; then
+                merge_item "${n}" bypass
+                return "${?}"
+            fi
+            merge_item "${n}"
+            rc=$?
+            [ "${rc}" -eq "${RC_MERGE_BLOCKED}" ] && { ask_merge_bypass "${n}" 1; rc=$?; }
+            return "${rc}"
+            ;;
         merge)
             merge_item "${n}"
             rc=$?

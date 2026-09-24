@@ -383,8 +383,8 @@ Only those reload, since a reload is an API call.
 `enter` shows the request the way its provider does - `glab mr view` or
 `gh pr view`, without the diff - and asks what to do with it: `Approve + Merge`,
 which `tab` switches to `Approve` or `Merge` alone, `Copy message`, `Comments`
-or `Diff`. Copying the channel message or reading the comments or the diff comes
-back to the question, `esc` returns to the picker. Getting the request in needs no confirmation of its own, since the
+or `Diff`. Copying the channel message ends there, reading the comments or the
+diff comes back to the question, `esc` returns to the picker. Getting the request in needs no confirmation of its own, since the
 question is asked on the view of the request.
 
 The context printed before the picker opens is off the screen while it runs, so
@@ -407,7 +407,8 @@ are missing - and when the provider blocks the merge although the approval went
 through, the merge offers three ways on: merging past the requirements (GitHub
 `--admin`, GitLab `--auto-merge=false`), leaving the merge to the provider until
 every requirement is met (`--auto`, on GitLab `--auto-merge`), or leaving the
-request alone. An auto-merge waits for the pipeline, so the pipelines of the
+request alone. While the pipeline runs, a fourth way leads: wait for it, then
+merge, or force merge when something besides the pipeline still blocks. An auto-merge waits for the pipeline, so the pipelines of the
 source branch are shown with [git-pipe](#git-pipe) once it is set.
 ```bash
 git-mr [-c|--create] [-a|--approve] [-M|--merge] [-C|--close] [-D|--delete] \
