@@ -165,7 +165,9 @@ shown with git-pipe once it is set.
 Actions:
   -c, --create            create a request from the current branch
   -a, --approve           approve the selected request
-  -M, --merge             merge the selected request
+  -M, --merge             merge the selected request and delete its source
+                          branch; when it is checked out, switch to the
+                          target branch and pull it
   -C, --close             close the selected request, then ask whether to
                           delete its source branch
   -D, --delete            delete the selected request (GitLab only), then ask
@@ -885,19 +887,55 @@ show_item_pipeline() {
     return 0
 }
 
+# the provider removed the source branch of a merged request, what is left of it
+# is the local branch. When it is checked out, the target branch takes its place
+# and is pulled, so the merge is there locally too. The default and the
+# production branch are never deleted
+cleanup_merged_branch() {
+    local json="${1}"
+    local source_branch target_branch default current
+
+    source_branch="$(jq -r '.source // empty' <<< "${json}")"
+    target_branch="$(jq -r '.target // empty' <<< "${json}")"
+    [ -z "${source_branch}" ] || [ "${source_branch}" = "-" ] && return 0
+    default="$(git-default 2>/dev/null)"
+    [ "${source_branch}" = "${default}" ] && return 0
+    [ -n "${prod_branch}" ] && [ "${source_branch}" = "${prod_branch}" ] && return 0
+    current="$(git branch --show-current 2>/dev/null)"
+    if [ "${current}" = "${source_branch}" ]; then
+        [ -z "${target_branch}" ] || [ "${target_branch}" = "-" ] && target_branch="${default}"
+        [ -z "${target_branch}" ] && { error "Failed to determine the target branch"; return 1; }
+        need_cmd git-checkout
+        need_cmd git-pull
+        echo 1>&2
+        git-checkout "${target_branch}" 1>&2 \
+            || { error "Failed to check out ${target_branch}"; return 1; }
+        git-pull 1>&2 || warning "Failed to pull ${target_branch}"
+    fi
+    git show-ref --verify --quiet "refs/heads/${source_branch}" || return 0
+    # a squash or rebase merge leaves the branch unmerged in the eyes of git,
+    # so -d would refuse it
+    git-color branch -D "${source_branch}" 1>&2 \
+        || { error "Failed to delete branch ${source_branch}"; return 1; }
+}
+
 # mode is empty for a plain merge, bypass to merge past the requirements and auto
 # to leave the merge to the provider until they are met
 merge_item() {
     local n="${1}"
     local mode="${2:-}"
-    local reason
+    local reason json
     local merge_args=()
 
     if [ -z "${mode}" ] && reason="$(merge_blocked_reason "${n}")"; then
         error "Cannot merge $(item_ref "${n}"): ${remote_host} reports ${reason}"
         return "${RC_MERGE_BLOCKED}"
     fi
+    json="$(item_json "${n}")"
     if [ "${provider}" = "github" ]; then
+        # gh asks whether to delete the branch otherwise; with --repo it only
+        # deletes the branch on GitHub, the local one is cleaned up below
+        merge_args+=("--delete-branch")
         case "${mode}" in
             # --admin merges through the branch protection rules, so a missing
             # approval does not block the merge
@@ -909,17 +947,30 @@ merge_item() {
         gh pr merge "${n}" --repo "${github_repo_selector}" "${merge_args[@]}" \
             || { error "Failed to merge $(item_ref "${n}")"; return 1; }
     else
+        # GitLab removes the source branch once the request is merged, an
+        # auto-merge included; the local one is cleaned up below
+        merge_args+=("--remove-source-branch")
         case "${mode}" in
             # glab has no bypass flag, it only decides whether the merge waits
             # for the pipeline; the merge goes through unless the project makes
             # the missing approval mandatory
             bypass) merge_args+=("--auto-merge=false") ;;
             auto)   merge_args+=("--auto-merge") ;;
+            # without the flag glab asks whether to set auto-merge as soon as
+            # the request has a pipeline; a plain merge is one that goes through
+            # now, the question was answered before
+            *)      merge_args+=("--auto-merge=false") ;;
         esac
         glab mr merge "${n}" "${merge_args[@]}" \
             || { error "Failed to merge $(item_ref "${n}")"; return 1; }
     fi
-    [ "${mode}" = "auto" ] && show_item_pipeline "${n}"
+    # an auto-merge has not merged anything yet, the local branch stays until
+    # it has
+    if [ "${mode}" = "auto" ]; then
+        show_item_pipeline "${n}"
+        return 0
+    fi
+    cleanup_merged_branch "${json}"
     return 0
 }
 
