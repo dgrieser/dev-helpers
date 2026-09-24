@@ -154,10 +154,13 @@ requirement is met (--auto, on GitLab --auto-merge), or leaving the request
 alone. Above that question stand the state of the pipeline and what the provider
 still waits for, so the question is answered against what is actually blocking.
 While a pipeline runs, waiting for it leads the answers and is preselected:
-the pipeline is polled until it is done, then the request is merged, or force
-merged when something besides the pipeline still blocks it. A pipeline that
-ends without success brings the question back. When the provider blocks nothing, the refused
-approval was not required for the merge, and a plain merge leads the answers.
+the pipelines of the source branch open in git-pipe, which ends on its own once
+they succeeded, then the request is merged, or force merged when something
+besides the pipeline still blocks it. A pipeline that fails keeps git-pipe open
+to look into and retry (alt-x); leaving it, or a pipeline that ended without
+success, brings the question back. Without git-pipe the pipeline is polled.
+When the provider blocks nothing, the refused approval was not required for the
+merge, and a plain merge leads the answers.
 
 An auto-merge waits for the pipeline, so the pipelines of the source branch are
 shown with git-pipe once it is set.
@@ -1025,6 +1028,34 @@ wait_for_item_pipeline() {
     printf '%s\n' "${state}"
 }
 
+# The wait happens in git-pipe, which shows the pipelines of the source branch
+# and ends on its own once they succeeded; one that fails leaves it open to look
+# into and retry. Whatever made git-pipe end, the state of the request is asked
+# for again afterwards: the pipeline of a request may be one git-pipe does not
+# list, and a git-pipe left by hand leaves a pipeline that is still running or
+# did not succeed. Without git-pipe or a terminal the pipeline is polled instead.
+watch_item_pipeline() {
+    local n="${1}"
+    local source_branch state
+
+    source_branch="$(item_json "${n}" | jq -r '.source // empty')"
+    if ! command -v git-pipe >/dev/null 2>&1 || [ -z "${source_branch}" ] \
+        || [ ! -t 0 ] || [ ! -t 2 ]; then
+        wait_for_item_pipeline "${n}"
+        return 0
+    fi
+    if git-pipe status --ref "${source_branch}" --no-tags --wait --exit-on-success </dev/tty >/dev/tty; then
+        # git-pipe saw it succeed, the request may take a moment to follow
+        wait_for_item_pipeline "${n}"
+        return 0
+    fi
+    # the question that follows names the state itself
+    state="$(item_pipeline_state "${n}")"
+    # a pipeline that is still running was left alone, the wait with it
+    [ "${state}" = "running" ] && state="left"
+    printf '%s\n' "${state}"
+}
+
 # waiting only makes a plain merge possible when the pipeline is all the
 # provider waits for; anything else still blocks it once the pipeline is done,
 # so the wait then leads into the forced merge
@@ -1071,10 +1102,12 @@ ask_merge_bypass() {
         --delimiter '\t' "${select_args[@]}")" || { echo "Abort." 1>&2; return 2; }
     case "${choice}" in
         wait|wait_bypass)
-            state="$(wait_for_item_pipeline "${n}")"
+            state="$(watch_item_pipeline "${n}")"
             # a pipeline that ended without success is a new situation, the
-            # question is asked again against it
+            # question is asked again against it; so is a wait that was left
+            # while the pipeline still runs
             [ "${state}" = "unsuccessful" ] && { ask_merge_bypass "${n}" 1; return "${?}"; }
+            [ "${state}" = "left" ] && { ask_merge_bypass "${n}" "${retry}"; return "${?}"; }
             if [ "${choice}" = "wait_bypass" ]; then
                 merge_item "${n}" bypass
                 return "${?}"

@@ -28,13 +28,13 @@ HEADER="ID  STATUS  SOURCE  REF  USER  CREATED  URL"
 PICKER_COLUMNS="2,3,4,5,6"
 # only enter ends the pipeline list, and only to open the jobs of a pipeline: the
 # log pager gets the terminal handed over, the browser and the clipboard are
-# silent, and the status filter reloads the list it narrows down
+# silent, and the status filter and a retry reload the list they change
 KEYS="esc,ctrl-c,ctrl-d,enter"
 EXEC_KEYS="ctrl-l"
 SILENT_KEYS="ctrl-o,ctrl-y"
-RELOAD_KEYS="tab,ctrl-r"
-KEY_DESCS="enter:jobs,tab:running only,ctrl-r:refresh,ctrl-y:copy url,ctrl-o:open,ctrl-l:logs"
-KEY_DESCS_HELP="enter jobs, tab running only, ctrl-r refresh, ctrl-y copy url, ctrl-o open, ctrl-l logs"
+RELOAD_KEYS="tab,ctrl-r,alt-x"
+KEY_DESCS="enter:jobs,tab:running only,ctrl-r:refresh,ctrl-y:copy url,ctrl-o:open,ctrl-l:logs,alt-x:retry"
+KEY_DESCS_HELP="enter jobs, tab running only, ctrl-r refresh, ctrl-y copy url, ctrl-o open, ctrl-l logs, alt-x retry"
 
 # the jobs of a pipeline, opened with enter: the log pager gets the terminal
 # handed over, the browser and the clipboard are silent, esc returns to the
@@ -42,8 +42,13 @@ KEY_DESCS_HELP="enter jobs, tab running only, ctrl-r refresh, ctrl-y copy url, c
 JOBS_KEYS="esc,ctrl-c,ctrl-d"
 JOBS_EXEC_KEYS="enter"
 JOBS_SILENT_KEYS="ctrl-o,ctrl-y"
-JOBS_KEY_DESCS="enter:log,ctrl-y:copy url,ctrl-o:open,esc:back"
-JOBS_KEY_DESCS_HELP="enter log, ctrl-y copy url, ctrl-o open, esc back"
+JOBS_RELOAD_KEYS="alt-x"
+JOBS_KEY_DESCS="enter:log,ctrl-y:copy url,ctrl-o:open,alt-x:retry,esc:back"
+JOBS_KEY_DESCS_HELP="enter log, ctrl-y copy url, ctrl-o open, alt-x retry, esc back"
+
+# the statuses the pipelines of a commit may end in for --exit-on-success to
+# count them as a success, as long as one of them actually succeeded
+SUCCESS_STATES="success skipped neutral"
 
 usage() {
     cat <<EOF 1>&2
@@ -68,6 +73,15 @@ The log of a job that is still running is shown as it grows; on GitHub the
 logs of a job only become available once it finished, so its steps take their
 place until then.
 
+alt-x asks before it retries the selected pipeline, or the selected job in the
+jobs picker. GitLab retries the jobs of a pipeline that failed or were canceled,
+GitHub reruns every job of a workflow run.
+
+--exit-on-success ends the picker once every pipeline of the newest commit of
+the ref succeeded, with exit code 0; in the jobs picker it is the commit of the
+pipeline the jobs belong to. A pipeline that fails leaves the picker open, so it
+can be looked into and retried, and leaving it by hand exits non-zero.
+
 COMMAND
     status                  show CI pipeline status for a ref
     search                  list pipelines matching variable, log, or status filters
@@ -88,6 +102,8 @@ Options:
                             of reporting none right away; a pipeline a push just
                             triggered takes a moment to exist
                             (default ${WAIT_SECONDS_DEFAULT} when no value is given)
+        --exit-on-success   end the picker with exit code 0 once the pipelines of
+                            the newest commit succeeded
 
 search options:
         --all-refs            do not filter by ref (search all refs)
@@ -307,6 +323,7 @@ list_github_pipelines_json() {
             status: (if .status == "completed" then (.conclusion // .status) else .status end),
             source: .event,
             ref: .head_branch,
+            sha: .head_sha,
             user: (.triggering_actor.login // .actor.login // "-"),
             created_at,
             web_url: .html_url
@@ -896,6 +913,7 @@ pipeline_detail_json() {
                 status: (if .status == "completed" then (.conclusion // .status) else .status end),
                 source: .event,
                 ref: .head_branch,
+                sha: .head_sha,
                 user: (.triggering_actor.login // .actor.login // "-"),
                 created_at,
                 web_url: .html_url
@@ -907,6 +925,7 @@ pipeline_detail_json() {
                 status,
                 source,
                 ref,
+                sha,
                 user: (.user.username // "-"),
                 created_at,
                 web_url
@@ -929,6 +948,96 @@ copy_url() {
     need_cmd clip
     printf '%s' "${url}" | clip || { error "Failed to copy the URL"; return 1; }
     echo "${url} copied to clipboard." 1>&2
+}
+
+# a retried pipeline or job runs again, so a watcher that stopped once nothing
+# ran anymore is put back on its interval
+resume_watching() {
+    [ -n "${FZF_WITH_HEADER_WATCH_RESET:-}" ] && touch "${FZF_WITH_HEADER_WATCH_RESET}"
+    return 0
+}
+
+# GitLab retries the jobs of a pipeline that failed or were canceled, GitHub
+# reruns every job of a workflow run; both refuse a pipeline that is still running
+retry_pipeline() {
+    local pid="${1}"
+    local out
+
+    if [ "${provider}" = "github" ]; then
+        out="$(gh api "${github_api_args[@]}" -X POST \
+            "repos/${github_repository}/actions/runs/${pid}/rerun" 2>&1)"
+    else
+        out="$(glab api -X POST "projects/$(project_id)/pipelines/${pid}/retry" 2>&1)"
+    fi || { error "Failed to retry pipeline ${pid}: $(tail -n 1 <<< "${out}")"; return 1; }
+    resume_watching
+    echo "Pipeline ${pid} retried." 1>&2
+}
+
+# GitLab retries a job as a new one of the same pipeline, GitHub reruns it as a
+# new attempt of the same run
+retry_job() {
+    local jid="${1}"
+    local out
+
+    if [ "${provider}" = "github" ]; then
+        out="$(gh api "${github_api_args[@]}" -X POST \
+            "repos/${github_repository}/actions/jobs/${jid}/rerun" 2>&1)"
+    else
+        out="$(glab api -X POST "projects/$(project_id)/jobs/${jid}/retry" 2>&1)"
+    fi || { error "Failed to retry job ${jid}: $(tail -n 1 <<< "${out}")"; return 1; }
+    resume_watching
+    echo "Job ${jid} retried." 1>&2
+}
+
+# The state of the pipelines of one commit: running while any of them is,
+# success once all of them ended in SUCCESS_STATES and one of them succeeded,
+# failed otherwise. Without a sha it is the newest commit of the ref, which on
+# GitHub is where every workflow a push started has a run of its own.
+commit_pipelines_state() {
+    local json="${1}"
+    local sha="${2:-}"
+
+    jq -r --arg ref "${ref}" --arg sha "${sha}" --arg ok "${SUCCESS_STATES}" "${JQ_ACTIVE}"'
+        ($ok | split(" ")) as $oks
+        | [ .[] | select($ref == "" or .ref == $ref) ] as $p
+        | (if $sha != "" then $sha else ($p | first | .sha) end) as $s
+        | [ $p[] | select(.sha == $s) | .status ] as $st
+        | if ($st | length) == 0 then "none"
+          elif any($st[]; active) then "running"
+          elif all($st[]; . as $x | $oks | index($x)) and any($st[]; . == "success") then "success"
+          else "failed" end
+    ' <<< "${json}"
+}
+
+# the jobs view lists one pipeline, so the pipelines of its commit are asked for
+# separately: the ones of its ref, the other workflows of the push on GitHub
+jobs_commit_state() {
+    local jobs_ref sha json
+
+    jobs_ref="$(jq -r '.ref // empty' <<< "${jobs_pipeline_json}")"
+    sha="$(jq -r '.sha // empty' <<< "${jobs_pipeline_json}")"
+    { [ -z "${jobs_ref}" ] || [ -z "${sha}" ]; } && { echo "none"; return 0; }
+    json="$(ref="${jobs_ref}"; per_page="${PER_PAGE_DEFAULT}"; paginate=0; statuses=()
+            list_pipelines_json 2>/dev/null)" || { echo "none"; return 0; }
+    ref="${jobs_ref}" commit_pipelines_state "${json}" "${sha}"
+}
+
+# every reload of a view run with --exit-on-success writes down where the commit
+# it watches stands, for the result event to read back, see pick_pipelines
+record_commit_state() {
+    local state="${1}"
+
+    [ "${exit_on_success:-0}" -eq 1 ] || return 0
+    printf '%s\n' "${state}" > "${CHECK_FILE}"
+}
+
+# fired by every result of the picker, a typed query included, so it only reads
+# back what the last reload found: a success ends the picker as if a key had
+# been pressed, and the file tells the run that started it why
+success_check() {
+    [ "$(cat "${CHECK_FILE}" 2>/dev/null)" = "success" ] || return 0
+    : > "${success_file}"
+    printf 'print(success)+accept'
 }
 
 # tab switches the status filter of the pipeline list; the file is what the
@@ -973,15 +1082,28 @@ handle_key() {
         esc|ctrl-c|ctrl-d)
             exit 255
             ;;
+        success)
+            # --exit-on-success saw the pipelines of the commit succeed
+            exit 1
+            ;;
     esac
     [ -z "${pid}" ] && exit 0
 
     case "${key}" in
         enter)
             # leaving the jobs of a pipeline with esc returns to this list,
-            # ending it there ends this one as well
-            PROJECT_ID="${PROJECT_ID:-}" "${0}" --jobs "${pid}" --watch "${watch_seconds}" || exit 0
+            # ending it there ends this one as well; with --exit-on-success the
+            # jobs view ends both on a success and leaves the file saying so
+            # where this run looks for it
+            local jobs_args=()
+            [ "${exit_on_success}" -eq 1 ] && jobs_args+=("--exit-on-success")
+            PROJECT_ID="${PROJECT_ID:-}" GIT_PIPE_SUCCESS_FILE="${success_file}" \
+                "${0}" --jobs "${pid}" --watch "${watch_seconds}" "${jobs_args[@]}" || exit 0
             exit 1
+            ;;
+        alt-x)
+            retry_pipeline "${pid}"
+            exit 0
             ;;
         ctrl-y)
             copy_url "${url}"
@@ -1014,7 +1136,7 @@ handle_jobs_key() {
             # back to the pipeline list this view was opened from
             exit 255
             ;;
-        ctrl-c|ctrl-d)
+        ctrl-c|ctrl-d|success)
             exit 1
             ;;
     esac
@@ -1023,6 +1145,10 @@ handle_jobs_key() {
     case "${key}" in
         enter)
             show_job_log "${jid}"
+            exit 0
+            ;;
+        alt-x)
+            retry_job "${jid}"
             exit 0
             ;;
         ctrl-y)
@@ -1058,6 +1184,8 @@ write_state() {
         printf 'grep_pattern=%q\n' "${grep_pattern}"
         printf 'per_page=%q\n' "${per_page}"
         printf 'paginate=%q\n' "${paginate}"
+        printf 'exit_on_success=%q\n' "${exit_on_success}"
+        printf 'success_file=%q\n' "${success_file}"
         # the jobs view lists one pipeline instead of a result set of its own
         printf 'jobs_pipeline_id=%q\n' "${jobs_pipeline_id}"
         printf 'jobs_pipeline_json=%q\n' "${jobs_pipeline_json}"
@@ -1118,6 +1246,19 @@ filter_active() {
     fi
 }
 
+# the actions of the result event: the preview keeps up with every reload of the
+# list, and --exit-on-success ends the picker once a reload found the pipelines
+# of the commit succeeded
+result_bind() {
+    local actions=()
+
+    [ "${refresh}" -eq 1 ] && actions+=("refresh-preview")
+    [ "${exit_on_success}" -eq 1 ] && actions+=("transform(${APP_NAME} --id ${id} --success-check)")
+    [ "${#actions[@]}" -eq 0 ] && return 0
+    local IFS='+'
+    printf -- '--bind=result:%s\n' "${actions[*]}"
+}
+
 pick_pipelines() {
     local watch_args=() refresh_bind=()
 
@@ -1127,15 +1268,15 @@ pick_pipelines() {
         watch_args=("--watch" "${watch_seconds}"
                     "--watch-delay" "${WATCH_FIRST_DELAY}"
                     "--watch-while" "${APP_NAME} --id ${id} --active")
-        # keep the job preview in sync with every reload of the list
-        refresh_bind=("--bind=result:refresh-preview")
     fi
+    mapfile -t refresh_bind < <(result_bind)
 
     fzf-with-header --key-command "${APP_NAME} --id ${id} --key" \
                     --key-descriptions "${KEY_DESCS}" \
                     --exec-keys "${EXEC_KEYS}" \
                     --silent-keys "${SILENT_KEYS}" \
                     --reload-keys "${RELOAD_KEYS}" \
+                    --confirm "alt-x:Retry pipeline {1}?" \
                     --columns "${PICKER_COLUMNS}" \
                     --command "${APP_NAME} --id ${id} --print" \
                     --footer-prefix "${APP_NAME} --id ${id} --footer" \
@@ -1156,13 +1297,15 @@ pick_jobs() {
         # preview of a running one keeps up with its log
         watch_args=("--watch" "${watch_seconds}"
                     "--watch-while" "${APP_NAME} --id ${id} --active")
-        refresh_bind=("--bind=result:refresh-preview")
     fi
+    mapfile -t refresh_bind < <(result_bind)
 
     fzf-with-header --key-command "${APP_NAME} --id ${id} --jobs-key" \
                     --key-descriptions "${JOBS_KEY_DESCS}" \
                     --exec-keys "${JOBS_EXEC_KEYS}" \
                     --silent-keys "${JOBS_SILENT_KEYS}" \
+                    --reload-keys "${JOBS_RELOAD_KEYS}" \
+                    --confirm "alt-x:Retry job {1}?" \
                     --columns "${PICKER_COLUMNS}" \
                     --command "${APP_NAME} --id ${id} --jobs-print" \
                     --footer-prefix "${APP_NAME} --id ${id} --jobs-footer" \
@@ -1241,6 +1384,7 @@ preview_id=""
 jobs_pipeline_id=""
 jobs_pipeline_json=""
 remote_repository=""
+exit_on_success=0
 
 add_status() {
     statuses+=("${1}")
@@ -1302,6 +1446,12 @@ while [ "${#}" -gt 0 ]; do
             else
                 wait_seconds="${WAIT_SECONDS_DEFAULT}"
             fi
+            ;;
+        --exit-on-success)
+            exit_on_success=1
+            ;;
+        --success-check)
+            mode="success-check"
             ;;
         --id)
             shift
@@ -1412,6 +1562,12 @@ USERS_FILE="/tmp/${APP_NAME}-${id}.users"
 # both fetched once and dropped by ctrl-r
 TAGS_FILE="/tmp/${APP_NAME}-${id}.tags"
 TAGPIPES_FILE="/tmp/${APP_NAME}-${id}.tagpipes"
+# where the commit a view run with --exit-on-success watches stands, and the file
+# saying it succeeded; a jobs view opened from the pipeline list leaves the
+# latter where the list looks for it
+CHECK_FILE="/tmp/${APP_NAME}-${id}.check"
+SUCCESS_FILE="/tmp/${APP_NAME}-${id}.success"
+success_file="${GIT_PIPE_SUCCESS_FILE:-${SUCCESS_FILE}}"
 
 # --key, --preview and --print are called by the picker with the id of the run
 # that produced the result set; reuse its state and cached pipelines or jobs
@@ -1426,9 +1582,18 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
     fi
     case "${mode}" in
         active)
+            # the jobs of a pipeline can all be done while it, or another
+            # pipeline of its commit, is still running; --exit-on-success
+            # waits for those as well
+            [ -n "${jobs_pipeline_id}" ] && [ "${exit_on_success}" -eq 1 ] \
+                && [ "$(cat "${CHECK_FILE}" 2>/dev/null)" = "running" ] && exit 0
             # the cached list is the one of the view that asked, pipelines or jobs
             has_active "$(cat "${JSON_FILE}")"
             exit $?
+            ;;
+        success-check)
+            success_check
+            exit 0
             ;;
         footer)
             print_footer
@@ -1453,6 +1618,8 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
                 [ -n "${pipelines}" ] && printf '%s\n' "${pipelines}" > "${JSON_FILE}"
             fi
             [ -z "${pipelines}" ] && pipelines="$(cat "${JSON_FILE}")"
+            [ "${exit_on_success}" -eq 1 ] \
+                && record_commit_state "$(commit_pipelines_state "${pipelines}")"
             print_pipelines "$(filter_active "${pipelines}")"
             exit 0
             ;;
@@ -1477,6 +1644,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
                 [ -n "${jobs}" ] && printf '%s\n' "${jobs}" > "${JSON_FILE}"
             fi
             [ -z "${jobs}" ] && jobs="$(cat "${JSON_FILE}")"
+            [ "${exit_on_success}" -eq 1 ] && record_commit_state "$(jobs_commit_state)"
             print_jobs "${jobs}"
             exit 0
             ;;
@@ -1484,7 +1652,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
 fi
 
 case "${mode}" in
-    key|preview|active|footer|jobs-key|jobs-preview|jobs-print|jobs-footer)
+    key|preview|active|footer|success-check|jobs-key|jobs-preview|jobs-print|jobs-footer)
         fail "no cached pipeline result for id ${id}"
         ;;
 esac
@@ -1525,7 +1693,24 @@ fi
 
 [ "${provider}" = "gitlab" ] && project_id >/dev/null
 
-trap 'rm -f "${STATE_FILE}" "${JSON_FILE}" "${FILTER_FILE}" "${USERS_FILE}" "${TAGS_FILE}" "${TAGPIPES_FILE}"' EXIT
+trap 'rm -f "${STATE_FILE}" "${JSON_FILE}" "${FILTER_FILE}" "${USERS_FILE}" "${TAGS_FILE}" "${TAGPIPES_FILE}" "${CHECK_FILE}" "${SUCCESS_FILE}"' EXIT
+
+# With --exit-on-success only a success exits 0: a picker left by hand exits 1
+# unless it ended with an error of its own. A jobs view opened from the pipeline
+# list keeps its exit codes, the list tells them apart itself.
+success_exit_code() {
+    local rc="${1}"
+
+    [ "${exit_on_success}" -eq 1 ] || { printf '%s\n' "${rc}"; return 0; }
+    [ -n "${GIT_PIPE_SUCCESS_FILE:-}" ] && { printf '%s\n' "${rc}"; return 0; }
+    if [ -e "${success_file}" ]; then
+        printf '0\n'
+    elif [ "${rc}" -eq 0 ]; then
+        printf '1\n'
+    else
+        printf '%s\n' "${rc}"
+    fi
+}
 
 if [ -n "${jobs_pipeline_id}" ]; then
     jobs="$(list_jobs_json "${jobs_pipeline_id}")" \
@@ -1548,7 +1733,7 @@ if [ -n "${jobs_pipeline_id}" ]; then
         printf '%s\n' "${jobs}" > "${JSON_FILE}"
         write_state
         pick_jobs
-        exit_code=$?
+        exit_code="$(success_exit_code "$?")"
     fi
     if [ "${cded}" -eq 1 ]; then
         cd - &> /dev/null || fail "failed to return to previous directory"
@@ -1583,7 +1768,13 @@ else
     printf '%s\n' "${pipelines}" > "${JSON_FILE}"
     write_state
     pick_pipelines "${pipelines}"
-    exit_code=$?
+    exit_code="$(success_exit_code "$?")"
+fi
+# without the picker there is nothing to wait in, the pipelines of the commit
+# either succeeded already or they did not
+if [ "${exit_on_success}" -eq 1 ] && [ ! -e "${success_file}" ] \
+    && [ "$(commit_pipelines_state "${pipelines}")" != "success" ]; then
+    [ "${exit_code}" -eq 0 ] && exit_code=1
 fi
 
 if [ "${cded}" -eq 1 ]; then

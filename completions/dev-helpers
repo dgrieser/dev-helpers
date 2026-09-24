@@ -536,7 +536,7 @@ _git-pipe()
         --var|--grep|-n|--limit|-q|--query|-w|--watch|--tags|-j|--jobs) return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-h --help -r --repo -j --jobs --ref --all-refs --tags --no-tags -q --query -w --watch -p --print --var --grep --source -s --status --failed --succeeded --aborted --running --pending --manual --skipped -n --limit -a --all -o --output"
+        __dh_compgen "-h --help -r --repo -j --jobs --ref --all-refs --tags --no-tags -q --query -w --watch --wait --exit-on-success -p --print --var --grep --source -s --status --failed --succeeded --aborted --running --pending --manual --skipped -n --limit -a --all -o --output"
     elif [ "${COMP_CWORD}" -eq 1 ]; then
         __dh_compgen "status search"
     fi

@@ -412,7 +412,11 @@ through, the merge offers three ways on: merging past the requirements (GitHub
 `--admin`, GitLab `--auto-merge=false`), leaving the merge to the provider until
 every requirement is met (`--auto`, on GitLab `--auto-merge`), or leaving the
 request alone. While the pipeline runs, a fourth way leads: wait for it, then
-merge, or force merge when something besides the pipeline still blocks. An auto-merge waits for the pipeline, so the pipelines of the
+merge, or force merge when something besides the pipeline still blocks. The wait
+opens the pipelines of the source branch in [git-pipe](#git-pipe) with
+`--exit-on-success`, so it continues on its own once they succeeded; a failed
+pipeline keeps git-pipe open to look into and retry, and leaving it brings the
+question back. An auto-merge waits for the pipeline, so the pipelines of the
 source branch are shown with [git-pipe](#git-pipe) once it is set.
 ```bash
 git-mr [-c|--create] [-a|--approve] [-M|--merge] [-C|--close] [-D|--delete] \
@@ -433,15 +437,17 @@ Show GitLab CI or GitHub Actions pipeline status for a ref, or search pipelines 
 
 Alongside the pipelines of the selected ref, the pipelines of the 3 most recent tags are shown (`--tags <N>` changes the number of tags, `--no-tags` turns them off). Each tag costs one API request, so a large `N` makes the lookup - and every `--watch` reload - slower.
 
-Results open in an interactive picker with the pipeline's jobs in the preview: `enter` steps into the pipeline and lists its jobs, `tab` narrows the list down to the pipelines that are still running and back, `ctrl-y` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs. Everything but `enter` happens inside the picker - the log pager gets the terminal handed over and returns to the same picker. The picker reloads once 10 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. A manual refresh (`ctrl-r`) refetches even after that, and if it brings up a running pipeline the auto-reloading resumes. Use `-p` or `-o json` for non-interactive output.
+Results open in an interactive picker with the pipeline's jobs in the preview: `enter` steps into the pipeline and lists its jobs, `tab` narrows the list down to the pipelines that are still running and back, `ctrl-y` copies the URL, `ctrl-o` opens it in the browser, `ctrl-l` shows the job logs, `alt-x` retries the pipeline after asking (GitLab retries the failed and canceled jobs, GitHub reruns the whole workflow run). Everything but `enter` happens inside the picker - the log pager gets the terminal handed over and returns to the same picker. The picker reloads once 10 seconds after it opened - a pipeline may have started in the meantime - and then keeps reloading every few seconds (`-w`, `-w 0` disables) as long as pipelines are still running, stopping once everything reached a final state. A manual refresh (`ctrl-r`) refetches even after that, and if it brings up a running pipeline the auto-reloading resumes. Use `-p` or `-o json` for non-interactive output.
 
-The jobs of a pipeline open in a picker of their own (`-j <pipeline>` opens it directly), with the details of the selected job and the tail of its log in the preview: `enter` pages the whole log, `ctrl-y` copies the job URL, `ctrl-o` opens it in the browser, `esc` returns to the pipeline list. The preview keeps up with the log of a job that is still running; on GitHub a job has no log before it finished, so its steps take the place of the log until then.
+The jobs of a pipeline open in a picker of their own (`-j <pipeline>` opens it directly), with the details of the selected job and the tail of its log in the preview: `enter` pages the whole log, `ctrl-y` copies the job URL, `ctrl-o` opens it in the browser, `alt-x` retries the job after asking, `esc` returns to the pipeline list. The preview keeps up with the log of a job that is still running; on GitHub a job has no log before it finished, so its steps take the place of the log until then.
+
+`--exit-on-success` ends the picker with exit code 0 once every pipeline of the newest commit of the ref succeeded (in the jobs picker: of the commit of its pipeline), which lets a script wait for CI and carry on. A failed pipeline leaves the picker open so it can be looked into and retried; leaving it by hand exits non-zero. Without the picker (`-p`, `-o json`) the exit code says whether the pipelines of the newest commit succeeded already.
 
 The ref, the source, the status and the user of a pipeline are columns of the list, so filtering by them is on the screen already. `--grep` and `--var` are not - they drop pipelines with nothing saying why the list is as short as it is - so the footer leads with them when they are used, followed by whether `tab` currently narrows the list down to what is running.
 ```bash
 git-pipe status [-r <project>] [--ref <ref>] [--tags <N>|--no-tags] [-q <query>] [-w <seconds>] \
-                [-p] [-o txt|json]
-git-pipe -j <pipeline> [-r <project>] [-w <seconds>] [-p] [-o txt|json]
+                [--wait [<seconds>]] [--exit-on-success] [-p] [-o txt|json]
+git-pipe -j <pipeline> [-r <project>] [-w <seconds>] [--exit-on-success] [-p] [-o txt|json]
 git-pipe search [-r <project>] [--ref <ref>|--all-refs] [--tags <N>|--no-tags] \
                 [--var <NAME[=VALUE]>] [--grep <pattern>] \
                 [--source <source>] [-s <status>|--failed|--succeeded|--aborted|...] \
