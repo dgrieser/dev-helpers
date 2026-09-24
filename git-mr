@@ -31,7 +31,7 @@ LIST_HEADER=$'ID\tSTATE\tUPDATED\tAUTHOR\tBRANCHES\tTITLE'
 LIST_KEYS="enter,esc,ctrl-q,ctrl-s,alt-i"
 LIST_EXEC_KEYS="ctrl-d,ctrl-f"
 LIST_SILENT_KEYS="ctrl-o,ctrl-y"
-LIST_RELOAD_KEYS="tab,ctrl-b,alt-a"
+LIST_RELOAD_KEYS="tab,ctrl-b,alt-a,alt-d"
 LIST_EXEC_RELOAD_KEYS="alt-m,alt-c,alt-x"
 
 # the row of the branch candidates that clears the branch filter
@@ -137,7 +137,7 @@ create or show. It starts on show when the branch filter has an open request
 and on create when it has none. Show lists the requests in a picker with the
 request and its diff in the preview, both filters among its keys:
 
-$(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,ctrl-s:switch to its source branch,alt-a:approve,alt-m:merge,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
+$(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,ctrl-s:switch to its source branch,alt-a:approve,alt-m:merge,alt-d:toggle draft,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
 Showing a request prints the view of the provider, without its diff, and asks
 what to do with it: approve + merge (tab switches to approve or merge only),
@@ -164,6 +164,9 @@ merge, and a plain merge leads the answers.
 
 An auto-merge waits for the pipeline, so the pipelines of the source branch are
 shown with git-pipe once it is set.
+
+A draft can not be merged, so approve + merge and merge ask first whether to
+mark a draft as ready; declining leaves the request alone.
 
 Actions:
   -c, --create            create a request from the current branch
@@ -1129,6 +1132,61 @@ ask_merge_bypass() {
     esac
 }
 
+# the draft state is changed with a command of its own on both providers; to is
+# draft or ready
+set_draft() {
+    local n="${1}"
+    local to="${2}"
+    local out rc=0
+
+    if [ "${provider}" = "github" ]; then
+        if [ "${to}" = "draft" ]; then
+            out="$(gh pr ready "${n}" --repo "${github_repo_selector}" --undo 2>&1)" || rc=1
+        else
+            out="$(gh pr ready "${n}" --repo "${github_repo_selector}" 2>&1)" || rc=1
+        fi
+    else
+        out="$(glab mr update "${n}" "--${to}" 2>&1)" || rc=1
+    fi
+    if [ "${rc}" -ne 0 ]; then
+        [ -n "${out}" ] && printf '%s\n' "${out}" 1>&2
+        error "Failed to mark $(item_ref "${n}") as ${to}"
+        return 1
+    fi
+    echo "$(item_ref "${n}") marked as ${to}." 1>&2
+}
+
+# a draft becomes ready and a ready request a draft; only an open request has a
+# draft state worth changing
+toggle_draft() {
+    local n="${1}"
+    local json
+
+    json="$(item_json "${n}")"
+    [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
+    case "$(jq -r '.state' <<< "${json}")" in
+        open|opened) ;;
+        *) error "$(item_ref "${n}") is not open"; return 1 ;;
+    esac
+    if [ "$(jq -r '.draft' <<< "${json}")" = "true" ]; then
+        set_draft "${n}" ready
+    else
+        set_draft "${n}" draft
+    fi
+}
+
+# neither provider merges a draft, so a merge of one asks right away whether to
+# mark it as ready, before anything is approved; declining leaves the request
+# alone
+ask_mark_ready() {
+    local n="${1}"
+
+    [ "$(item_json "${n}" | jq -r '.draft // false')" = "true" ] || return 0
+    prompt-yes-no "'$(item_ref "${n}")' is a draft, mark it as ready?" \
+        || { echo "Abort." 1>&2; return 2; }
+    set_draft "${n}" ready
+}
+
 approve_and_merge() {
     local n="${1}"
     local rc
@@ -1524,6 +1582,7 @@ create_request() {
 action_label() {
     case "${1}" in
         show)     echo "show" ;;
+        draft)    echo "toggle draft" ;;
         review)   echo "approve + merge" ;;
         approve)  echo "approve" ;;
         merge)    echo "merge" ;;
@@ -1545,7 +1604,10 @@ run_action() {
 
     case "${act}" in
         show)     show_request "${n}" ;;
-        review)   approve_and_merge "${n}" ;;
+        review)
+            ask_mark_ready "${n}" || return "${?}"
+            approve_and_merge "${n}"
+            ;;
         approve)
             approve_item "${n}"
             rc=$?
@@ -1554,11 +1616,13 @@ run_action() {
             return "${rc}"
             ;;
         merge)
+            ask_mark_ready "${n}" || return "${?}"
             merge_item "${n}"
             rc=$?
             [ "${rc}" -eq "${RC_MERGE_BLOCKED}" ] && { ask_merge_bypass "${n}"; rc=$?; }
             return "${rc}"
             ;;
+        draft)    toggle_draft "${n}" ;;
         close)    close_item "${n}" ;;
         delete)   delete_item "${n}" ;;
         copy)     copy_message "${n}" ;;
@@ -1753,6 +1817,7 @@ handle_list_key() {
         ctrl-s) checkout_item "${n}" ;;
         alt-a)  run_action approve "${n}" ;;
         alt-m)  run_action merge "${n}" ;;
+        alt-d)  run_action draft "${n}" ;;
         alt-i)  run_action issue "${n}" ;;
         alt-c)  run_action close "${n}" ;;
         alt-x)  run_action delete "${n}" ;;
@@ -1765,7 +1830,7 @@ handle_list_key() {
 }
 
 list_key_descs() {
-    printf 'enter:%s,tab:state,ctrl-b:branch,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:comments,ctrl-s:switch,alt-a:approve,alt-m:merge,alt-i:issue,alt-c:close%s,esc:back' \
+    printf 'enter:%s,tab:state,ctrl-b:branch,ctrl-d:diff,ctrl-o:open,ctrl-y:copy message,ctrl-f:comments,ctrl-s:switch,alt-a:approve,alt-m:merge,alt-d:draft,alt-i:issue,alt-c:close%s,esc:back' \
         "$(action_label "${action}")" \
         "$([ "${provider}" != "github" ] && printf ',alt-x:delete')"
 }

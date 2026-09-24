@@ -368,7 +368,7 @@ the preview: `enter` runs the chosen action (show by default), `tab` switches th
 `ctrl-b` asks for the branch filter on a list of the repository's branches,
 `ctrl-d` shows the diff, `ctrl-o` opens it in the browser, `ctrl-y` copies a
 channel message, `ctrl-f` shows the comments, `ctrl-s` switches to its source
-branch, `alt-a` approves, `alt-m` merges,
+branch, `alt-a` approves, `alt-m` merges, `alt-d` toggles draft,
 `alt-i` creates an issue from it, `alt-c` closes it, `alt-x` deletes it, and
 `esc` goes back. Every other action is a key of the picker or an answer of the
 shown request, so the menu stays two lines long.
@@ -377,7 +377,7 @@ All of those but the chosen action, creating an issue and switching to the
 branch - all of which report something the picker would draw over - act inside the picker: showing the diff
 or the comments hands the terminal to the pager, opening the browser and copying
 the message keep the screen and report above the header, and the two filters,
-approving, merging, closing and deleting reload the list so what changed shows.
+approving, merging, toggling draft, closing and deleting reload the list so what changed shows.
 Only those reload, since a reload is an API call.
 
 `enter` shows the request the way its provider does - `glab mr view` or
@@ -418,6 +418,10 @@ opens the pipelines of the source branch in [git-pipe](#git-pipe) with
 pipeline keeps git-pipe open to look into and retry, and leaving it brings the
 question back. An auto-merge waits for the pipeline, so the pipelines of the
 source branch are shown with [git-pipe](#git-pipe) once it is set.
+
+A draft can not be merged, so `Approve + Merge` and `Merge` (`alt-m`, `-M`) ask
+first whether to mark a draft as ready (GitHub `gh pr ready`, GitLab
+`glab mr update --ready`); declining leaves the request alone.
 ```bash
 git-mr [-c|--create] [-a|--approve] [-M|--merge] [-C|--close] [-D|--delete] \
        [-m|--copy-message] [-i|--issue] [--feedback] [-u|--unresolved] [-r|--raw] \
