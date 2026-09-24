@@ -16,7 +16,7 @@ __dh_complete_alias()
     # git-color hands over to git's own completion, which needs the same
     # complete options git registers itself
     case "${2}" in
-        git-color) complete -o bashdefault -o default -o nospace -F "_${2}" "${1}" ;;
+        git-color|git-pull) complete -o bashdefault -o default -o nospace -F "_${2}" "${1}" ;;
         *) complete -F "_${2}" "${1}" ;;
     esac
 }
@@ -546,6 +546,40 @@ complete -F _git-pipe git-pipe
 
 # git-pr is a symlink to git-mr, so it takes the same options
 complete -F _git-mr git-pr
+
+# git-pull hands its arguments to git pull, so its line is completed as "git pull"
+_git-pull()
+{
+    local cur prev
+    __dh_init
+    if __dh_load_git_completion; then
+        local -a saved_words=( "${COMP_WORDS[@]}" )
+        local saved_cword="${COMP_CWORD}"
+        local saved_line="${COMP_LINE}" saved_point="${COMP_POINT}"
+        local offset=0
+        while [ "${COMP_LINE:offset:1}" = " " ]; do offset=$(( offset + 1 )); done
+        offset=$(( offset + ${#saved_words[0]} ))
+        COMP_WORDS=( git pull "${saved_words[@]:1}" )
+        COMP_CWORD=$(( saved_cword + 1 ))
+        COMP_LINE="git pull${COMP_LINE:offset}"
+        COMP_POINT=$(( saved_point - offset + 8 ))
+        __dh_git_delegate 1
+        COMP_WORDS=( "${saved_words[@]}" )
+        COMP_CWORD="${saved_cword}"
+        COMP_LINE="${saved_line}"
+        COMP_POINT="${saved_point}"
+        return 0
+    fi
+    # no git completion installed, so complete at least a few things
+    compopt +o nospace 2>/dev/null
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "--recurse-submodules --no-recurse-submodules --rebase --no-rebase --ff-only -h --help"
+    else
+        __dh_compgen "$(LC_ALL=C git remote 2>/dev/null) $(__dh_all_branches)"
+    fi
+    return 0
+}
+complete -o bashdefault -o default -o nospace -F _git-pull git-pull
 
 _git-push()
 {

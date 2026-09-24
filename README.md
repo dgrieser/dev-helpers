@@ -450,6 +450,17 @@ merge requests alike.
 git-pr [OPTIONS] [<project>]
 ```
 
+### git-pull
+Run `git pull`, and offer to pull the submodules along with it.
+```bash
+git-pull [<git pull options>] [<repository> [<refspec>...]]
+```
+Every argument is handed to `git pull` as it is. When the repository has
+submodules, pulling them too is offered (default yes) and done with
+`--recurse-submodules`. The question is skipped when the command line already
+says `--recurse-submodules` or `--no-recurse-submodules`, or `submodule.recurse`
+is configured.
+
 ### git-push
 Push current or named branch; optional push-only or force-with-lease.
 ```bash
