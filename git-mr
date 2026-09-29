@@ -145,6 +145,9 @@ copy a channel message, its comments or its diff. Copying the message ends
 there, reading the comments or the diff comes back to the question, esc returns
 to the picker.
 
+A request that needs no approval, because its rules ask for none or it has every
+approval it needs, is merged by approve + merge without approving it.
+
 When the approval is refused, because the request is your own or the approval
 rights are missing, and when the provider blocks the merge although the approval
 went through, the approve + merge and the merge action offer three ways on:
@@ -722,6 +725,25 @@ approve_item() {
     return 1
 }
 
+# whether the merge still waits for an approval. GitLab counts the approvals
+# left from the rules right away, GitHub names a missing review in its review
+# decision; an answer that can not be read counts as required, so the approval
+# is tried as before
+approval_required() {
+    local n="${1}"
+    local left decision
+
+    if [ "${provider}" = "github" ]; then
+        decision="$(gh pr view "${n}" --repo "${github_repo_selector}" \
+            --json reviewDecision --jq '.reviewDecision // ""' 2>/dev/null)" || return 0
+        [ -n "${decision}" ] && [ "${decision}" != "APPROVED" ]
+        return
+    fi
+    left="$(glab api "projects/:fullpath/merge_requests/${n}/approvals" 2>/dev/null \
+        | jq -r '.approvals_left // empty')"
+    [ -z "${left}" ] || [ "${left}" -gt 0 ]
+}
+
 # both clients refuse a blocked merge before they ask for a merge method, so the
 # state is read up front; parsing it out of the error is no option, capturing the
 # output would swallow that question
@@ -736,8 +758,7 @@ merge_blocked_reason() {
         printf 'the requirements of the target branch are not satisfied\n'
         return 0
     fi
-    status="$(glab mr view "${n}" --output json 2>/dev/null \
-        | jq -r '.detailed_merge_status // empty')" || return 1
+    status="$(merge_status "${n}")" || return 1
     case " ${GITLAB_BLOCKED_STATUSES} " in
         *" ${status} "*) printf '%s\n' "${status//_/ }" ;;
         *) return 1 ;;
@@ -756,10 +777,13 @@ GITLAB_TRANSIENT_STATUSES="checking unchecked preparing"
 GITHUB_TRANSIENT_STATUSES="UNKNOWN"
 
 # the status the provider reports for the merge, read again while it is still
-# working it out
+# working it out. GitLab catches up with changed approval rules only after a
+# while, until then it reports approvals that no rule asks for anymore; such a
+# status is read again like an undecided one
 merge_status() {
     local attempts=0
     local status
+    local stale=""
 
     while [ "${attempts}" -lt 3 ]; do
         attempts=$((attempts + 1))
@@ -776,6 +800,13 @@ merge_status() {
             case " ${GITLAB_TRANSIENT_STATUSES} " in
                 *" ${status} "*) continue ;;
             esac
+            if [ "${status}" = "not_approved" ] || [ "${status}" = "approvals_syncing" ]; then
+                if [ -z "${stale}" ]; then
+                    stale=0
+                    approval_required "${1}" || stale=1
+                fi
+                [ "${stale}" -eq 1 ] && continue
+            fi
         fi
         printf '%s\n' "${status}"
         return 0
@@ -1003,25 +1034,10 @@ editable_approval_rules() {
             | [(.id | tostring), .name] | @tsv'
 }
 
-# GitLab recomputes the merge status once the rules changed, until then it still
-# reports the approvals the rules asked for
-wait_for_approval_sync() {
-    local n="${1}"
-    local attempts=0
-
-    while [ "${attempts}" -lt 5 ]; do
-        attempts=$((attempts + 1))
-        case "$(merge_status "${n}")" in
-            not_approved|approvals_syncing) sleep 1 ;;
-            *) return 0 ;;
-        esac
-    done
-}
-
 # GitLab has no flag that merges past a mandatory approval, the approvals are
 # taken off the request instead: each rule that still asks for some is set to
 # require none, which GitLab shows as overwritten rules. They stay that way, the
-# request is about to be merged
+# request is about to be merged, and the merge that follows is a plain one
 bypass_approval_rules() {
     local n="${1}"
     local rules="${2}"
@@ -1038,7 +1054,6 @@ bypass_approval_rules() {
         fi
         echo "Approval rule \"${name}\" of $(item_ref "${n}") requires no approval now." 1>&2
     done <<< "${rules}"
-    wait_for_approval_sync "${n}"
 }
 
 # a refused approval and a blocked merge both fall back to the same question:
@@ -1264,12 +1279,19 @@ ask_mark_ready() {
     set_draft "${n}" ready
 }
 
+# a request that waits for no approval, because its rules ask for none or it
+# has every approval it needs, is merged without approving it; the approval is
+# nothing the merge needs, and on a request of your own it is refused anyway
 approve_and_merge() {
     local n="${1}"
-    local rc
+    local rc=0
 
-    approve_item "${n}"
-    rc=$?
+    if approval_required "${n}"; then
+        approve_item "${n}"
+        rc=$?
+    else
+        echo "$(item_ref "${n}") needs no approval, merging." 1>&2
+    fi
     if [ "${rc}" -eq 0 ]; then
         merge_item "${n}"
         rc=$?

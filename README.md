@@ -428,6 +428,11 @@ keeps the local branch, nothing is merged yet. `-n` shows one request
 without the picker, `-p` prints the list. `-A` starts with every state instead
 of the open ones.
 
+A request that needs no approval - its rules ask for none or it has every
+approval it needs - is merged by `Approve + Merge` without approving it; a
+GitLab merge status that still reports the approvals of rules changed a moment
+ago is read again until it catches up.
+
 When the approval is refused - the request is your own or the approval rights
 are missing - and when the provider blocks the merge although the approval went
 through, the merge offers three ways on: merging past the requirements (GitHub
