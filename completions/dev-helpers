@@ -377,11 +377,36 @@ _git-diff()
         -p|--path)
             __dh_files
             return 0 ;;
+        -q|--query) return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-p --path -v --vim -h --help"
-    else
-        __dh_compgen "$(__dh_all_branches)"
+        __dh_compgen "-p --path -u --untracked -q --query --print -P --patch -v --vim -h --help"
+        return 0
+    fi
+    # the mode is the first word that is neither an option nor its value, the
+    # words after it are the arguments of the mode
+    local index=1 mode="" position=0
+    while [ "${index}" -lt "${COMP_CWORD}" ]; do
+        case "${COMP_WORDS[index]}" in
+            -p|--path|-q|--query) index=$(( index + 1 )) ;;
+            -*) ;;
+            *)
+                if [ -z "${mode}" ]; then
+                    mode="${COMP_WORDS[index]}"
+                else
+                    position=$(( position + 1 ))
+                fi
+                ;;
+        esac
+        index=$(( index + 1 ))
+    done
+    if [ -z "${mode}" ]; then
+        __dh_compgen "branch uncommitted unstaged staged commits"
+    elif [ "${position}" -lt 2 ]; then
+        case "${mode}" in
+            branch) __dh_compgen "$(__dh_all_branches)" ;;
+            commits) __dh_compgen "$(__dh_commits)" ;;
+        esac
     fi
     return 0
 }

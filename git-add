@@ -94,7 +94,7 @@ vimdiff_file() {
     local path="${1}"; shift
     # git-diff handles the readonly side (HEAD version, or an empty file for
     # untracked files)
-    git-diff --vim --path "${GIT_DIR}/${path}"
+    git-diff --vim --untracked --path "${GIT_DIR}/${path}" uncommitted
 }
 
 contains_path() {

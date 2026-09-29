@@ -3,25 +3,39 @@
 git() { LC_ALL=C command git -c color.ui=always "$@"; }
 git-color() { command git-color --color=always "$@"; }
 
-APP_NAME="$(basename "${0}")"
+APP="$(basename "${0}")"
 
 usage() {
     cat <<EOF 1>&2
-usage: ${APP_NAME} [OPTIONS] [BRANCH]
+usage: ${APP} [OPTIONS] [MODE [ARG ...]]
 
-Show the current working-tree diff, or compare the current branch to BRANCH.
+Interactively view a diff: pick a changed file and see its diff in the preview.
+Without MODE a menu asks which diff to show.
 
-When BRANCH is omitted, show the existing diff against HEAD plus untracked files.
-When BRANCH is provided, show the diff from merge-base(BRANCH, HEAD) to HEAD.
+Modes:
+  branch [BASE [BRANCH]]  Diff BRANCH against its merge base with BASE
+                          (BRANCH defaults to the current branch; both are
+                          asked for when BASE is omitted)
+  uncommitted             Diff staged and unstaged tracked changes
+  unstaged                Diff unstaged tracked changes
+  staged                  Diff staged changes
+  commits [START [END]]   Diff the commits from START to END, both included
+                          (END defaults to HEAD; both are picked from the
+                          commits of the current branch when START is omitted)
 
 Options:
-  -p, --path PATH       Limit the diff to PATH (a file or subfolder).
-                        May be repeated to include multiple paths.
-  -v, --vim             Open each changed file in vimdiff instead of printing.
-                        The working-tree file is editable, the other version
-                        is readonly. Quit vim (:q, :qa or ZZ) to open the
-                        next file, or exit with an error (:cq) to stop.
-  -h, --help            Show this help message and exit
+  -p, --path PATH         Limit the diff to PATH (a file or subfolder).
+                          May be repeated to include multiple paths.
+  -u, --untracked         Include untracked files (uncommitted and unstaged)
+  -q, --query QUERY       Start the picker with a search query
+      --print             Print the change list instead of opening the picker
+  -P, --patch             Print the whole diff instead of opening the picker
+  -v, --vim               Open each changed file in vimdiff instead of the
+                          picker. The newer side is on the left, and editable
+                          when it is the working-tree file. Quit vim (:q, :qa
+                          or ZZ) to open the next file, or exit with an error
+                          (:cq) to stop.
+  -h, --help              Show this help message and exit
 EOF
     exit 1
 }
@@ -40,12 +54,120 @@ abort() {
     exit 1
 }
 
-print_worktree_diff() {
-    git-color --pager=never -C "${git_dir}" diff HEAD -- "${paths[@]}"
+need_cmd() {
+    command -v "${1}" >/dev/null 2>&1 || fail "${1} not found"
+}
 
-    readarray -t untracked < <(git -C "${git_dir}" ls-files --others --exclude-standard -- "${paths[@]}")
-    print_header=1
-    for f in "${untracked[@]}"; do
+# the picker comes back the moment a key that was handed the terminal is through,
+# so a message of one of them is only read if it is waited for
+notify() {
+    error "${1}"
+    read -rsn 1 -p "Press any key to continue"
+    echo 1>&2
+}
+
+RED=$'\e[31m'
+GREEN=$'\e[32m'
+YELLOW=$'\e[33m'
+MAGENTA=$'\e[35m'
+CYAN=$'\e[36m'
+NC=$'\e[0m'
+NL=$'\n'
+
+HEADER=$'TYPE\tPATH'
+# the editor and vimdiff run inside the picker with the terminal handed over,
+# and may have changed the working tree once they are through
+EXEC_RELOAD_KEYS="ctrl-e,alt-v"
+EXPECT_KEYS="ctrl-d,esc,ctrl-c,enter"
+KEY_DESCS="alt-v:vimdiff,ctrl-d:diff,ctrl-e:edit"
+
+# pad tab separated columns, ANSI aware, so colored cells still line up; the
+# last column stays unpadded
+render_table() {
+    awk -F'\t' '
+        function vlen(s) { gsub(/\033\[[0-9;]*m/, "", s); return length(s) }
+        { rows[NR] = $0
+          for (i = 1; i <= NF; i++) { l = vlen($i); if (l > w[i]) w[i] = l } }
+        END {
+            for (r = 1; r <= NR; r++) {
+                nf = split(rows[r], f, "\t")
+                line = ""
+                for (i = 1; i <= nf; i++) {
+                    if (i > 1) line = line "  "
+                    line = line f[i]
+                    if (i < nf) { pad = w[i] - vlen(f[i]); while (pad-- > 0) line = line " " }
+                }
+                print line
+            }
+        }'
+}
+
+# --- the diff --------------------------------------------------------------
+
+# the changes as "TYPE<tab>PATH" lines in path order. A path git reports twice
+# (unmerged and modified during a conflict) is listed once, as unmerged.
+list_changes() {
+    local status path
+
+    {
+        while IFS= read -r -d '' status && IFS= read -r -d '' path; do
+            case "${status}" in
+                A) status="added" ;;
+                D) status="deleted" ;;
+                U) status="unmerged" ;;
+                T) status="typechange" ;;
+                *) status="modified" ;;
+            esac
+            printf '%s\t%s\n' "${status}" "${path}"
+        done < <(git -C "${git_dir}" diff --no-color --no-renames --name-status -z "${diff_args[@]}" -- "${paths[@]}")
+        if [ "${untracked}" -eq 1 ]; then
+            while IFS= read -r -d '' path; do
+                printf 'untracked\t%s\n' "${path}"
+            done < <(git -C "${git_dir}" ls-files --others --exclude-standard -z -- "${paths[@]}")
+        fi
+    } | awk -F'\t' '!seen[$2]++' | LC_ALL=C sort -t $'\t' -k2
+}
+
+# only the picker lists the changes reversed, so they come out sorted from the
+# top of its bottom up layout
+print_changes() {
+    local reverse="${1}"
+    local rows
+
+    rows="$(list_changes | awk -F'\t' -v OFS='\t' \
+        -v added="${GREEN}" -v deleted="${RED}" -v modified="${YELLOW}" \
+        -v other="${MAGENTA}" -v untracked="${CYAN}" -v nc="${NC}" '
+        {
+            color = other
+            if ($1 == "added") color = added
+            else if ($1 == "deleted") color = deleted
+            else if ($1 == "modified") color = modified
+            else if ($1 == "untracked") color = untracked
+            print color $1 nc, color $2 nc
+        }')"
+    [ -n "${reverse}" ] && rows="$(tac <<< "${rows}")"
+    printf '%s\n' "${HEADER}${rows:+${NL}${rows}}" | render_table
+}
+
+# ${3}: the --color value, "always" unless the diff is parsed
+print_file_diff() {
+    local type="${1}" path="${2}" color="${3:-always}"
+
+    if [ "${type}" == "untracked" ]; then
+        git --no-pager -C "${git_dir}" diff --color="${color}" --no-index /dev/null -- "${path}"
+    else
+        git --no-pager -C "${git_dir}" diff --color="${color}" --no-renames "${diff_args[@]}" -- "${path}"
+    fi
+}
+
+print_patch() {
+    local untracked_files=() f print_header=1
+
+    git-color --pager=never -C "${git_dir}" diff "${diff_args[@]}" -- "${paths[@]}"
+
+    [ "${untracked}" -eq 1 ] || return 0
+    readarray -t untracked_files < <(git -C "${git_dir}" ls-files --others --exclude-standard -- "${paths[@]}")
+    for f in "${untracked_files[@]}"; do
         if [ -e "${git_dir}/${f}" ]; then
             [ "${print_header}" -eq 1 ] && echo -e "\n\e[1;31mUNTRACKED\e[0m\n" && print_header=0
             git-color --pager=never -C "${git_dir}" diff --no-index /dev/null "${f}"
@@ -53,47 +175,348 @@ print_worktree_diff() {
     done
 }
 
+# a submodule is a gitlink on one side of the diff at least: git lists it as a
+# single path like any other change, but there is no file to edit or diff
+is_submodule() {
+    git -C "${git_dir}" diff --no-color --no-renames --raw "${diff_args[@]}" -- "${1}" \
+        | grep -qE '^:(160000 |[0-7]+ 160000 )'
+}
+
+print_footer() {
+    printf '%s\n' "${label}"
+}
+
+# --- the editor and vimdiff ------------------------------------------------
+
+# open the working tree file at the first change; the hunk header names the
+# first context line, the change itself follows the three lines of context
+edit_file() {
+    local type="${1}" path="${2}"
+    local lineno
+
+    need_cmd vim
+    lineno="$(print_file_diff "${type}" "${path}" never \
+        | awk '/^@@/ { if (match($0, /\+[0-9]+/)) { print substr($0, RSTART + 1, RLENGTH - 1); exit } }')"
+    if [[ "${lineno}" =~ ^[0-9]+$ ]]; then
+        lineno=$((lineno + 3))
+    else
+        lineno=1
+    fi
+    vim "+${lineno}" "${git_dir}/${path}"
+}
+
+# write the version of a file on one side of the diff to a file; a side the file
+# is missing on gives an empty file to diff against
+write_side() {
+    local side="${1}" path="${2}" out="${3}"
+
+    mkdir -p "$(dirname "${out}")"
+    case "${side}" in
+        empty) : > "${out}" ;;
+        index) git -C "${git_dir}" show ":${path}" > "${out}" 2>/dev/null || : > "${out}" ;;
+        *) git -C "${git_dir}" show "${side}:${path}" > "${out}" 2>/dev/null || : > "${out}" ;;
+    esac
+}
+
+# the left window holds the newer side of the diff and is editable when it is
+# the working tree file; closing one window quits vim so the next file, or the
+# picker, comes back right away. :cq still exits non-zero because it bypasses
+# autocmds. redraw! clears the stacked startup messages so vim does not show the
+# "Press ENTER or type command to continue" prompt before the diff.
 open_vimdiff() {
-    # ${1}: repo-relative path of the editable working-tree file
-    # ${2}: readonly counterpart file
-    # WinClosed autocmd: closing either window (:q, ZZ, :qa) quits vim so the
-    #   loop advances without leaving a lone single-file window behind. :cq
-    #   still exits non-zero (abort) because it bypasses autocmds.
-    # redraw!: clear the stacked startup messages so vim does not show the
-    #   "Press ENTER or type command to continue" prompt before the diff.
-    vim -d "${git_dir}/${1}" "${2}" \
-        -c 'wincmd l' -c 'setlocal readonly nomodifiable' -c 'wincmd h' \
+    local left="${1}" right="${2}" editable="${3}"
+    local ro_args=(-c 'windo setlocal readonly nomodifiable' -c 'wincmd h')
+
+    [ "${editable}" -eq 1 ] \
+        && ro_args=(-c 'wincmd l' -c 'setlocal readonly nomodifiable' -c 'wincmd h')
+
+    vim -d "${left}" "${right}" "${ro_args[@]}" \
         -c 'autocmd WinClosed * ++nested qall' \
         -c 'redraw!'
 }
 
-vimdiff_files() {
-    # ${1}: ref providing the readonly side; remaining args: repo-relative files
-    local base_ref="${1}"
-    shift
+# with the newer side checked out, its version of the file is the one in the
+# working tree, so that one is opened in place of a copy of it and the change can
+# be edited right there
+vimdiff_file() {
+    local type="${1}" path="${2}"
+    local old="${old_side}" new="${new_side}"
 
-    if [ "${#}" -eq 0 ]; then
+    need_cmd vim
+    if [ -z "${tmp_root}" ]; then
+        # not local: the EXIT trap runs after this function has returned
+        tmp_root="$(mktemp -d)" || fail "Cannot create temp directory."
+        trap 'rm -rf "${tmp_root}"' EXIT
+    fi
+
+    [ "${type}" == "untracked" ] && old="empty"
+    [ "${new}" == "$(git -C "${git_dir}" rev-parse --verify --quiet HEAD)" ] \
+        && [ -f "${git_dir}/${path}" ] && new="worktree"
+    [ "${new}" == "worktree" ] && [ ! -f "${git_dir}/${path}" ] && new="empty"
+
+    write_side "${old}" "${path}" "${tmp_root}/old/${path}"
+    if [ "${new}" == "worktree" ]; then
+        open_vimdiff "${git_dir}/${path}" "${tmp_root}/old/${path}" 1
+    else
+        write_side "${new}" "${path}" "${tmp_root}/new/${path}"
+        open_vimdiff "${tmp_root}/new/${path}" "${tmp_root}/old/${path}" 0
+    fi
+}
+
+vimdiff_changes() {
+    local changes=() change
+
+    mapfile -t changes < <(list_changes)
+    if [ "${#changes[@]}" -eq 0 ]; then
         echo "No changed files." 1>&2
         return
     fi
-
-    # Not local: the EXIT trap runs after this function has returned.
-    tmp_root="$(mktemp -d)" || fail "Cannot create temp directory."
-    trap 'rm -rf "${tmp_root}"' EXIT
-
-    local f other
-    for f in "${@}"; do
-        other="${tmp_root}/${f}"
-        mkdir -p "$(dirname "${other}")"
-        # Files absent in base_ref (added or untracked) diff against an empty file.
-        git -C "${git_dir}" show "${base_ref}:${f}" > "${other}" 2>/dev/null || : > "${other}"
-        open_vimdiff "${f}" "${other}" || abort
+    for change in "${changes[@]}"; do
+        is_submodule "${change#*$'\t'}" && continue
+        vimdiff_file "${change%%$'\t'*}" "${change#*$'\t'}" || abort
     done
 }
 
-compare_branch=""
+# --- the picker ------------------------------------------------------------
+
+handle_key() {
+    local key line type path
+
+    key="$(head -n 1 <<< "${key_result}")"
+    line="$(sed -n '2p' <<< "${key_result}")"
+    read -r type path <<< "${line}"
+
+    case "${key}" in
+        esc|ctrl-c)
+            exit 255
+            ;;
+    esac
+    [ -z "${path}" ] && exit 0
+
+    case "${key}" in
+        ctrl-d)
+            echo -e "${type}\t${path}"
+            print_file_diff "${type}" "${path}"
+            exit 1
+            ;;
+        ctrl-e)
+            if is_submodule "${path}"; then
+                notify "Not editing '${path}': is a submodule"
+            elif [ ! -f "${git_dir}/${path}" ]; then
+                notify "Not editing '${path}': not in the working tree"
+            else
+                edit_file "${type}" "${path}"
+            fi
+            exit 0
+            ;;
+        alt-v)
+            if is_submodule "${path}"; then
+                notify "Not diffing '${path}': is a submodule"
+            else
+                vimdiff_file "${type}" "${path}"
+            fi
+            exit 0
+            ;;
+        enter)
+            echo -e "${type}\t${path}"
+            exit 1
+            ;;
+        *)
+            fail "Unknown key: ${key}"
+            ;;
+    esac
+}
+
+write_state() {
+    {
+        printf 'git_dir=%q\n' "${git_dir}"
+        printf 'untracked=%q\n' "${untracked}"
+        printf 'old_side=%q\n' "${old_side}"
+        printf 'new_side=%q\n' "${new_side}"
+        printf 'label=%q\n' "${label}"
+        declare -p diff_args
+        declare -p paths
+    } > "${STATE_FILE}"
+}
+
+pick_change() {
+    need_cmd fzf-with-header
+    fzf-with-header --key-command "${APP} --id ${id} --key" \
+                    --key-descriptions "${KEY_DESCS}" \
+                    --exec-reload-keys "${EXEC_RELOAD_KEYS}" \
+                    --command "${APP} --id ${id} --print-up" \
+                    --footer-prefix "${APP} --id ${id} --footer" \
+                    "${query}" \
+                    --preview="${APP} --id ${id} --preview {}" \
+                    --preview-window=right:70%,nowrap \
+                    --expect="${EXPECT_KEYS}" \
+                    --bind=load:last
+}
+
+# --- the menu --------------------------------------------------------------
+
+# an aborted prompt says so itself, so the run only has to end
+
+pick_mode() {
+    need_cmd prompt-select
+    diff_mode="$(printf '%-12s %s\n' \
+        "branch"      "Diff against a base branch" \
+        "uncommitted" "Diff staged and unstaged tracked changes" \
+        "unstaged"    "Diff unstaged tracked changes" \
+        "staged"      "Diff staged changes" \
+        "commits"     "Diff a specific commit range" \
+        | prompt-select --prompt "Diff:" --key-regex '^\S+')"
+    [ -n "${diff_mode}" ] || exit 1
+}
+
+# The branch to diff against. After a fetch the remote-tracking ref is the one
+# that moved, and a local branch of the same name may not even exist, so that
+# is the one offered when it is there.
+default_base() {
+    local branch current upstream
+
+    current="$(git -C "${git_dir}" branch --show-current)"
+    branch="$(git-default 2>/dev/null)"
+    if [ -n "${branch}" ] && [ "${branch}" != "${current}" ]; then
+        git -C "${git_dir}" show-ref --verify --quiet "refs/remotes/origin/${branch}" \
+            && echo "origin/${branch}" || echo "${branch}"
+        return 0
+    fi
+    # on the default branch itself, what is not pushed yet is meant
+    upstream="$(git -C "${git_dir}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"
+    [ -n "${upstream}" ] && { echo "${upstream}"; return 0; }
+    echo "${branch}"
+}
+
+current_branch() {
+    local branch
+
+    branch="$(git -C "${git_dir}" branch --show-current)"
+    echo "${branch:-HEAD}"
+}
+
+# Remote branches keep their prefix: "origin/main" is a ref git can resolve, a
+# bare "main" only is one when the local branch exists too.
+ref_candidates() {
+    { git -C "${git_dir}" for-each-ref --sort=-committerdate \
+          --format='%(refname:short)' refs/heads refs/remotes
+      git -C "${git_dir}" tag --sort=-v:refname; } 2>/dev/null \
+        | sed -e '/^origin\/HEAD$/d' -e '/^HEAD$/d' \
+        | awk '!seen[$0]++'
+}
+
+pick_ref() {
+    local prompt="${1}" prefill="${2}"
+    local ref
+
+    need_cmd prompt-complete
+    ref="$(ref_candidates | prompt-complete --prompt "${prompt}" --prefill "${prefill}")"
+    [ -n "${ref}" ] || exit 1
+    echo "${ref}"
+}
+
+commit_rows() {
+    git -C "${git_dir}" log --no-color --format='%h  %s  (%ar, %an)' "${@}"
+}
+
+# the commits to offer come from stdin
+pick_commit() {
+    local prompt="${1}"
+    local rev
+
+    need_cmd prompt-select
+    rev="$(prompt-select --prompt "${prompt}" --key-regex '^\S+' --filter)"
+    [ -n "${rev}" ] || exit 1
+    echo "${rev}"
+}
+
+resolve_commit() {
+    local rev
+
+    rev="$(git -C "${git_dir}" rev-parse --verify --quiet "${1}^{commit}" 2>/dev/null)" \
+        || fail "Not a commit: ${1}"
+    echo "${rev}"
+}
+
+short_rev() {
+    git -C "${git_dir}" rev-parse --short "${1}"
+}
+
+# sets the diff, its two sides and the label naming it from the mode and its args
+resolve_diff() {
+    local head empty_tree base branch merge_base start end
+
+    empty_tree="$(git -C "${git_dir}" hash-object -t tree /dev/null)"
+    # before the first commit everything is compared to nothing
+    head="$(git -C "${git_dir}" rev-parse --verify --quiet HEAD)" || head="${empty_tree}"
+
+    case "${diff_mode}" in
+        uncommitted)
+            diff_args=("${head}")
+            old_side="${head}"
+            new_side="worktree"
+            label="uncommitted"
+            ;;
+        unstaged)
+            diff_args=()
+            old_side="index"
+            new_side="worktree"
+            label="unstaged"
+            ;;
+        staged)
+            diff_args=(--cached)
+            old_side="${head}"
+            new_side="index"
+            label="staged"
+            ;;
+        branch)
+            base="${mode_args[0]}"
+            branch="${mode_args[1]}"
+            if [ -z "${base}" ]; then
+                base="$(pick_ref "Base:" "$(default_base)")" || exit 1
+                branch="$(pick_ref "Branch:" "$(current_branch)")" || exit 1
+            fi
+            [ -z "${branch}" ] && branch="$(current_branch)"
+            new_side="$(resolve_commit "${branch}")" || exit 1
+            resolve_commit "${base}" >/dev/null || exit 1
+            merge_base="$(git -C "${git_dir}" merge-base "${base}" "${new_side}")" \
+                || fail "No merge base between ${base} and ${branch}."
+            diff_args=("${merge_base}" "${new_side}")
+            old_side="${merge_base}"
+            label="${base}...${branch}"
+            ;;
+        commits)
+            start="${mode_args[0]}"
+            end="${mode_args[1]}"
+            if [ -z "${start}" ]; then
+                start="$(commit_rows HEAD | pick_commit "Start commit:")" || exit 1
+                start="$(resolve_commit "${start}")" || exit 1
+                # the end is one of the commits after the start, or the start itself
+                end="$({ commit_rows --ancestry-path "${start}..HEAD"; commit_rows -1 "${start}"; } \
+                    | pick_commit "End commit:")" || exit 1
+            fi
+            start="$(resolve_commit "${start}")" || exit 1
+            new_side="$(resolve_commit "${end:-HEAD}")" || exit 1
+            # the start is included, so the diff begins at its parent
+            old_side="$(git -C "${git_dir}" rev-parse --verify --quiet "${start}^")" \
+                || old_side="${empty_tree}"
+            diff_args=("${old_side}" "${new_side}")
+            label="$(short_rev "${start}") to $(short_rev "${new_side}")"
+            ;;
+    esac
+    [ "${untracked}" -eq 1 ] && label="${label} with untracked"
+}
+
+diff_mode=""
+mode_args=()
 paths=()
-vim_diff=0
+untracked=0
+action="list"
+key_result=""
+preview_line=""
+query=""
+id=$$
+id_given=0
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -105,48 +528,143 @@ while [ "${#}" -gt 0 ]; do
                 error "Missing argument for ${1}"
                 usage
             fi
-            paths+=("${2}")
+            # git runs in the repo root, so a relative path is made absolute
+            # while it still refers to the directory it was given in
+            if [[ "${2}" == /* ]]; then
+                paths+=("${2}")
+            else
+                paths+=("${PWD}/${2}")
+            fi
             shift
             ;;
+        -u|--untracked)
+            untracked=1
+            ;;
+        -q|--query)
+            if [ -z "${2}" ]; then
+                error "Missing argument for ${1}"
+                usage
+            fi
+            query="${2}"
+            shift
+            ;;
+        --print)
+            action="print"
+            ;;
+        -P|--patch)
+            action="patch"
+            ;;
         -v|--vim)
-            vim_diff=1
+            action="vim"
+            ;;
+        --print-up)
+            action="print-up"
+            ;;
+        --footer)
+            action="footer"
+            ;;
+        --preview)
+            [ -z "${2}" ] && exit 0
+            action="preview"
+            preview_line="${2}"
+            shift
+            ;;
+        --key)
+            [ -z "${2}" ] && fail "Missing argument for key"
+            action="key"
+            key_result="${2}"
+            shift
+            ;;
+        --id)
+            [ -z "${2}" ] && fail "Missing argument for id"
+            id="${2}"
+            id_given=1
+            shift
             ;;
         -*)
             error "Unknown option: ${1}"
             usage
             ;;
         *)
-            if [ -n "${compare_branch}" ]; then
-                error "Unexpected argument: ${1}"
-                usage
+            if [ -z "${diff_mode}" ]; then
+                diff_mode="${1}"
+            else
+                mode_args+=("${1}")
             fi
-            compare_branch="${1}"
             ;;
     esac
     shift
 done
 
-git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo."
+STATE_FILE="/tmp/${APP}-${id}.state"
 
-[ "${vim_diff}" -eq 1 ] && ! command -v vim >/dev/null && fail "vim not found."
+# --print-up, --footer, --preview and --key are called by the picker and reuse
+# the state of the run that opened it
+case "${action}" in
+    print-up|footer|preview|key)
+        [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] || fail "No state for id ${id}"
+        # shellcheck source=/dev/null
+        . "${STATE_FILE}"
+        case "${action}" in
+            print-up)
+                print_changes 1
+                ;;
+            footer)
+                print_footer
+                ;;
+            preview)
+                read -r type path <<< "${preview_line}"
+                [ -n "${path}" ] && print_file_diff "${type}" "${path}"
+                ;;
+            key)
+                handle_key
+                ;;
+        esac
+        exit 0
+        ;;
+esac
 
-if [ -z "${compare_branch}" ]; then
-    if [ "${vim_diff}" -eq 1 ]; then
-        readarray -t changed < <(git -C "${git_dir}" diff --name-only HEAD -- "${paths[@]}")
-        readarray -t untracked < <(git -C "${git_dir}" ls-files --others --exclude-standard -- "${paths[@]}")
-        vimdiff_files HEAD "${changed[@]}" "${untracked[@]}"
-    else
-        print_worktree_diff
-    fi
-else
-    git -C "${git_dir}" rev-parse --verify --quiet "${compare_branch}^{commit}" >/dev/null ||
-        fail "Branch not found: ${compare_branch}"
-    if [ "${vim_diff}" -eq 1 ]; then
-        merge_base="$(git -C "${git_dir}" merge-base "${compare_branch}" HEAD)" ||
-            fail "No merge base between ${compare_branch} and HEAD."
-        readarray -t changed < <(git -C "${git_dir}" diff --name-only "${merge_base}" HEAD -- "${paths[@]}")
-        vimdiff_files "${merge_base}" "${changed[@]}"
-    else
-        git-color --pager=never -C "${git_dir}" diff "${compare_branch}...HEAD" -- "${paths[@]}"
-    fi
-fi
+git_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not a git repo."
+
+[ -z "${diff_mode}" ] && pick_mode
+
+case "${diff_mode}" in
+    branch|commits)
+        [ "${#mode_args[@]}" -gt 2 ] && { error "Unexpected argument: ${mode_args[2]}"; usage; }
+        ;;
+    uncommitted|unstaged|staged)
+        [ "${#mode_args[@]}" -gt 0 ] && { error "Unexpected argument: ${mode_args[0]}"; usage; }
+        ;;
+    *)
+        error "Unknown mode: ${diff_mode}"
+        usage
+        ;;
+esac
+
+case "${diff_mode}" in
+    uncommitted|unstaged) ;;
+    *) [ "${untracked}" -eq 1 ] && fail "--untracked only applies to the uncommitted and unstaged diffs." ;;
+esac
+
+resolve_diff
+
+case "${action}" in
+    print)
+        print_changes
+        ;;
+    patch)
+        print_patch
+        ;;
+    vim)
+        vimdiff_changes
+        ;;
+    list)
+        if [ -z "$(list_changes)" ]; then
+            echo "No changed files." 1>&2
+            exit 0
+        fi
+        write_state
+        trap 'rm -f "${STATE_FILE}"' EXIT
+        pick_change
+        ;;
+esac

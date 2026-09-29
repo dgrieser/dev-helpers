@@ -271,9 +271,31 @@ git-default [--fqn]
 ```
 
 ### git-diff
-Show diff of HEAD plus untracked files, or against a branch; optional vimdiff.
+Interactive diff viewer, the read-only sibling of `git-add`: the changed files
+are listed as TYPE / PATH and the preview shows the diff of the selected file.
+Nothing is staged or changed by it. Without a mode a menu asks which diff to show:
+
+- `branch [BASE [BRANCH]]` - BRANCH against its merge base with BASE; asks for
+  both (base defaults to the default branch, branch to the current one) when
+  BASE is omitted
+- `uncommitted` - staged and unstaged tracked changes
+- `unstaged` - unstaged tracked changes
+- `staged` - staged changes
+- `commits [START [END]]` - the commits from START to END, both included; picks
+  both from the commits of the current branch when START is omitted
+
+`enter` prints the selected path and `ctrl-d` its diff, both end the picker.
+`ctrl-e` opens the file in the editor at its first change and `alt-v` opens both
+sides in vimdiff; they hand the terminal over and come back to the same picker.
+vimdiff puts the newer side on the left, which is the editable working tree file
+when the diff ends in it or in the checked out commit.
+
+`-u` adds untracked files to the `uncommitted` and `unstaged` diffs, `--print`
+prints the change list, `-P` the whole diff, and `-v` opens every changed file
+in vimdiff in turn instead of the picker.
 ```bash
-git-diff [-p|--path PATH] [-v|--vim] [BRANCH]
+git-diff [-p|--path PATH] [-u|--untracked] [-q|--query QUERY] [--print|-P|--patch|-v|--vim] \
+         [branch [BASE [BRANCH]] | uncommitted | unstaged | staged | commits [START [END]]]
 ```
 
 ### git-find-repo
