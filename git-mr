@@ -146,7 +146,9 @@ there, reading the comments or the diff comes back to the question, esc returns
 to the picker.
 
 A request that needs no approval, because its rules ask for none or it has every
-approval it needs, is merged by approve + merge without approving it.
+approval it needs, is merged by approve + merge without approving it. While its
+pipeline runs, approve + merge asks the question below instead of merging right
+away, with waiting preselected.
 
 When the approval is refused, because the request is your own or the approval
 rights are missing, and when the provider blocks the merge although the approval
@@ -1281,7 +1283,10 @@ ask_mark_ready() {
 
 # a request that waits for no approval, because its rules ask for none or it
 # has every approval it needs, is merged without approving it; the approval is
-# nothing the merge needs, and on a request of your own it is refused anyway
+# nothing the merge needs, and on a request of your own it is refused anyway.
+# A pipeline that still runs goes to the question, which leads with waiting for
+# it; a merge right away would not wait unless the target branch requires the
+# pipeline to pass
 approve_and_merge() {
     local n="${1}"
     local rc=0
@@ -1290,9 +1295,13 @@ approve_and_merge() {
         approve_item "${n}"
         rc=$?
     else
-        echo "$(item_ref "${n}") needs no approval, merging." 1>&2
+        echo "$(item_ref "${n}") needs no approval." 1>&2
     fi
     if [ "${rc}" -eq 0 ]; then
+        if [ "$(item_pipeline_state "${n}")" = "running" ]; then
+            ask_merge_bypass "${n}"
+            return "${?}"
+        fi
         merge_item "${n}"
         rc=$?
         # the approval went through, the target branch still asks for more

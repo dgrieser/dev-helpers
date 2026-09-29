@@ -431,7 +431,9 @@ of the open ones.
 A request that needs no approval - its rules ask for none or it has every
 approval it needs - is merged by `Approve + Merge` without approving it; a
 GitLab merge status that still reports the approvals of rules changed a moment
-ago is read again until it catches up.
+ago is read again until it catches up. While the pipeline runs, `Approve +
+Merge` asks the question below instead of merging right away, with waiting
+preselected.
 
 When the approval is refused - the request is your own or the approval rights
 are missing - and when the provider blocks the merge although the approval went
