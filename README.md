@@ -433,7 +433,12 @@ are missing - and when the provider blocks the merge although the approval went
 through, the merge offers three ways on: merging past the requirements (GitHub
 `--admin`, GitLab `--auto-merge=false`), leaving the merge to the provider until
 every requirement is met (`--auto`, on GitLab `--auto-merge`), or leaving the
-request alone. While the pipeline runs, a fourth way leads: wait for it, then
+request alone. A missing approval the GitLab rules make mandatory blocks the
+forced merge as well, so there `Bypass approval rules and merge` sets every rule
+of the request still asking for approvals to require none, then merges; it is
+preselected unless a pipeline runs, and not offered for a code owner rule or a
+project that prevents editing the rules in merge requests. While the pipeline
+runs, a further way leads: wait for it, then
 merge, or force merge when something besides the pipeline still blocks. The wait
 opens the pipelines of the source branch in [git-pipe](#git-pipe) with
 `--exit-on-success`, so it continues on its own once they succeeded; a failed

@@ -151,8 +151,13 @@ went through, the approve + merge and the merge action offer three ways on:
 merging past the requirements (GitHub --admin, which needs the permission to do
 so; GitLab --auto-merge=false), leaving the merge to the provider until every
 requirement is met (--auto, on GitLab --auto-merge), or leaving the request
-alone. Above that question stand the state of the pipeline and what the provider
-still waits for, so the question is answered against what is actually blocking.
+alone. A missing approval the GitLab rules make mandatory blocks the forced merge
+as well, so there the rules of the request can be bypassed instead, preselected
+unless a pipeline runs: every rule still asking for approvals is set to require
+none, then the request is merged; a code owner rule and a project that prevents
+editing the rules in merge requests leave nothing to bypass. Above that question
+stand the state of the pipeline and what the provider still waits for, so the
+question is answered against what is actually blocking.
 While a pipeline runs, waiting for it leads the answers and is preselected:
 the pipelines of the source branch open in git-pipe, which ends on its own once
 they succeeded, then the request is merged, or force merged when something
@@ -980,15 +985,73 @@ merge_item() {
     return 0
 }
 
+# the approval rules of a GitLab merge request that still ask for approvals and
+# can be changed on the request itself: the project has to allow overriding
+# them, and a code owner rule follows CODEOWNERS, which no request overrides.
+# Prints the id and the name of each rule, tab separated
+editable_approval_rules() {
+    local n="${1}"
+    local locked
+
+    [ "${provider}" = "gitlab" ] || return 0
+    locked="$(glab api "projects/:fullpath/approvals" 2>/dev/null \
+        | jq -r '.disable_overriding_approvers_per_merge_request // false')"
+    [ "${locked}" = "true" ] && return 0
+    glab api "projects/:fullpath/merge_requests/${n}/approval_rules" 2>/dev/null \
+        | jq -r '.[]
+            | select((.approvals_required // 0) > 0 and .rule_type != "code_owner")
+            | [(.id | tostring), .name] | @tsv'
+}
+
+# GitLab recomputes the merge status once the rules changed, until then it still
+# reports the approvals the rules asked for
+wait_for_approval_sync() {
+    local n="${1}"
+    local attempts=0
+
+    while [ "${attempts}" -lt 5 ]; do
+        attempts=$((attempts + 1))
+        case "$(merge_status "${n}")" in
+            not_approved|approvals_syncing) sleep 1 ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
+# GitLab has no flag that merges past a mandatory approval, the approvals are
+# taken off the request instead: each rule that still asks for some is set to
+# require none, which GitLab shows as overwritten rules. They stay that way, the
+# request is about to be merged
+bypass_approval_rules() {
+    local n="${1}"
+    local rules="${2}"
+    local id name out
+
+    while IFS=$'\t' read -r id name; do
+        [ -z "${id}" ] && continue
+        if ! out="$(glab api --method PUT \
+            "projects/:fullpath/merge_requests/${n}/approval_rules/${id}" \
+            --raw-field approvals_required=0 2>&1 >/dev/null)"; then
+            [ -n "${out}" ] && printf '%s\n' "${out}" 1>&2
+            error "Failed to change approval rule \"${name}\" of $(item_ref "${n}")"
+            return 1
+        fi
+        echo "Approval rule \"${name}\" of $(item_ref "${n}") requires no approval now." 1>&2
+    done <<< "${rules}"
+    wait_for_approval_sync "${n}"
+}
+
 # a refused approval and a blocked merge both fall back to the same question:
 # merge past the requirements, wait for them, or leave the request alone. When
 # the provider reports nothing blocking, the approval it refused was not
 # required for the merge, so the merge that needs no flag leads the answers. The
 # other answers name the flag they run, what they are answered against stands
-# above them
+# above them. On GitLab a missing approval the rules make mandatory blocks the
+# forced merge too, getting past it means changing the rules
 bypass_items() {
     local plain="${1}"
     local wait="${2:-}"
+    local approvals="${3:-0}"
     local bypass_flag auto_flag
 
     if [ "${provider}" = "github" ]; then
@@ -1003,9 +1066,9 @@ bypass_items() {
         wait_bypass) printf '%s\t%s\n' "wait_bypass" "Wait for ${CI_LABEL,,}, then force merge (${bypass_flag})" ;;
     esac
     [ "${plain}" -eq 1 ] && printf '%s\t%s\n' "merge" "Merge"
-    printf '%s\t%s\n' \
-        "bypass" "Force merge (${bypass_flag})" \
-        "auto"   "Set auto-merge (${auto_flag})"
+    printf '%s\t%s\n' "bypass" "Force merge (${bypass_flag})"
+    [ "${approvals}" -eq 1 ] && printf '%s\t%s\n' "approvals" "Bypass approval rules and merge"
+    printf '%s\t%s\n' "auto" "Set auto-merge (${auto_flag})"
     printf '%s\t%s\n' "abort" "Leave the ${NOUN} as it is"
 }
 
@@ -1074,14 +1137,17 @@ wait_mode() {
 # the state of the request as the provider sees it leads the question: its
 # pipeline, and what it still waits for. A running pipeline is the one case
 # where waiting is the answer that does what the target branch asks for, so the
-# cursor starts on it. A plain merge that comes back blocked asks again, without
-# offering itself a second time
+# cursor starts on it. Otherwise a GitLab request that waits for approvals the
+# rules make mandatory starts on changing the rules, the forced merge fails
+# there. A plain merge that comes back blocked asks again, without offering
+# itself a second time
 ask_merge_bypass() {
     local n="${1}"
     local retry="${2:-0}"
-    local choice pipeline_state requirement prompt rc state
+    local choice pipeline_state requirement prompt rc state rules
     local plain=0
     local wait=""
+    local approvals=0
     local select_args=()
 
     need_cmd prompt-select
@@ -1097,11 +1163,17 @@ ask_merge_bypass() {
         printf '%sBlocked:%s nothing\n' "${C_LABEL}" "${C_RESET}" 1>&2
         prompt="Merge '$(item_ref "${n}")'?"
     fi
+    if [ "${requirement}" = "not_approved" ]; then
+        rules="$(editable_approval_rules "${n}")"
+        [ -n "${rules}" ] && approvals=1
+    fi
     if [ "${pipeline_state}" = "running" ]; then
         wait="$(wait_mode "${requirement}")"
         select_args+=("--default" "${wait}")
+    elif [ "${approvals}" -eq 1 ]; then
+        select_args+=("--default" "approvals")
     fi
-    choice="$(bypass_items "${plain}" "${wait}" | prompt-select --prompt "${prompt}" \
+    choice="$(bypass_items "${plain}" "${wait}" "${approvals}" | prompt-select --prompt "${prompt}" \
         --delimiter '\t' "${select_args[@]}")" || { echo "Abort." 1>&2; return 2; }
     case "${choice}" in
         wait|wait_bypass)
@@ -1120,7 +1192,12 @@ ask_merge_bypass() {
             [ "${rc}" -eq "${RC_MERGE_BLOCKED}" ] && { ask_merge_bypass "${n}" 1; rc=$?; }
             return "${rc}"
             ;;
-        merge)
+        merge|approvals)
+            # with the rules changed, what still blocks the merge, a running
+            # pipeline above all, brings the question back
+            if [ "${choice}" = "approvals" ]; then
+                bypass_approval_rules "${n}" "${rules}" || return 1
+            fi
             merge_item "${n}"
             rc=$?
             [ "${rc}" -eq "${RC_MERGE_BLOCKED}" ] && { ask_merge_bypass "${n}" 1; rc=$?; }
