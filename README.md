@@ -583,7 +583,7 @@ git-search <query> [--gitlab|--github]
 ```
 
 ### git-tag
-Create, delete, or recreate a git tag.
+Create, delete, or recreate a git tag. After pushing a tag, the pipeline it triggered opens in [git-pipe](#git-pipe), which ends on its own once the pipeline succeeded; a failed pipeline keeps it open to look into and retry.
 ```bash
 git-tag [<tag>] [-d] [-r] [-y]
 ```

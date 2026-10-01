@@ -176,6 +176,7 @@ if [ "${create}" -eq 1 ]; then
 
     # the pipeline of interest is the one the tag just pushed triggered, so ask
     # for that ref instead of the branch and skip the tag queries; it takes a
-    # moment to exist, hence --wait
-    git-pipe status --ref "${tag}" --no-tags --wait
+    # moment to exist, hence --wait; once it succeeded there is nothing left to
+    # look at, so the view ends on its own
+    git-pipe status --ref "${tag}" --no-tags --wait --exit-on-success
 fi
