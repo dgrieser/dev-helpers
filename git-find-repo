@@ -5,7 +5,7 @@ git-color() { command git-color --color=always "$@"; }
 
 usage() {
     cat <<EOF 1>&2
-usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--list|-L] [--print-history|--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-id|->
+usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--list|-L] [--print-history|--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-url|pr-url|mr-id|->
 EOF
     exit 1
 }
@@ -371,10 +371,11 @@ update_listing() {
 checkout_requested_ref() {
     local repo_path
     local branch
+    local info
 
     repo_path="${1}"
     [ "${no_checkout}" -eq 1 ] && return 0
-    [ -z "${checkout_mr_id}" ] && [ -z "${checkout_source_branch}" ] && return 0
+    [ -z "${checkout_mr_id}" ] && [ -z "${checkout_pr_id}" ] && [ -z "${checkout_source_branch}" ] && return 0
 
     (
         cd "${repo_path}" || fail "Unable to change directory to: ${repo_path}"
@@ -382,8 +383,28 @@ checkout_requested_ref() {
         git-color pull 1>&2 || fail "Unable to pull default branch"
         branch="${checkout_source_branch}"
         if [ -n "${checkout_mr_id}" ]; then
-            branch="$(glab mr view "${checkout_mr_id}" -F json | jq -r '.source_branch')"
+            info="$(glab mr view "${checkout_mr_id}" -F json)" || fail "Unable to get MR: ${checkout_mr_id}"
+            branch="$(jq -r '.source_branch' <<< "${info}")"
             { [ -n "${branch}" ] && [ "${branch}" != "null" ]; } || fail "Unable to get source branch for MR: ${checkout_mr_id}"
+            # the source branch of a fork MR does not exist on origin; prefix the
+            # local branch with the fork owner so it cannot clash with ours
+            if [ "$(jq -r '.source_project_id != .target_project_id' <<< "${info}")" = "true" ]; then
+                branch="$(jq -r '.author.username' <<< "${info}")/${branch}"
+                note "MR ${checkout_mr_id} is from a fork, checking out as: ${branch}"
+                glab mr checkout "${checkout_mr_id}" --branch "${branch}" 1>&2 || fail "Unable to checkout fork MR: ${checkout_mr_id}"
+                exit 0
+            fi
+        elif [ -n "${checkout_pr_id}" ]; then
+            info="$(gh pr view "${checkout_pr_id}" --json headRefName,isCrossRepository,headRepositoryOwner)" || fail "Unable to get PR: ${checkout_pr_id}"
+            branch="$(jq -r '.headRefName' <<< "${info}")"
+            { [ -n "${branch}" ] && [ "${branch}" != "null" ]; } || fail "Unable to get source branch for PR: ${checkout_pr_id}"
+            # see fork MR handling above
+            if [ "$(jq -r '.isCrossRepository' <<< "${info}")" = "true" ]; then
+                branch="$(jq -r '.headRepositoryOwner.login' <<< "${info}")/${branch}"
+                note "PR ${checkout_pr_id} is from a fork, checking out as: ${branch}"
+                gh pr checkout "${checkout_pr_id}" --branch "${branch}" 1>&2 || fail "Unable to checkout fork PR: ${checkout_pr_id}"
+                exit 0
+            fi
         else
             note "Switching to source branch: ${branch}"
         fi
@@ -490,6 +511,7 @@ if [ "${project}" = "-" ]; then
 fi
 
 checkout_mr_id=""
+checkout_pr_id=""
 checkout_source_branch=""
 
 # a bare or !-prefixed MR number refers to the current repo, not a project name
@@ -504,6 +526,11 @@ fi
 
 url=""
 
+# a scheme-less URL (host/owner/repo...) is treated as https
+if [[ "${project}" != *":"* ]] && [[ "${project}" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/ ]]; then
+    project="https://${project}"
+fi
+
 if [[ "${project}" == *":/"* ]]; then
     url="${project}"
     if [[ "${url}" == *"/-/"* ]]; then
@@ -517,6 +544,19 @@ if [[ "${project}" == *":/"* ]]; then
                 ;;
         esac
         url="${url%%/-/*}"
+    elif [[ "${url}" =~ ^[^:/]+://[^/]+/[^/]+/[^/]+/(pull|tree)/ ]]; then
+        # GitHub style: https://github.com/<owner>/<repo>/pull/<id> or .../tree/<branch>
+        url_base="$(echo "${url}" | sed -E 's|^([^:/]+://[^/]+/[^/]+/[^/]+)/.*$|\1|')"
+        url_ref="${url#${url_base}/}"
+        case "${url_ref}" in
+            pull/*)
+                checkout_pr_id="$(echo "${url_ref}" | grep -oE '^pull/[0-9]+' | grep -oE '[0-9]+$')"
+                ;;
+            tree/*)
+                checkout_source_branch="$(echo "${url_ref}" | sed -E 's|^tree/([^?#]+).*$|\1|')"
+                ;;
+        esac
+        url="${url_base}"
     fi
     project="$(echo "${url}" | sed -E 's|^[^:/]+:/{1,2}[^/]*||; s|[?#].*$||; s|\.git$||')"
 elif [[ "${project}" == *":"* ]]; then
