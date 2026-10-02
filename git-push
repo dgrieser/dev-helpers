@@ -232,9 +232,10 @@ pipe_args=(--ref "${BRANCH_SHORT}" --no-tags)
 # a push that went through triggered a pipeline for the commit it pushed; that
 # commit is watched rather than the newest pipeline of the branch, which is
 # still the one of the commit before for a moment, and the view ends on its own
-# once it succeeded
+# once it succeeded. A branch without any pipeline is reported right away, the
+# picker's first reload picks up a pipeline that was not there yet
 if [ "${push_rc}" -eq 0 ] \
     && pushed_sha="$(git -C "${git_dir}" rev-parse -q --verify "${BRANCH}^{commit}")"; then
-    pipe_args+=(--sha "${pushed_sha}" --wait --exit-on-success)
+    pipe_args+=(--sha "${pushed_sha}" --exit-on-success)
 fi
 git-pipe status "${pipe_args[@]}"
