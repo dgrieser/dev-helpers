@@ -14,7 +14,8 @@ Commit and push a branch, then offer the request it is still missing.
 A clean working tree makes this a plain push. Otherwise the changes are staged
 with git-add and committed first. Once the push is through, a merge request or
 pull request is offered when the branch has none, and the pipelines of the
-branch are shown with git-pipe.
+branch are shown with git-pipe, which ends on its own once the pipeline of the
+pushed commit succeeded.
 
 BRANCH                        The branch to push; defaults to the checked out one.
 
@@ -227,4 +228,13 @@ fi
 
 # the pipelines of interest after a push are the ones of the branch it went to,
 # so the tag queries are only latency here
-git-pipe status --no-tags
+pipe_args=(--ref "${BRANCH_SHORT}" --no-tags)
+# a push that went through triggered a pipeline for the commit it pushed; that
+# commit is watched rather than the newest pipeline of the branch, which is
+# still the one of the commit before for a moment, and the view ends on its own
+# once it succeeded
+if [ "${push_rc}" -eq 0 ] \
+    && pushed_sha="$(git -C "${git_dir}" rev-parse -q --verify "${BRANCH}^{commit}")"; then
+    pipe_args+=(--sha "${pushed_sha}" --wait --exit-on-success)
+fi
+git-pipe status "${pipe_args[@]}"

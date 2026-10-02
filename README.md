@@ -479,12 +479,12 @@ Results open in an interactive picker with the pipeline's jobs in the preview: `
 
 The jobs of a pipeline open in a picker of their own (`-j <pipeline>` opens it directly), with the details of the selected job and the tail of its log in the preview: `enter` pages the whole log, `ctrl-y` copies the job URL, `ctrl-o` opens it in the browser, `alt-x` retries the job after asking, `esc` returns to the pipeline list. The preview keeps up with the log of a job that is still running; on GitHub a job has no log before it finished, so its steps take the place of the log until then.
 
-`--exit-on-success` ends the picker with exit code 0 once every pipeline of the newest commit of the ref succeeded (in the jobs picker: of the commit of its pipeline), which lets a script wait for CI and carry on. A failed pipeline leaves the picker open so it can be looked into and retried; leaving it by hand exits non-zero. Without the picker (`-p`, `-o json`) the exit code says whether the pipelines of the newest commit succeeded already.
+`--exit-on-success` ends the picker with exit code 0 once every pipeline of the newest commit of the ref succeeded (in the jobs picker: of the commit of its pipeline), which lets a script wait for CI and carry on. A failed pipeline leaves the picker open so it can be looked into and retried; leaving it by hand exits non-zero. Without the picker (`-p`, `-o json`) the exit code says whether the pipelines of the newest commit succeeded already. `--sha <sha>` watches that commit instead of the newest one of the ref, and makes `--wait` wait for a pipeline of it - right after a push the newest pipeline is still the one of the commit before.
 
 The ref, the source, the status and the user of a pipeline are columns of the list, so filtering by them is on the screen already. `--grep` and `--var` are not - they drop pipelines with nothing saying why the list is as short as it is - so the footer leads with them when they are used, followed by whether `tab` currently narrows the list down to what is running.
 ```bash
 git-pipe status [-r <project>] [--ref <ref>] [--tags <N>|--no-tags] [-q <query>] [-w <seconds>] \
-                [--wait [<seconds>]] [--exit-on-success] [-p] [-o txt|json]
+                [--wait [<seconds>]] [--exit-on-success] [--sha <sha>] [-p] [-o txt|json]
 git-pipe -j <pipeline> [-r <project>] [-w <seconds>] [--exit-on-success] [-p] [-o txt|json]
 git-pipe search [-r <project>] [--ref <ref>|--all-refs] [--tags <N>|--no-tags] \
                 [--var <NAME[=VALUE]>] [--grep <pattern>] \
@@ -523,7 +523,9 @@ caller that has settled the question already, such as
 nothing else, so the request is still offered, and a tree with changes in it is
 refused rather than committed unasked. The "To create a merge request"
 hint GitLab and GitHub answer such a push with settles the question for free;
-without it the provider is asked.
+without it the provider is asked. After a push that went through, the pipeline
+of the pushed commit opens in [git-pipe](#git-pipe), which ends on its own once
+it succeeded; a failed pipeline keeps it open to look into and retry.
 
 ### git-rebase
 Replay the commits of the current branch on top of another branch, or pick up a

@@ -104,6 +104,10 @@ Options:
                             (default ${WAIT_SECONDS_DEFAULT} when no value is given)
         --exit-on-success   end the picker with exit code 0 once the pipelines of
                             the newest commit succeeded
+        --sha <SHA>         the commit --exit-on-success watches and --wait waits
+                            for instead of the newest one of the ref; right
+                            after a push the newest pipeline is still the one
+                            of the commit before
 
 search options:
         --all-refs            do not filter by ref (search all refs)
@@ -1185,6 +1189,7 @@ write_state() {
         printf 'per_page=%q\n' "${per_page}"
         printf 'paginate=%q\n' "${paginate}"
         printf 'exit_on_success=%q\n' "${exit_on_success}"
+        printf 'watch_sha=%q\n' "${watch_sha}"
         printf 'success_file=%q\n' "${success_file}"
         # the jobs view lists one pipeline instead of a result set of its own
         printf 'jobs_pipeline_id=%q\n' "${jobs_pipeline_id}"
@@ -1205,14 +1210,19 @@ fetch_pipelines() {
     annotate_users "${pipelines}"
 }
 
+count_wait_pipelines() {
+    jq --arg sha "${watch_sha}" '[ .[] | select($sha == "" or .sha == $sha) ] | length' <<< "${1}"
+}
+
 # The pipeline of a ref that was just pushed does not exist the moment the push
 # returns, so asking for it right away answers with nothing. --wait keeps asking
-# until one shows up or the time is up.
+# until one shows up or the time is up. With --sha the older pipelines of the
+# ref do not count, only one of that commit does.
 wait_for_pipelines() {
     local pipelines="${1}"
     local count deadline left nap
 
-    count="$(jq 'length' <<< "${pipelines}")"
+    count="$(count_wait_pipelines "${pipelines}")"
     { [ "${count}" -gt 0 ] || [ "${wait_seconds}" -le 0 ]; } \
         && { printf '%s\n' "${pipelines}"; return 0; }
 
@@ -1224,7 +1234,7 @@ wait_for_pipelines() {
         [ "${left}" -lt "${nap}" ] && nap="${left}"
         sleep "${nap}"
         pipelines="$(fetch_pipelines)" || return 1
-        count="$(jq 'length' <<< "${pipelines}")"
+        count="$(count_wait_pipelines "${pipelines}")"
         [ "${count}" -gt 0 ] && break
     done
     printf '%s\n' "${pipelines}"
@@ -1385,6 +1395,7 @@ jobs_pipeline_id=""
 jobs_pipeline_json=""
 remote_repository=""
 exit_on_success=0
+watch_sha=""
 
 add_status() {
     statuses+=("${1}")
@@ -1449,6 +1460,11 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --exit-on-success)
             exit_on_success=1
+            ;;
+        --sha)
+            shift
+            [ -z "${1:-}" ] && error "Missing sha argument" && usage
+            watch_sha="${1}"
             ;;
         --success-check)
             mode="success-check"
@@ -1619,7 +1635,7 @@ if [ "${id_given}" -eq 1 ] && [ -f "${STATE_FILE}" ] && [ -f "${JSON_FILE}" ]; t
             fi
             [ -z "${pipelines}" ] && pipelines="$(cat "${JSON_FILE}")"
             [ "${exit_on_success}" -eq 1 ] \
-                && record_commit_state "$(commit_pipelines_state "${pipelines}")"
+                && record_commit_state "$(commit_pipelines_state "${pipelines}" "${watch_sha}")"
             print_pipelines "$(filter_active "${pipelines}")"
             exit 0
             ;;
@@ -1773,7 +1789,7 @@ fi
 # without the picker there is nothing to wait in, the pipelines of the commit
 # either succeeded already or they did not
 if [ "${exit_on_success}" -eq 1 ] && [ ! -e "${success_file}" ] \
-    && [ "$(commit_pipelines_state "${pipelines}")" != "success" ]; then
+    && [ "$(commit_pipelines_state "${pipelines}" "${watch_sha}")" != "success" ]; then
     [ "${exit_code}" -eq 0 ] && exit_code=1
 fi
 
