@@ -189,7 +189,9 @@ Actions:
   -a, --approve           approve the selected request
   -M, --merge             merge the selected request and delete its source
                           branch; when it is checked out, switch to the
-                          target branch and pull it
+                          target branch and pull it; in a linked worktree
+                          (see git-worktree) the worktree is removed once the
+                          run ends and the main tree takes the target branch
   -C, --close             close the selected request, then ask whether to
                           delete its source branch
   -D, --delete            delete the selected request (GitLab only), then ask
@@ -937,10 +939,45 @@ show_item_pipeline() {
     return 0
 }
 
+# the target branch takes the place of the merged one and is pulled, so the
+# merge is there locally too
+switch_to_target_branch() {
+    local target_branch="${1}"
+
+    need_cmd git-checkout
+    need_cmd git-pull
+    echo 1>&2
+    git-checkout "${target_branch}" 1>&2 \
+        || { error "Failed to check out ${target_branch}"; return 1; }
+    git-pull 1>&2 || warning "Failed to pull ${target_branch}"
+}
+
+delete_merged_branch() {
+    local source_branch="${1}"
+
+    git show-ref --verify --quiet "refs/heads/${source_branch}" || return 0
+    # a squash or rebase merge leaves the branch unmerged in the eyes of git,
+    # so -d would refuse it
+    git-color branch -D "${source_branch}" 1>&2 \
+        || { error "Failed to delete branch ${source_branch}"; return 1; }
+}
+
+# a linked worktree, the ones git-worktree adds among them, has a git dir of its
+# own next to the common one of the main tree
+in_linked_worktree() {
+    local git_dir common_dir
+
+    git_dir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 1
+    common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+    [ "${git_dir}" != "${common_dir}" ]
+}
+
 # the provider removed the source branch of a merged request, what is left of it
-# is the local branch. When it is checked out, the target branch takes its place
-# and is pulled, so the merge is there locally too. The default and the
-# production branch are never deleted
+# is the local branch. When it is checked out, the target branch takes its place.
+# Checked out in a linked worktree, the worktree goes instead and the main tree
+# takes the target branch, which waits for the end of the run, see
+# cleanup_merged_worktree. The default and the production branch are never
+# deleted
 cleanup_merged_branch() {
     local json="${1}"
     local source_branch target_branch default current
@@ -955,18 +992,39 @@ cleanup_merged_branch() {
     if [ "${current}" = "${source_branch}" ]; then
         [ -z "${target_branch}" ] || [ "${target_branch}" = "-" ] && target_branch="${default}"
         [ -z "${target_branch}" ] && { error "Failed to determine the target branch"; return 1; }
-        need_cmd git-checkout
-        need_cmd git-pull
-        echo 1>&2
-        git-checkout "${target_branch}" 1>&2 \
-            || { error "Failed to check out ${target_branch}"; return 1; }
-        git-pull 1>&2 || warning "Failed to pull ${target_branch}"
+        if in_linked_worktree; then
+            printf '%s\t%s\t%s\n' "$(git rev-parse --show-toplevel)" "${source_branch}" \
+                "${target_branch}" > "${WORKTREE_FILE}"
+            return 0
+        fi
+        switch_to_target_branch "${target_branch}" || return 1
     fi
-    git show-ref --verify --quiet "refs/heads/${source_branch}" || return 0
-    # a squash or rebase merge leaves the branch unmerged in the eyes of git,
-    # so -d would refuse it
-    git-color branch -D "${source_branch}" 1>&2 \
-        || { error "Failed to delete branch ${source_branch}"; return 1; }
+    delete_merged_branch "${source_branch}"
+}
+
+# the picker that merged, and every key it calls back with, still runs in the
+# worktree of the merged branch, and a shell started in a removed directory
+# complains on every call, so the worktree is only removed once the run ends.
+# The main tree takes its place: the target branch is checked out there and
+# pulled, then the source branch is deleted. A worktree a switch in the picker
+# moved to another branch is still in use and stays, and so does one with
+# changes that are not committed, which git refuses to remove
+cleanup_merged_worktree() {
+    local worktree source_branch target_branch main_dir
+
+    [ -s "${WORKTREE_FILE}" ] || return 0
+    IFS=$'\t' read -r worktree source_branch target_branch < "${WORKTREE_FILE}"
+    [ "$(git -C "${worktree}" branch --show-current 2>/dev/null)" = "${source_branch}" ] || return 0
+    # the main tree is always the first one git lists
+    main_dir="$(git -C "${worktree}" worktree list --porcelain | sed -n '1s/^worktree //p')"
+    [ -z "${main_dir}" ] && { error "Failed to determine the main tree of ${worktree}"; return 1; }
+    cd "${main_dir}" 1>/dev/null || { error "Failed to change to: ${main_dir}"; return 1; }
+    echo 1>&2
+    git-color worktree remove "${worktree}" 1>&2 \
+        || { error "Failed to remove worktree ${worktree}"; return 1; }
+    echo "Removed worktree ${worktree}, the main tree is ${main_dir}" 1>&2
+    switch_to_target_branch "${target_branch}" || return 1
+    delete_merged_branch "${source_branch}"
 }
 
 # mode is empty for a plain merge, bypass to merge past the requirements and auto
@@ -2188,6 +2246,8 @@ while [ "${#}" -gt 0 ]; do
 done
 
 STATE_FILE="/tmp/${APP_NAME}-${id}.state"
+# the worktree a merge left behind, for the run that opened the picker to remove
+WORKTREE_FILE="/tmp/${APP_NAME}-${id}.worktree"
 
 # the picker calls back into the script, those runs reuse the state of the run
 # that opened it
@@ -2283,7 +2343,9 @@ echo 1>&2
 print_context 1>&2
 echo 1>&2
 
-trap 'rm -f "${STATE_FILE}"' EXIT
+trap 'rm -f "${STATE_FILE}" "${WORKTREE_FILE}"' EXIT
+# a file an earlier run with the same id left behind holds no merge of this run
+rm -f "${WORKTREE_FILE}"
 write_state
 
 exit_code=0
@@ -2316,6 +2378,7 @@ else
         exit_code="${?}"
     fi
 fi
+cleanup_merged_worktree || exit_code=1
 
 if [ "${cded}" -eq 1 ]; then
     cd - &>/dev/null || true

@@ -423,7 +423,11 @@ be deleted locally and on the remote as well; deleting a request is GitLab only,
 because the GitHub API can not delete a pull request. Merging deletes the
 source branch on the remote (GitHub `--delete-branch`, GitLab
 `--remove-source-branch`) and locally; when it is checked out, the target branch
-is checked out instead and pulled with [git-pull](#git-pull). An auto-merge
+is checked out instead and pulled with [git-pull](#git-pull). Checked out in a
+linked worktree, such as one [git-worktree](#git-worktree) adds, the worktree is
+removed once the run ends and the main tree takes the target branch instead; a
+worktree with uncommitted changes is kept. The shell stays in the removed
+directory, the path of the main tree is printed to change into. An auto-merge
 keeps the local branch, nothing is merged yet. `-n` shows one request
 without the picker, `-p` prints the list. `-A` starts with every state instead
 of the open ones.
