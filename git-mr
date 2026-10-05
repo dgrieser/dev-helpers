@@ -68,6 +68,11 @@ PIPELINE_UNSUCCESSFUL_STATES="failed canceled cancelled manual blocked failure e
 # how often a pipeline that is waited for before the merge is asked about
 PIPELINE_POLL_SECONDS=10
 
+# how long GitLab gets to apply approval rules changed right before the merge,
+# and how often its merge status is asked about meanwhile
+APPROVAL_SYNC_SECONDS=60
+APPROVAL_SYNC_POLL_SECONDS=2
+
 JQ_STATE_COLOR='
     def statecolor:
         if . == "open" or . == "opened" then "\u001b[32m"
@@ -159,7 +164,8 @@ requirement is met (--auto, on GitLab --auto-merge), or leaving the request
 alone. A missing approval the GitLab rules make mandatory blocks the forced merge
 as well, so there the rules of the request can be bypassed instead, preselected
 unless a pipeline runs: every rule still asking for approvals is set to require
-none, then the request is merged; a code owner rule and a project that prevents
+none, GitLab gets up to a minute to apply that to the merge status, then the
+request is merged; a code owner rule and a project that prevents
 editing the rules in merge requests leave nothing to bypass. Above that question
 stand the state of the pipeline and what the provider still waits for, so the
 question is answered against what is actually blocking.
@@ -1067,6 +1073,42 @@ bypass_approval_rules() {
     done <<< "${rules}"
 }
 
+# GitLab applies changed approval rules to the merge status only after a while
+# and refuses the merge with a bare 405 until it has; the few reads merge_status
+# allows a stale status fall short of that. So after the rules changed, the
+# status is polled until it reports something besides the approvals, or the time
+# is up; a merge after that fails on its own if GitLab still has not caught up
+wait_for_approval_sync() {
+    local n="${1}"
+    local status
+    local started="${SECONDS}"
+    local waiting=0
+
+    while :; do
+        status="$(glab mr view "${n}" --output json 2>/dev/null \
+            | jq -r '.detailed_merge_status // empty')"
+        case " not_approved approvals_syncing ${GITLAB_TRANSIENT_STATUSES} " in
+            *" ${status} "*) ;;
+            *) break ;;
+        esac
+        if [ $((SECONDS - started)) -ge "${APPROVAL_SYNC_SECONDS}" ]; then
+            [ "${waiting}" -eq 1 ] && [ -t 2 ] && printf '\r\033[K' 1>&2
+            warning "${remote_host} still reports ${status//_/ } for $(item_ref "${n}"), merging anyway"
+            return 0
+        fi
+        if [ "${waiting}" -eq 0 ]; then
+            printf 'Waiting for %s to apply the approval rules of %s (ctrl-c to abort)...\n' \
+                "${remote_host}" "$(item_ref "${n}")" 1>&2
+            waiting=1
+        fi
+        [ -t 2 ] && printf '\r%sMerge status:%s %s (%ds)' "${C_LABEL}" "${C_RESET}" \
+            "${status//_/ }" "$((SECONDS - started))" 1>&2
+        sleep "${APPROVAL_SYNC_POLL_SECONDS}"
+    done
+    [ "${waiting}" -eq 1 ] && [ -t 2 ] && printf '\r\033[K' 1>&2
+    return 0
+}
+
 # a refused approval and a blocked merge both fall back to the same question:
 # merge past the requirements, wait for them, or leave the request alone. When
 # the provider reports nothing blocking, the approval it refused was not
@@ -1223,6 +1265,7 @@ ask_merge_bypass() {
             # pipeline above all, brings the question back
             if [ "${choice}" = "approvals" ]; then
                 bypass_approval_rules "${n}" "${rules}" || return 1
+                wait_for_approval_sync "${n}"
             fi
             merge_item "${n}"
             rc=$?

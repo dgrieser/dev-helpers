@@ -442,7 +442,8 @@ through, the merge offers three ways on: merging past the requirements (GitHub
 every requirement is met (`--auto`, on GitLab `--auto-merge`), or leaving the
 request alone. A missing approval the GitLab rules make mandatory blocks the
 forced merge as well, so there `Bypass approval rules and merge` sets every rule
-of the request still asking for approvals to require none, then merges; it is
+of the request still asking for approvals to require none, waits up to a minute
+for GitLab to apply that to the merge status, then merges; it is
 preselected unless a pipeline runs, and not offered for a code owner rule or a
 project that prevents editing the rules in merge requests. While the pipeline
 runs, a further way leads: wait for it, then
