@@ -40,11 +40,11 @@ done
 matches=""
 if [ ${gitlab} -eq 1 ]; then
     [ -n "${matches}" ] && matches="${matches}${NL}"
-    matches="${matches}$(glab repo search -s "${query}" -F json | jq -r '.[].web_url')"
+    matches="${matches}$(glab repo search -s "${query}" -F json | jq -r 'arrays | .[].web_url // empty')"
 fi
 if [ ${github} -eq 1 ]; then
     [ -n "${matches}" ] && matches="${matches}${NL}"
-    matches="${matches}$(gh search repos "${query}" --json url | jq -r '.[].url')"
+    matches="${matches}$(gh search repos "${query}" --json url | jq -r 'arrays | .[].url // empty')"
 fi
 [ -n "${matches}" ] && echo "${matches}"
 exit 0
