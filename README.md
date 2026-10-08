@@ -258,6 +258,17 @@ List, inspect, filter, delete GitLab container registry tags for current repo.
 git-container <check|list|delete> [ID] [-n <name>] [-t <tag>] [-o txt|json]
 ```
 
+### git-copy-unpushed
+Find the git repos under the workspace of an old system (e.g. its mounted disk)
+with work that is on no remote: local changes, a stash, unpushed commits or no
+remote at all. Without `--copy` it only lists them with their size and why; with
+it, each is copied (`rsync -a`) to the same path under the new workspace
+(`-d/--dest`, default `~/workspace`), skipping a destination that exists. A repo
+nested in a copied or excluded one (`-x/--exclude`, repeatable) comes along with it.
+```bash
+git-copy-unpushed [--copy] [-d <dest>] [-x <path>]... <source>
+```
+
 ### git-create
 Create a new GitLab repo under `$WORKSPACE` via `glab`.
 ```bash

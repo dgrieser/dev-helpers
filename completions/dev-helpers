@@ -369,6 +369,28 @@ _git-default()
 }
 complete -F _git-default git-default
 
+_git-copy-unpushed()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -d|--dest)
+            __dh_dirs
+            return 0
+            ;;
+        -x|--exclude)
+            return 0
+            ;;
+    esac
+    if [[ "${cur}" == -* ]]; then
+        __dh_compgen "--copy -d --dest -x --exclude -h --help"
+    else
+        __dh_dirs
+    fi
+    return 0
+}
+complete -F _git-copy-unpushed git-copy-unpushed
+
 _git-diff()
 {
     local cur prev

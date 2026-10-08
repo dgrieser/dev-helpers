@@ -1,0 +1,139 @@
+#!/bin/bash
+
+# Copies the git repos under the old system's workspace that exist nowhere else:
+# uncommitted or untracked changes, a stash, commits on no remote branch, or no
+# remote at all. Each goes to the same relative path under the new workspace;
+# a destination that already exists is skipped, never overwritten.
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} [OPTIONS] SOURCE
+
+Find the git repos under SOURCE, the workspace of an old system (e.g. its
+mounted disk), with work that is on no remote: local changes, a stash,
+unpushed commits or no remote at all. Without --copy it only lists them.
+
+Arguments:
+  SOURCE                Old workspace
+
+Options:
+  --copy                Copy them (rsync -a) to the same path under DEST; an
+                        existing destination is skipped, never overwritten
+  -d, --dest DEST       New workspace (default: ~/workspace)
+  -x, --exclude PATH    Repo path relative to SOURCE to leave out, with the
+                        repos in it; repeatable
+  -h, --help            Show this help message and exit
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+copy=0
+src=""
+dst="${HOME}/workspace"
+excludes=()
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        --copy)
+            copy=1
+            ;;
+        -d|--dest)
+            shift
+            [ -z "${1}" ] && usage
+            dst="${1%/}"
+            ;;
+        -x|--exclude)
+            shift
+            [ -z "${1}" ] && usage
+            excludes+=("${1%/}")
+            ;;
+        -*)
+            error "Unknown option: ${1}"
+            usage
+            ;;
+        *)
+            [ -n "${src}" ] && error "Unexpected argument: ${1}" && usage
+            src="${1%/}"
+            ;;
+    esac
+    shift
+done
+
+[ -z "${src}" ] && usage
+[ -d "${src}" ] || fail "Source ${src} not found (old disk mounted?)"
+command -v rsync > /dev/null 2>&1 || fail "rsync is required"
+
+# why a repo needs copying, empty when everything is on a remote
+reasons() {
+    local repo="${1}"
+    local -a why=()
+    local -a git=(git -C "${repo}" -c safe.directory='*')
+    [ -z "$("${git[@]}" remote 2>/dev/null)" ] && why+=("no remote")
+    [ -n "$("${git[@]}" status --porcelain 2>/dev/null | head -1)" ] && why+=("local changes")
+    [ -n "$("${git[@]}" stash list 2>/dev/null | head -1)" ] && why+=("stash")
+    # commits on local branches that no remote-tracking branch contains
+    local unpushed
+    unpushed="$("${git[@]}" rev-list --count --branches --not --remotes 2>/dev/null)"
+    [ "${unpushed:-0}" -gt 0 ] && why+=("${unpushed} unpushed commit(s)")
+    local IFS=", "
+    echo "${why[*]}"
+}
+
+copied=0
+skipped=0
+found=0
+last_copied=""
+# repos sorted by path, so a repo is seen before the ones nested in it
+while read -r gitdir; do
+    repo="$(dirname "${gitdir}")"
+    rel="${repo#"${src}"/}"
+    # a nested repo comes along with its parent anyway
+    if [ -n "${last_copied}" ] && [[ "${repo}" == "${last_copied}"/* ]]; then
+        continue
+    fi
+    excluded=0
+    for exclude in "${excludes[@]}"; do
+        [ "${rel}" = "${exclude}" ] || [[ "${rel}" == "${exclude}"/* ]] && excluded=1
+    done
+    if [ ${excluded} -eq 1 ]; then
+        # skips nested repos of an excluded one as well
+        last_copied="${repo}"
+        continue
+    fi
+    why="$(reasons "${repo}")"
+    [ -z "${why}" ] && continue
+    found=$((found + 1))
+    size="$(du -sh "${repo}" 2>/dev/null | cut -f1)"
+    if [ -e "${dst}/${rel}" ]; then
+        printf 'SKIP  %-60s %6s  %s (exists in %s)\n' "${rel}" "${size}" "${why}" "${dst}"
+        skipped=$((skipped + 1))
+        continue
+    fi
+    printf '%s  %-60s %6s  %s\n' "$([ ${copy} -eq 1 ] && echo COPY || echo WOULD)" "${rel}" "${size}" "${why}"
+    last_copied="${repo}"
+    if [ ${copy} -eq 1 ]; then
+        mkdir -p "$(dirname "${dst}/${rel}")"
+        rsync -a "${repo}/" "${dst}/${rel}/" || { error "Copying ${rel} failed"; continue; }
+        copied=$((copied + 1))
+    fi
+done < <(find "${src}" -name node_modules -prune -o -name .git -print -prune 2>/dev/null | LC_ALL=C sort)
+
+echo
+if [ ${copy} -eq 1 ]; then
+    echo "${found} repo(s) with local-only work: ${copied} copied, ${skipped} skipped (destination exists)"
+else
+    echo "${found} repo(s) with local-only work, ${skipped} of them would be skipped (destination exists); run with --copy to copy"
+fi
