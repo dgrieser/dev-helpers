@@ -107,18 +107,47 @@ current_project_dir() {
     done
 }
 
-last_history_entry() {
+recent_history_entries() {
     local history_file
     local excluded_path
+    local timestamp
+    local history_path
+    local count
 
     history_file="$(history_cache_file)"
     excluded_path="${1}"
+    count=0
     [ -f "${history_file}" ] || return 0
 
-    awk -F '\t' -v excluded_path="${excluded_path}" '
-        NF >= 2 && $2 != excluded_path { last = $2 }
-        END { if (last != "") print last }
-    ' "${history_file}"
+    # newest first, each repo once with the time of its last visit, skipping
+    # the ones deleted since
+    tac "${history_file}" | awk -F '\t' -v excluded_path="${excluded_path}" '
+        NF >= 2 && $2 != excluded_path && !seen[$2]++ { print $1 "\t" $2 }
+    ' | while IFS=$'\t' read -r timestamp history_path; do
+        [ -d "${history_path}" ] || continue
+        printf '%s\t%s\n' "${timestamp}" "${history_path}"
+        count=$((count + 1))
+        [ "${count}" -ge 10 ] && break
+    done
+}
+
+choose_history_entry() {
+    local entries
+    local timestamp
+    local history_path
+    local width
+
+    entries="${1}"
+    width=0
+    while IFS=$'\t' read -r timestamp history_path; do
+        history_path="$(relative_repo_path "${history_path}")"
+        [ "${#history_path}" -gt "${width}" ] && width="${#history_path}"
+    done <<< "${entries}"
+
+    while IFS=$'\t' read -r timestamp history_path; do
+        printf '%s\t%-*s  %s\n' "${history_path}" "${width}" "$(relative_repo_path "${history_path}")" \
+            "${timestamp:0:10} ${timestamp:11:5}"
+    done <<< "${entries}" | prompt-select --prompt "Go to:" --delimiter '\t'
 }
 
 generate_listing() {
@@ -554,8 +583,9 @@ if [ "${print_history_only}" -eq 1 ]; then
 fi
 
 if [ "${project}" = "-" ]; then
-    project="$(last_history_entry "$(current_project_dir)")"
-    [ -n "${project}" ] || fail "No project history found"
+    history_entries="$(recent_history_entries "$(current_project_dir)")"
+    [ -n "${history_entries}" ] || fail "No project history found"
+    project="$(choose_history_entry "${history_entries}")" || exit 1
 fi
 
 checkout_mr_id=""

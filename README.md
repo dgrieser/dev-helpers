@@ -310,7 +310,7 @@ git-diff [-p|--path PATH] [-u|--untracked] [-q|--query QUERY] [--print|-P|--patc
 ```
 
 ### git-find-repo
-Print the path of a repo under `$WORKSPACE` by name, `name#parent` qualifier, relative path, or git URL; `-` jumps to the previous repo from history. Without an exact match, a picker offers every repo whose name contains the requested one (ignoring case) plus finding it online; with no such repo, or for a URL, missing repos are cloned right away unless disabled. GitLab MR (`/-/merge_requests/<id>`) and branch (`/-/tree/<branch>`) URLs also check out and pull the referenced branch unless disabled; a bare or `!`-prefixed MR number does the same for the current repo. Keeps a cached repo listing and a jump history.
+Print the path of a repo under `$WORKSPACE` by name, `name#parent` qualifier, relative path, or git URL; `-` picks one of the last 10 repos from history, newest first. Without an exact match, a picker offers every repo whose name contains the requested one (ignoring case) plus finding it online; with no such repo, or for a URL, missing repos are cloned right away unless disabled. GitLab MR (`/-/merge_requests/<id>`) and branch (`/-/tree/<branch>`) URLs also check out and pull the referenced branch unless disabled; a bare or `!`-prefixed MR number does the same for the current repo. Keeps a cached repo listing and a jump history.
 ```bash
 git-find-repo [--workspace|-W <path>] [--vc-folder|-F <folder>] [--update-listing|-U] \
               [--list|-L] [--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-id|->
