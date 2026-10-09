@@ -345,6 +345,54 @@ find_matching_repos() {
     printf '%s' "${matched_paths}"
 }
 
+find_similar_repos() {
+    local requested_project
+    local listing
+    local listing_entry
+    local repo_path
+    local candidate
+    local similar_paths
+
+    # a qualifier only narrows exact matches, the name alone is looked for here
+    requested_project="${1%%#*}"
+    requested_project="${requested_project,,}"
+    listing="${2}"
+    similar_paths=""
+    [ -z "${requested_project}" ] && return 0
+
+    while IFS= read -r listing_entry; do
+        [ -z "${listing_entry}" ] && continue
+        repo_path="${listing_entry#*$'\t'}"
+        # a name is looked for in the repo name, a path in the relative path
+        case "${requested_project}" in
+            */*)
+                candidate="${repo_path#"${workspace}"/}"
+                ;;
+            *)
+                candidate="${repo_path##*/}"
+                ;;
+        esac
+        [[ "${candidate,,}" == *"${requested_project}"* ]] && similar_paths="${similar_paths}${repo_path}"$'\n'
+    done <<< "${listing}"
+
+    printf '%s' "${similar_paths}"
+}
+
+choose_similar_repo() {
+    local similar_paths
+    local repo_path
+
+    similar_paths="${1}"
+    {
+        while IFS= read -r repo_path; do
+            [ -z "${repo_path}" ] && continue
+            printf '%s\t%s\n' "${repo_path}" "$(relative_repo_path "${repo_path}")"
+        done <<< "${similar_paths}"
+        # the key cannot clash with a repo, those are absolute paths
+        [ "${no_git_clone}" -eq 0 ] && printf '%s\t%s\n' "online" "Find ${project} online"
+    } | prompt-select --prompt "Choose repository:" --delimiter '\t'
+}
+
 update_listing() {
     local cache_file
     local cache_dir
@@ -617,6 +665,20 @@ if [ -z "${matches}" ] && [ "${listing_refreshed}" -eq 0 ]; then
     matches="$(find_matching_repos "${project}" "${listing}")"
 fi
 
+# without an exact match the repos containing the name are offered before going
+# online; a URL names one repo exactly and goes online right away
+not_found_warned=0
+if [ -z "${matches}" ] && [ -z "${url}" ]; then
+    similar="$(find_similar_repos "${project}" "${listing}")"
+    if [ -n "${similar}" ]; then
+        warning "${project} was not found locally."
+        not_found_warned=1
+        echo 1>&2
+        choice="$(choose_similar_repo "${similar}")" || exit 1
+        [ "${choice}" = "online" ] || matches="${choice}"
+    fi
+fi
+
 match="$(printf '%s\n' "${matches}" | sed -n '1p')"
 match_count="$(printf '%s\n' "${matches}" | sed '/^$/d' | wc -l)"
 
@@ -628,7 +690,7 @@ if [ "${match_count}" -gt 1 ]; then
 fi
 
 if [ -z "${match}" ] && [ "${no_git_clone}" -eq 0 ]; then
-    warning "${project} was not found locally."
+    [ "${not_found_warned}" -eq 1 ] || warning "${project} was not found locally."
     clone_url="${url:-${project}}"
     note "Attempting to clone ${clone_url} ..."
     echo 1>&2
