@@ -156,6 +156,8 @@ Before a create, a branch the remote has but GitLab does not know yet is waited
 for; GitLab registers a pushed branch in the background, and a create before
 that fails with "source_branch does not exist". A create that fails that way
 after glab pushed the branch itself is retried once GitLab knows the branch.
+Once a create or a recover went through, a question asks whether to copy a
+channel message for the new request (default no).
 
 Showing a request prints the view of the provider, without its diff, and asks
 what to do with it: approve + merge (tab switches to approve or merge only),
@@ -679,6 +681,15 @@ open_item() {
     else
         glab mr view "${n}" --web
     fi
+}
+
+# not every new request gets announced, so its channel message only goes to the
+# clipboard when the user asks for it, never by default
+ask_copy_message() {
+    local n="${1}"
+
+    prompt-no-yes "Copy a channel message for '$(item_ref "${n}")'?" || return 0
+    copy_message "${n}"
 }
 
 copy_message() {
@@ -1861,7 +1872,7 @@ recover_request() {
     submit_recovery "${source_branch}" || fail "Failed to recover the ${NOUN}"
 
     n="$(wait_for_request "${source_branch}")" || return 0
-    copy_message "${n}"
+    ask_copy_message "${n}"
     return 0
 }
 
@@ -1949,7 +1960,7 @@ create_request() {
     fi
 
     n="$(wait_for_request "${source_branch}")" || return 0
-    copy_message "${n}"
+    ask_copy_message "${n}"
     return 0
 }
 

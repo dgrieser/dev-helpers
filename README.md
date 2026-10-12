@@ -421,6 +421,10 @@ it (up to 2 minutes). When `glab` pushes the branch itself and the create fails
 that way, the create is retried from the saved options once GitLab knows the
 branch.
 
+Once a create or a recover went through, a question asks whether to copy a
+channel message for the new request (default no); nothing goes to the
+clipboard without that answer.
+
 All of those but the chosen action, creating an issue and switching to the
 branch - all of which report something the picker would draw over - act inside the picker: showing the diff
 or the comments hands the terminal to the pager, opening the browser and copying
