@@ -406,6 +406,21 @@ branch, `alt-a` approves, `alt-m` merges, `alt-d` toggles draft,
 `esc` goes back. Every other action is a key of the picker or an answer of the
 shown request, so the menu stays two lines long.
 
+When `glab` failed to create a merge request, it saved the options of the
+request (see `glab mr create --recover`). If they are for the current branch,
+the menu offers `recover` as a third way in, preselected unless the branch has
+an open request, and `--create` asks to recover it (default yes) before it asks
+for a new one. Recovering submits the saved title, description and settings
+again without asking for them.
+
+GitLab checks the source branch of a new merge request against a cache that a
+background job renews after each push. A branch pushed moments ago can
+therefore fail the create with `source_branch does not exist`. So before the
+create, a branch that the remote already has is waited for until GitLab knows
+it (up to 2 minutes). When `glab` pushes the branch itself and the create fails
+that way, the create is retried from the saved options once GitLab knows the
+branch.
+
 All of those but the chosen action, creating an issue and switching to the
 branch - all of which report something the picker would draw over - act inside the picker: showing the diff
 or the comments hands the terminal to the pager, opening the browser and copying

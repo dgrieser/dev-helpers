@@ -73,6 +73,11 @@ PIPELINE_POLL_SECONDS=10
 APPROVAL_SYNC_SECONDS=60
 APPROVAL_SYNC_POLL_SECONDS=2
 
+# how long GitLab gets to register a branch pushed right before the create, and
+# how often it is asked about meanwhile
+BRANCH_SYNC_SECONDS=120
+BRANCH_SYNC_POLL_SECONDS=3
+
 JQ_STATE_COLOR='
     def statecolor:
         if . == "open" or . == "opened" then "\u001b[32m"
@@ -144,6 +149,14 @@ request and its diff in the preview, both filters among its keys:
 
 $(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,ctrl-s:switch to its source branch,alt-a:approve,alt-m:merge,alt-d:toggle draft,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
+When glab failed to create a merge request from the current branch, the menu
+offers recover as a third way in, and --create asks to recover it first.
+Recovering submits the options glab saved again (glab mr create --recover).
+Before a create, a branch the remote has but GitLab does not know yet is waited
+for; GitLab registers a pushed branch in the background, and a create before
+that fails with "source_branch does not exist". A create that fails that way
+after glab pushed the branch itself is retried once GitLab knows the branch.
+
 Showing a request prints the view of the provider, without its diff, and asks
 what to do with it: approve + merge (tab switches to approve or merge only),
 copy a channel message, its comments or its diff. Copying the message ends
@@ -185,7 +198,8 @@ A draft can not be merged, so approve + merge and merge ask first whether to
 mark a draft as ready; declining leaves the request alone.
 
 Actions:
-  -c, --create            create a request from the current branch
+  -c, --create            create a request from the current branch, or recover
+                          the one glab failed to create from it
   -a, --approve           approve the selected request
   -M, --merge             merge the selected request and delete its source
                           branch; when it is checked out, switch to the
@@ -1740,6 +1754,147 @@ create_target_branch() {
     git-default 2>/dev/null
 }
 
+create_source_branch() {
+    local source_branch
+
+    source_branch="$(git branch --show-current)"
+    # -k checked out the target branch, so the request comes from the branch
+    # that was checked out before
+    [ -n "${previous_branch}" ] && [ "${previous_branch}" != "${source_branch}" ] \
+        && source_branch="${previous_branch}"
+    printf '%s\n' "${source_branch}"
+}
+
+# GitLab checks the source branch of a new merge request against its cached
+# branch names, which the background job of a push renews; until that job ran,
+# a branch git already has does not exist for the API and the create fails with
+# "source_branch does not exist". The HEAD request asks that same cache
+branch_registered() {
+    glab api --method HEAD \
+        "projects/:fullpath/repository/branches/$(jq -rn --arg b "${1}" '$b | @uri')" \
+        >/dev/null 2>&1
+}
+
+# a branch git does not have yet is not waited for, glab pushes it itself
+# 0 GitLab knows the branch, 1 it does not
+wait_for_branch() {
+    local source_branch="${1}"
+    local started="${SECONDS}"
+    local waiting=0
+
+    while ! branch_registered "${source_branch}"; do
+        if [ "${waiting}" -eq 0 ]; then
+            git ls-remote --exit-code --heads "${remote_url}" "${source_branch}" >/dev/null 2>&1 \
+                || return 1
+            printf 'Waiting for %s to register the branch %s (ctrl-c to abort)...\n' \
+                "${remote_host}" "${source_branch}" 1>&2
+            waiting=1
+        fi
+        if [ $((SECONDS - started)) -ge "${BRANCH_SYNC_SECONDS}" ]; then
+            [ -t 2 ] && printf '\r\033[K' 1>&2
+            warning "${remote_host} still does not know the branch ${source_branch}"
+            return 1
+        fi
+        [ -t 2 ] && printf '\r%sBranch:%s not registered yet (%ds)' "${C_LABEL}" "${C_RESET}" \
+            "$((SECONDS - started))" 1>&2
+        sleep "${BRANCH_SYNC_POLL_SECONDS}"
+    done
+    [ "${waiting}" -eq 1 ] && [ -t 2 ] && printf '\r\033[K' 1>&2
+    return 0
+}
+
+# glab keeps its configuration in the first of these that applies
+glab_config_dir() {
+    if [ -n "${GLAB_CONFIG_DIR:-}" ]; then
+        printf '%s\n' "${GLAB_CONFIG_DIR}"
+    elif [ -f "${HOME}/.config/glab-cli/config.yml" ]; then
+        printf '%s\n' "${HOME}/.config/glab-cli"
+    else
+        printf '%s\n' "${XDG_CONFIG_HOME:-${HOME}/.config}/glab-cli"
+    fi
+}
+
+# a merge request glab failed to create leaves its options in one file per
+# repository, which glab mr create --recover submits again and then removes
+recovery_file() {
+    [ "${provider}" = "gitlab" ] && [ -n "${remote_repository}" ] || return 1
+    printf '%s/recover/%s/mr.json\n' "$(glab_config_dir)" "${remote_repository}"
+}
+
+# 0 a failed create of a request from the given branch can be recovered
+has_recovery() {
+    local source_branch="${1}"
+    local file
+
+    [ -n "${source_branch}" ] || return 1
+    file="$(recovery_file)" || return 1
+    [ -r "${file}" ] || return 1
+    [ "$(jq -r '.source_branch // empty' "${file}" 2>/dev/null)" = "${source_branch}" ]
+}
+
+# glab saved the title with the draft prefix it had added and adds it once more
+# when recovering, so the saved one is taken off first. --yes skips the
+# confirmation the failed create already went through
+submit_recovery() {
+    local source_branch="${1}"
+    local file tmp
+
+    file="$(recovery_file)" || return 1
+    tmp="${file}.tmp"
+    if ! jq 'if .is_draft then .title |= sub("^Draft: "; "") else . end' "${file}" > "${tmp}" \
+        || ! mv "${tmp}" "${file}"; then
+        rm -f "${tmp}"
+        error "Failed to update the recovery file: ${file}"
+        return 1
+    fi
+    wait_for_branch "${source_branch}"
+    glab mr create --recover --yes
+}
+
+recover_request() {
+    local source_branch n
+
+    source_branch="$(create_source_branch)"
+    has_recovery "${source_branch}" || fail "No failed ${NOUN} to recover for ${source_branch}"
+    echo "Recovering the ${NOUN} for ${source_branch} → $(jq -r '.target_branch // "?"' \
+        "$(recovery_file)")..." 1>&2
+    submit_recovery "${source_branch}" || fail "Failed to recover the ${NOUN}"
+
+    n="$(wait_for_request "${source_branch}")" || return 0
+    copy_message "${n}"
+    return 0
+}
+
+# glab pushes a branch the remote does not have yet right before it creates the
+# request, too soon for GitLab to know the branch. A create that failed while
+# git has the branch and GitLab does not is submitted again from the options
+# glab saved once GitLab caught up; any other failure is left to the recovery
+# that the next create offers
+retry_create() {
+    local source_branch="${1}"
+
+    has_recovery "${source_branch}" || return 1
+    branch_registered "${source_branch}" && return 1
+    wait_for_branch "${source_branch}" || return 1
+    echo "Retrying the ${NOUN} now that ${remote_host} knows ${source_branch}..." 1>&2
+    submit_recovery "${source_branch}"
+}
+
+# --create offers the request glab failed to create from this branch before it
+# asks for a new one
+create_or_recover() {
+    local source_branch rc
+
+    source_branch="$(create_source_branch)"
+    if has_recovery "${source_branch}"; then
+        prompt-yes-no "Recover the ${NOUN} \"$(jq -r '.title // empty' "$(recovery_file)")\" that failed to be created?"
+        rc="${?}"
+        [ "${rc}" -eq 0 ] && { recover_request; return "${?}"; }
+        [ "${rc}" -eq "${RC_INTERRUPTED}" ] && abort
+    fi
+    create_request
+}
+
 create_request() {
     local source_branch target_branch default_branch title n
     local draft=0
@@ -1748,11 +1903,7 @@ create_request() {
     local prompt_args=()
     local create_args=()
 
-    source_branch="$(git branch --show-current)"
-    # -k checked out the target branch, so the request comes from the branch
-    # that was checked out before
-    [ -n "${previous_branch}" ] && [ "${previous_branch}" != "${source_branch}" ] \
-        && source_branch="${previous_branch}"
+    source_branch="$(create_source_branch)"
     [ -z "${source_branch}" ] && fail "Failed to determine the current branch (detached HEAD?)"
     default_branch="$(git-default 2>/dev/null)"
     target_branch="$(create_target_branch "${source_branch}")"
@@ -1789,7 +1940,12 @@ create_request() {
         [ "${keep_source_branch}" -eq 0 ] && create_args+=("--remove-source-branch")
         [ "${squash_before_merge}" -eq 1 ] && create_args+=("--squash-before-merge")
         [ "${draft}" -eq 1 ] && create_args+=("--draft")
-        glab mr create "${create_args[@]}" || fail "Failed to create the ${NOUN}"
+        wait_for_branch "${source_branch}"
+        if ! glab mr create "${create_args[@]}" && ! retry_create "${source_branch}"; then
+            has_recovery "${source_branch}" \
+                && fail "Failed to create the ${NOUN}, ${APP_NAME} --create offers to recover it"
+            fail "Failed to create the ${NOUN}"
+        fi
     fi
 
     n="$(wait_for_request "${source_branch}")" || return 0
@@ -1891,8 +2047,12 @@ list_footer() {
 
 # the two ways in, nothing else: every other action is a key of the picker or
 # an answer of the question that follows a shown request, and so are the two
-# filters, which used to be entries here
+# filters, which used to be entries here. A request glab failed to create from
+# this branch adds a third, recovering it
 menu_items() {
+    local recoverable="${1:-0}"
+
+    [ "${recoverable}" -eq 1 ] && printf '%s\n' "recover"
     printf '%s\n' "create" "show"
 }
 
@@ -1955,22 +2115,32 @@ has_open_requests() {
 # it, so widening them is what it is opened for.
 run_menu() {
     local choice rc preselected
+    local recoverable=0
 
+    has_recovery "$(create_source_branch)" && recoverable=1
     # the list decides which way in the menu starts on: with an open request
-    # there is one to show, without one there is one to create. The answer is an
-    # API call, so it is taken once, before the menu opens, and the filters the
-    # picker changes stay with the picker
+    # there is one to show, without one there is one to create, or to recover
+    # when glab failed to create it. The answer is an API call, so it is taken
+    # once, before the menu opens, and the filters the picker changes stay with
+    # the picker
     if has_open_requests; then
         preselected="show"
+    elif [ "${recoverable}" -eq 1 ]; then
+        preselected="recover"
     else
         preselected="create"
     fi
 
     while true; do
-        choice="$(menu_items | prompt-select --default "${preselected}")" || return 0
+        choice="$(menu_items "${recoverable}" | prompt-select --default "${preselected}")" \
+            || return 0
         case "${choice}" in
             create)
                 create_request
+                return "${?}"
+                ;;
+            recover)
+                recover_request
                 return "${?}"
                 ;;
             show)
@@ -2350,7 +2520,7 @@ write_state
 
 exit_code=0
 if [ "${action}" = "create" ]; then
-    create_request
+    create_or_recover
     exit_code="${?}"
 # a piped run without an action prints the list; with an action the picker still
 # opens on the terminal and its output is what gets piped
