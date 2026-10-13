@@ -100,7 +100,8 @@ Options:
                             (default ${WATCH_SECONDS_DEFAULT}, 0 disables auto-reloading)
         --wait [SECONDS]    wait up to SECONDS for a pipeline to show up instead
                             of reporting none right away; a pipeline a push just
-                            triggered takes a moment to exist
+                            triggered takes a moment to exist; a commit
+                            without a CI config is not waited for
                             (default ${WAIT_SECONDS_DEFAULT} when no value is given)
         --exit-on-success   end the picker with exit code 0 once the pipelines of
                             the newest commit succeeded
@@ -1214,6 +1215,24 @@ count_wait_pipelines() {
     jq --arg sha "${watch_sha}" '[ .[] | select($sha == "" or .sha == $sha) ] | length' <<< "${1}"
 }
 
+# A commit without a CI config in its tree gets no pipeline, so there is nothing
+# to wait for. Only the default place of the config is looked at: a GitLab
+# project that takes it from elsewhere, like a custom ci_config_path or Auto
+# DevOps, is reported as it stands right away. A commit that is not here
+# locally cannot be looked into and is waited for
+commit_has_ci_config() {
+    local commit
+
+    commit="$(git rev-parse -q --verify "${watch_sha:-${ref}}^{commit}" 2>/dev/null)" \
+        || return 0
+    if [ "${provider}" = "github" ]; then
+        git ls-tree --name-only "${commit}" .github/workflows/ 2>/dev/null \
+            | grep -qE '\.ya?ml$'
+    else
+        git cat-file -e "${commit}:.gitlab-ci.yml" 2>/dev/null
+    fi
+}
+
 # The pipeline of a ref that was just pushed does not exist the moment the push
 # returns, so asking for it right away answers with nothing. --wait keeps asking
 # until one shows up or the time is up. With --sha the older pipelines of the
@@ -1225,6 +1244,11 @@ wait_for_pipelines() {
     count="$(count_wait_pipelines "${pipelines}")"
     { [ "${count}" -gt 0 ] || [ "${wait_seconds}" -le 0 ]; } \
         && { printf '%s\n' "${pipelines}"; return 0; }
+    if ! commit_has_ci_config; then
+        log "No CI config in the commit, not waiting for a pipeline."
+        printf '%s\n' "${pipelines}"
+        return 0
+    fi
 
     log "No pipelines yet, waiting up to ${wait_seconds}s for one to show up..."
     deadline=$((SECONDS + wait_seconds))
