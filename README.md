@@ -24,8 +24,9 @@ source the stable-named copy from your shell rc after defining the aliases:
 
 ```bash
 source /usr/local/share/bash-completion/completions/dev-helpers
-__dh_register_aliases                    # auto-map aliases to git-* commands
-__dh_complete_alias g git-find-repo      # map wrapper functions explicitly
+__dh_register_aliases                          # auto-map aliases to git-* commands
+__dh_complete_alias g git-find-repo            # map wrapper functions explicitly
+__dh_complete_alias gwdel git-worktree delete  # ... calling it with leading words
 ```
 
 ## Tools
@@ -636,7 +637,7 @@ git-track-branches [-C|--clear]
 Manage mirrored git worktrees under `$WORKSPACE_WORKTREE`, alongside any other
 worktrees of the repository.
 ```bash
-git-worktree [add|list|go|delete|move-to-main] [-b <branch>] [-B <base>] [--fetch|--no-fetch] [-w <dir>]
+git-worktree [add|list|go|delete|move-to-main|interactive] [-b <branch>] [-B <base>] [--fetch|--no-fetch] [-w <dir>]
 ```
 Only `add` is bound to `$WORKSPACE_WORKTREE`. The repository is resolved through
 git from any of its worktrees, so `list`, `go`, `delete` and `move-to-main` also
@@ -664,6 +665,27 @@ already have a worktree instead of every local branch.
 
 `add` refuses a branch that another worktree, the main tree included, already
 has checked out, and prints where it is.
+
+Without a command `git-worktree` asks in a `prompt-select` menu whether to add a
+worktree or to list them in the `interactive` picker. `-b`, `-B`, `--fetch` and
+`--no-fetch` are then only the defaults the questions of the add offer, and the
+menu starts on the add when one of them is given; `add` itself takes them as
+they are. Esc in the picker or in a question of the add goes back to the menu,
+ctrl-c ends the run, and Tab completes the branches the questions ask for.
+`interactive` opens an `fzf-with-header` picker over every worktree of the
+repository, the main tree on top, listing branch, HEAD and state (main tree,
+current, uncommitted, prunable, unregistered), while the preview names path,
+branch, upstream, HEAD, state and changes, followed by the changed files and the
+recent commits. `enter` offers in a menu what fits the worktree under the
+cursor: going to it, which prints its path, moving its uncommitted changes to
+the main tree, or deleting it, with those changes only once that was confirmed;
+esc there returns to the list. `alt-a` asks for a branch on the terminal (the
+search typed so far is the default, else `-b`), adds its worktree and prints
+that path, so a wrapper like
+`gw() { local d; d="$(git-worktree "$@")" && [ -d "${d}" ] && cd "${d}"; }`
+changes into it. `alt-d` and `alt-m` delete and move right from the list, each
+after a confirmation, and the list stays open; leaving it after deleting the
+worktree the shell is in prints the main tree instead.
 
 When `add` has to create the branch, the start point is taken from `-B/--base`
 (asked interactively when omitted, defaulting to the default remote branch) and

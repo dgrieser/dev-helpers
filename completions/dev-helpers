@@ -6,19 +6,46 @@
 # shell rc after defining the aliases and map them:
 #
 #   source /usr/local/share/bash-completion/completions/dev-helpers
-#   __dh_register_aliases                    # auto-map aliases to git-* commands
-#   __dh_complete_alias g git-find-repo      # map wrapper functions explicitly
+#   __dh_register_aliases                        # auto-map aliases to git-* commands
+#   __dh_complete_alias g git-find-repo          # map wrapper functions explicitly
+#   __dh_complete_alias gwdel git-worktree delete  # ... calling it with leading words
 
-# Map NAME to the completion of a dev-helpers command: __dh_complete_alias <name> <command>
+declare -gA __dh_wrapper_command=()
+declare -gA __dh_wrapper_words=()
+
+# Map NAME to the completion of a dev-helpers command:
+# __dh_complete_alias <name> <command> [<word> ...]. A wrapper that calls the
+# command with leading words of its own names them, and is completed as if they
+# had been typed; the words must not contain spaces.
 __dh_complete_alias()
 {
-    declare -F "_${2}" >/dev/null || return 1
+    local name="${1}" command="${2}"
+    declare -F "_${command}" >/dev/null || return 1
+    shift 2
+    if [ "${#}" -gt 0 ]; then
+        __dh_wrapper_command["${name}"]="${command}"
+        __dh_wrapper_words["${name}"]="${*}"
+        complete -F __dh_complete_wrapper "${name}"
+        return 0
+    fi
     # git-color hands over to git's own completion, which needs the same
     # complete options git registers itself
-    case "${2}" in
-        git-color|git-pull) complete -o bashdefault -o default -o nospace -F "_${2}" "${1}" ;;
-        *) complete -F "_${2}" "${1}" ;;
+    case "${command}" in
+        git-color|git-pull) complete -o bashdefault -o default -o nospace -F "_${command}" "${name}" ;;
+        *) complete -F "_${command}" "${name}" ;;
     esac
+}
+
+# The leading words of a wrapper go in front of what was typed, so the completion
+# of its command sees the command line it ends up running.
+__dh_complete_wrapper()
+{
+    local name="${COMP_WORDS[0]}" command words
+    command="${__dh_wrapper_command[${name}]}"
+    read -ra words <<< "${__dh_wrapper_words[${name}]}"
+    COMP_WORDS=("${command}" "${words[@]}" "${COMP_WORDS[@]:1}")
+    COMP_CWORD=$(( COMP_CWORD + ${#words[@]} ))
+    "_${command}" "${command}" "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}"
 }
 
 # Register completions for all defined aliases whose expansion starts with a
@@ -715,7 +742,7 @@ __dh_worktree_command()
     local word
     for word in "${COMP_WORDS[@]:1}"; do
         case "${word}" in
-            add|list|go|delete|move-to-main) echo "${word}"; return 0 ;;
+            add|list|go|delete|move-to-main|interactive) echo "${word}"; return 0 ;;
         esac
     done
     return 0
@@ -742,7 +769,7 @@ _git-worktree()
     if [[ "${cur}" == -* ]]; then
         __dh_compgen "-b --branch -B --base --fetch --no-fetch -w --workdir -h --help"
     elif [ "${COMP_CWORD}" -eq 1 ]; then
-        __dh_compgen "add list go delete move-to-main"
+        __dh_compgen "add list go delete move-to-main interactive"
     fi
     return 0
 }

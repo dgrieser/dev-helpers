@@ -25,8 +25,17 @@ Commands:
                         BRANCH the current linked worktree, or one picked
                         interactively when run from the main tree
   move-to-main          Move uncommitted changes from a linked worktree to its main tree
+  interactive           Pick from every worktree of the repository: enter
+                        offers what to do with it (go to, delete, move its
+                        changes to the main tree), alt-a adds a worktree,
+                        alt-d deletes one, alt-m moves its uncommitted changes
+                        to the main tree; a worktree gone to or added is
+                        printed
 
-If COMMAND is omitted, add is used.
+If COMMAND is omitted, a menu offers to add a worktree or to list them in the
+interactive picker. -b, -B, --fetch and --no-fetch are then only what the
+questions of the add offer, there and on alt-a in the picker. Esc in the picker
+or in a question goes back to the menu, ctrl-c ends it.
 
 Only add is bound to WORKSPACE_WORKTREE; the other commands work on any
 worktree of a repository whose main tree is under WORKSPACE, wherever the
@@ -81,7 +90,7 @@ set_command() {
     fi
 
     case "${1}" in
-        add|list|go|delete|move-to-main)
+        add|list|go|delete|move-to-main|interactive)
             mode="${1}"
             command_seen=1
             ;;
@@ -203,33 +212,89 @@ branch_checked_out() {
         grep -Fqx "branch refs/heads/${1}"
 }
 
+# The questions of an add, asked with prompt-complete: unlike prompt-input and
+# prompt-yes-no it lets esc back out, and Tab completes what is piped into it.
+# ${1} is the prompt, ${2} the text the answer starts with.
+ask_text() {
+    prompt-complete --no-abort-message -p "${1}" --prefill "${2}" -d "${2}"
+}
+
+# yes 0, no 1, backed out 2, ctrl-c 130; ${2} is the answer of a plain enter
+ask_yes_no() {
+    if [ "${2}" = "no" ]; then
+        ask_hint="[y/N]"
+    else
+        ask_hint="[Y/n]"
+    fi
+    ask_answer="$(printf "yes\nno\n" | prompt-complete --no-abort-message -p "${1} ${ask_hint}:")"
+    ask_rc="${?}"
+    [ "${ask_rc}" = "0" ] || return "$([ "${ask_rc}" = "130" ] && echo 130 || echo 2)"
+    case "${ask_answer}" in
+        "")
+            [ "${2}" != "no" ]
+            ;;
+        [yY]|[yY][eE][sS])
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# A question of an add was backed out of or answered no: ctrl-c (130) ends the
+# run, anything else returns to the menu or the picker that asked (exit 2), or
+# aborts an add of its own.
+back_out() {
+    [ "${1}" = "130" ] && exit 130
+    [ "${add_args_are_defaults}" = "1" ] && exit 2
+    abort
+}
+
+local_branches() {
+    git -C "${workdir}" for-each-ref --format="%(refname:short)" refs/heads 2>/dev/null
+}
+
+all_branches() {
+    git -C "${workdir}" for-each-ref --format="%(refname)" refs/heads refs/remotes 2>/dev/null |
+        grep -v "/HEAD$" |
+        sed -e "s|^refs/heads/||" -e "s|^refs/remotes/||"
+}
+
 default_base() {
     (cd "${workdir}" && git-default 2>/dev/null) || current_branch "${workdir}"
 }
 
 resolve_base() {
-    if [ -n "${base_arg}" ]; then
+    if [ -n "${base_arg}" ] && [ "${add_args_are_defaults}" != "1" ]; then
         base="${base_arg}"
     else
-        base="$(prompt-input -p "Base:" -d "$(default_base)")" || fail "Base is required"
+        base="$(all_branches | ask_text "Base:" "${base_arg:-$(default_base)}")" || back_out "${?}"
     fi
     [ -n "${base}" ] || fail "Base is required"
 }
 
 resolve_fetch() {
-    case "${fetch_arg}" in
-        yes)
-            do_fetch=1
-            return 0
-            ;;
-        no)
-            do_fetch=0
-            return 0
-            ;;
-    esac
+    if [ "${add_args_are_defaults}" != "1" ]; then
+        case "${fetch_arg}" in
+            yes)
+                do_fetch=1
+                return 0
+                ;;
+            no)
+                do_fetch=0
+                return 0
+                ;;
+        esac
+    fi
 
-    prompt-yes-no "Fetch ${base} before creating ${branch}?"
-    case "${?}" in
+    if [ "${fetch_arg}" = "no" ]; then
+        ask_yes_no "Fetch ${base} before creating ${branch}?" no
+    else
+        ask_yes_no "Fetch ${base} before creating ${branch}?" yes
+    fi
+    fetch_rc="${?}"
+    case "${fetch_rc}" in
         0)
             do_fetch=1
             ;;
@@ -237,7 +302,7 @@ resolve_fetch() {
             do_fetch=0
             ;;
         *)
-            abort
+            back_out "${fetch_rc}"
             ;;
     esac
 }
@@ -310,7 +375,7 @@ resolve_branch() {
         branch="${branch_arg}"
     else
         current="$(current_branch "${workdir}")" || fail "Cannot determine current branch in workspace dir: ${workdir}"
-        branch="$(prompt-input -p "Branch:" -d "${current}")" || fail "Branch is required"
+        branch="$(local_branches | ask_text "Branch:" "${current}")" || back_out "${?}"
     fi
     validate_branch_name "${branch}"
 }
@@ -378,7 +443,7 @@ add_worktree() {
     fi
 
     if ! branch_exists "${branch}"; then
-        prompt-yes-no "Branch ${branch} does not exist. Create it?" || abort
+        ask_yes_no "Branch ${branch} does not exist. Create it?" yes || back_out "${?}"
         create_branch=1
         resolve_base
         resolve_fetch
@@ -386,8 +451,10 @@ add_worktree() {
         git -C "${workdir}" rev-parse --verify --quiet "${base}^{commit}" >/dev/null ||
             fail "Base is not a valid commit-ish: ${base}"
     else
-        [ -z "${base_arg}" ] || warning "Branch ${branch} already exists, ignoring --base"
-        [ -z "${fetch_arg}" ] || warning "Branch ${branch} already exists, ignoring --fetch/--no-fetch"
+        if [ "${add_args_are_defaults}" != "1" ]; then
+            [ -z "${base_arg}" ] || warning "Branch ${branch} already exists, ignoring --base"
+            [ -z "${fetch_arg}" ] || warning "Branch ${branch} already exists, ignoring --fetch/--no-fetch"
+        fi
     fi
 
     mkdir -p "$(dirname "${target}")" ||
@@ -495,7 +562,7 @@ unregistered_mirror_worktrees() {
                     continue
                     ;;
             esac
-            printf "%s (unregistered)\n" "${candidate}"
+            printf "%s\n" "${candidate}"
         done
 }
 
@@ -506,7 +573,8 @@ list_worktrees() {
             [ -n "${path}" ] || continue
             format_worktree_row "${path}" "${head}" "${is_main}" "${prunable}" "${branch}"
         done
-    unregistered_mirror_worktrees "$(printf "%s\n" "${rows}" | cut -f1)"
+    unregistered_mirror_worktrees "$(printf "%s\n" "${rows}" | cut -f1)" |
+        sed "s/\$/ (unregistered)/"
 }
 
 worktree_of_branch() {
@@ -636,8 +704,388 @@ move_to_main() {
     echo "${workdir}"
 }
 
+# The keys of the interactive picker: enter and alt-a end it for the terminal,
+# enter to pick what to do with the worktree under the cursor and alt-a to ask for
+# a branch and add its worktree. Deleting and moving changes run inside it, once
+# they were confirmed, and reload the list.
+PICK_KEYS="enter,alt-a,esc,ctrl-c"
+PICK_RELOAD_KEYS="alt-d,alt-m"
+PICK_KEY_DESCS="enter:actions,alt-a:add,alt-d:delete,alt-m:move to main"
+# branch, HEAD and state are shown; the first column is the path the keys act on,
+# the fourth the one their questions and the preview name
+PICK_COLUMNS="2,3,5"
+
+RED='\033[31m'
+YELLOW='\033[33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# the picker comes back the moment a key that had the terminal is through, so a
+# message of one of them is only read if it is waited for
+notify() {
+    read -rsn 1 -p "Press any key to continue" < /dev/tty
+    echo 1>&2
+}
+
+display_path() {
+    case "${1}" in
+        "${HOME}"|"${HOME}"/*)
+            printf "~%s" "${1#"${HOME}"}"
+            ;;
+        *)
+            printf "%s" "${1}"
+            ;;
+    esac
+}
+
+is_registered_worktree() {
+    worktree_rows | cut -f1 | grep -Fqx "${1}"
+}
+
+# One row per worktree, the main tree heading the list: fzf-with-header shows the
+# first row at the bottom, so the rows are fed reversed below the header, and a
+# load puts the cursor on the last row, the top one, unless a search is on.
+# The flags of a registered worktree as the list and the preview name them;
+# ${2} and ${3} are the is_main and prunable fields of its row.
+worktree_state() {
+    state=""
+    [ "${2}" = "1" ] && state="main tree"
+    [ "${1}" = "$(cat "${pick_state}.current" 2>/dev/null)" ] && state="${state:+${state}, }current"
+    if [ "${3}" = "1" ]; then
+        state="${state:+${state}, }${RED}prunable${NC}"
+    elif has_uncommitted_changes "${1}"; then
+        state="${state:+${state}, }${YELLOW}uncommitted${NC}"
+    fi
+    printf "%b" "${state:--}"
+}
+
+pick_print() {
+    rows="$(worktree_rows)" || exit 1
+    {
+        printf "PATH\tBRANCH\tHEAD\tWORKTREE\tSTATE\n"
+        {
+            printf "%s\n" "${rows}" |
+                while IFS="$(printf "\t")" read -r path head is_main prunable branch; do
+                    [ -n "${path}" ] || continue
+                    printf "%s\t%s\t%s\t%s\t%s\n" "${path}" "${branch:-(detached)}" "${head}" \
+                        "$(display_path "${path}")" "$(worktree_state "${path}" "${is_main}" "${prunable}")"
+                done
+            unregistered_mirror_worktrees "$(printf "%s\n" "${rows}" | cut -f1)" |
+                while IFS= read -r path; do
+                    printf "%s\t-\t-\t%s\t%b\n" "${path}" "$(display_path "${path}")" \
+                        "${RED}unregistered${NC}"
+                done
+        } | tac
+    } | column -t -s "$(printf "\t")"
+}
+
+preview_field() {
+    printf "%b%-9s%b %b\n" "${BOLD}" "${1}:" "${NC}" "${2}"
+}
+
+# the upstream the branch tracks and how far it is ahead or behind
+preview_upstream() {
+    upstream="$(git -C "${1}" rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>/dev/null)"
+    if [ -z "${upstream}" ]; then
+        preview_field "Upstream" "none"
+        return 0
+    fi
+    counts="$(git -C "${1}" rev-list --left-right --count "HEAD...@{upstream}" 2>/dev/null)"
+    ahead="${counts%%[[:space:]]*}"
+    behind="${counts##*[[:space:]]}"
+    distance=""
+    [ "${ahead:-0}" -gt 0 ] && distance="ahead ${ahead}"
+    [ "${behind:-0}" -gt 0 ] && distance="${distance:+${distance}, }behind ${behind}"
+    preview_field "Upstream" "${upstream} (${distance:-up to date})"
+}
+
+# the porcelain status counted into staged, unstaged and untracked paths
+preview_changes() {
+    changes="$(git -C "${1}" status --porcelain --untracked-files=all 2>/dev/null |
+        awk '
+            /^\?\?/ {
+                untracked++
+                next
+            }
+            {
+                if (substr($0, 1, 1) != " ") staged++
+                if (substr($0, 2, 1) != " ") unstaged++
+            }
+            END {
+                if (staged) out = staged " staged"
+                if (unstaged) out = out (out ? ", " : "") unstaged " unstaged"
+                if (untracked) out = out (out ? ", " : "") untracked " untracked"
+                print out
+            }
+        ')"
+    [ -n "${changes}" ] && preview_field "Changes" "${changes}"
+}
+
+# What the list leaves out as "Label: value" lines, then the changed files and the
+# recent commits of the worktree. A worktree whose dir is gone is described from
+# the repository.
+pick_preview() {
+    preview_field "Path" "$(display_path "${1}")"
+    row="$(worktree_rows | awk -F "\t" -v path="${1}" '$1 == path { print; exit }')"
+    if [ -z "${row}" ]; then
+        preview_field "State" "${RED}unregistered${NC}"
+        return 0
+    fi
+    IFS="$(printf "\t")" read -r _ head is_main prunable branch <<< "${row}"
+
+    preview_field "Branch" "${branch:-(detached)}"
+    if [ "${prunable}" = "1" ]; then
+        preview_field "HEAD" "$(git -C "${workdir}" log -1 --format="%h %s (%cr)" "${head}" 2>/dev/null)"
+        preview_field "State" "$(worktree_state "${1}" "${is_main}" "${prunable}")"
+        return 0
+    fi
+    [ -n "${branch}" ] && preview_upstream "${1}"
+    preview_field "HEAD" "$(git -C "${1}" log -1 --format="%h %s (%cr)")"
+    preview_field "State" "$(worktree_state "${1}" "${is_main}" "${prunable}")"
+    preview_changes "${1}"
+
+    echo
+    if has_uncommitted_changes "${1}"; then
+        git -C "${1}" status --short
+        echo
+    fi
+    git -C "${1}" log --oneline --decorate -n 50
+}
+
+# The add of the menu and of the picker: the branch is asked for, offering ${1},
+# and -b, -B, --fetch and --no-fetch only name what the questions of the add offer.
+interactive_add() {
+    add_args_are_defaults=1
+    branch="$(local_branches | ask_text "Branch:" "${1}")" || back_out "${?}"
+    [ -n "${branch}" ] || back_out 2
+    validate_branch_name "${branch}"
+    add_worktree
+}
+
+# The branch offered is what the list was searched for, or else -b. Backing out of
+# any question returns to the list, ctrl-c leaves it.
+pick_add() {
+    target="$(interactive_add "${FZF_WITH_HEADER_QUERY:-${branch_arg}}")"
+    case "${?}" in
+        0)
+            echo "${target}"
+            exit 1
+            ;;
+        2)
+            exit 0
+            ;;
+        130)
+            pick_leave ctrl-c
+            ;;
+        *)
+            notify
+            exit 0
+            ;;
+    esac
+}
+
+# Opened from the menu, esc returns to it and ctrl-c ends both, printing nothing.
+# Alone the picker ends either way, sending the shell to the main tree when the
+# worktree it is in was deleted.
+pick_leave() {
+    if [ -e "${pick_state}.menu" ]; then
+        [ "${1}" = "esc" ] && exit 255
+        exit 1
+    fi
+    if [ -e "${pick_state}.left" ]; then
+        echo "${workdir}"
+        exit 1
+    fi
+    exit 255
+}
+
+# ${2} = force deletes a worktree with uncommitted changes as well
+pick_delete() {
+    [ "${1}" != "${workdir}" ] || fail "Cannot delete the main tree"
+    is_registered_worktree "${1}" ||
+        fail "Not a registered worktree, remove the dir yourself: ${1}"
+    if [ "${2}" = "force" ]; then
+        git -C "${workdir}" worktree remove --force "${1}" >/dev/null || exit 1
+    else
+        git -C "${workdir}" worktree remove "${1}" >/dev/null || exit 1
+    fi
+    # the shell the picker was started from is in the deleted dir, so leaving the
+    # picker sends it to the main tree
+    if [ "${1}" = "$(cat "${pick_state}.current" 2>/dev/null)" ]; then
+        : > "${pick_state}.left"
+    fi
+}
+
+pick_move() {
+    [ "${1}" != "${workdir}" ] || fail "Pick a linked worktree to move its changes to the main tree"
+    [ -d "${1}" ] || fail "Worktree dir is gone: ${1}"
+    is_registered_worktree "${1}" ||
+        fail "Not a registered worktree: ${1}"
+    source_kind="linked"
+    source_worktree="${1}"
+    move_to_main >/dev/null
+}
+
+# Enter: a menu of what fits the worktree. A worktree with uncommitted changes is
+# deleted with them, which git refuses otherwise, once that was confirmed. Esc
+# returns to the list, as does an action that went wrong, once its message was
+# read; the actions run in subshells, as their failures exit.
+pick_actions() {
+    title="$(display_path "${1}")"
+    actions=""
+    [ -d "${1}" ] && actions="go\tGo to worktree\n"
+    if [ "${1}" != "${workdir}" ] && is_registered_worktree "${1}"; then
+        if [ -d "${1}" ] && has_uncommitted_changes "${1}"; then
+            actions="${actions}move\tMove changes to main tree\n"
+            actions="${actions}force\tDelete worktree and its uncommitted changes\n"
+        else
+            actions="${actions}delete\tDelete worktree\n"
+        fi
+    fi
+    [ -n "${actions}" ] || exit 0
+
+    need_cmd prompt-select
+    action="$(printf "%b" "${actions}" |
+        prompt-select --no-abort-message --prompt "${title}:" --delimiter "\t")"
+    case "${?}" in
+        0)
+            ;;
+        130)
+            pick_leave ctrl-c
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+
+    case "${action}" in
+        go)
+            echo "${1}"
+            exit 1
+            ;;
+        move)
+            ( pick_move "${1}" ) || notify
+            ;;
+        delete)
+            ( pick_delete "${1}" ) || notify
+            ;;
+        force)
+            ask_yes_no "Delete ${title} and its uncommitted changes?" no || exit 0
+            ( pick_delete "${1}" force ) || notify
+            ;;
+    esac
+    exit 0
+}
+
+# Called by fzf-with-header with the key on the first line and the row it was
+# pressed on below: exit 1 ends the picker with what was printed, 255 without
+# anything, and 0 lists the worktrees again.
+pick_key() {
+    key="$(printf "%s\n" "${key_result}" | head -n 1)"
+    path="$(printf "%s\n" "${key_result}" | sed -n "2p" | awk -F "  +" '{ print $1 }')"
+
+    case "${key}" in
+        esc|ctrl-c)
+            pick_leave "${key}"
+            ;;
+        alt-a)
+            pick_add
+            ;;
+    esac
+    [ -n "${path}" ] || exit 0
+
+    case "${key}" in
+        enter)
+            pick_actions "${path}"
+            ;;
+        alt-d)
+            pick_delete "${path}"
+            ;;
+        alt-m)
+            pick_move "${path}"
+            ;;
+    esac
+    exit 0
+}
+
+# The commands the picker runs find the repository and the worktree it was started
+# from in files of their own, as the dir the picker was started in may be gone.
+interactive_worktrees() {
+    need_cmd fzf-with-header
+    printf "%s\n" "${workdir}" > "${pick_state}.workdir" ||
+        fail "Cannot write ${pick_state}.workdir"
+    printf "%s\n" "${source_worktree}" > "${pick_state}.current" ||
+        fail "Cannot write ${pick_state}.current"
+    printf "%s\n" "${branch_arg}" "${base_arg}" "${fetch_arg}" > "${pick_state}.add" ||
+        fail "Cannot write ${pick_state}.add"
+
+    pick_cmd="$(readlink -f -- "${0}") --id ${id}"
+    fzf-with-header --key-command "${pick_cmd} --pick-key" \
+                    --key-descriptions "${PICK_KEY_DESCS}" \
+                    --reload-keys "${PICK_RELOAD_KEYS}" \
+                    --confirm "alt-d:Delete worktree {4}?" \
+                    --confirm "alt-m:Move the changes of {4} to the main tree?" \
+                    --columns "${PICK_COLUMNS}" \
+                    --command "${pick_cmd} --pick-print" \
+                    --preview="${pick_cmd} --pick-preview {1}" \
+                    --preview-window=right:50%,nowrap \
+                    --bind='load:transform:[ -n "${FZF_QUERY}" ] && echo first || echo last' \
+                    --expect="${PICK_KEYS}"
+}
+
+# Without a command a menu asks whether to add a worktree or to open the picker,
+# starting on the add when the arguments are about one.
+#
+# Esc in the picker or in a question of the add comes back here, as does a failed
+# add; esc here, or ctrl-c anywhere, ends the run. The worktree picked or added is
+# printed, or the main tree, if the worktree the shell is in was deleted.
+menu() {
+    need_cmd prompt-select
+    : > "${pick_state}.menu" || fail "Cannot write ${pick_state}.menu"
+    menu_default="list"
+    [ -n "${branch_arg}${base_arg}${fetch_arg}" ] && menu_default="add"
+    while true; do
+        choice="$(printf "add\tAdd worktree\nlist\tList worktrees\n" |
+            prompt-select --prompt "Worktree:" --delimiter "\t" --default "${menu_default}")" ||
+            menu_quit
+        menu_default="${choice}"
+        case "${choice}" in
+            add)
+                target="$(interactive_add "${branch_arg}")"
+                menu_rc="${?}"
+                ;;
+            list)
+                target="$(interactive_worktrees)"
+                menu_rc="${?}"
+                ;;
+            *)
+                menu_quit
+                ;;
+        esac
+        case "${menu_rc}" in
+            0)
+                # ctrl-c in the picker ends it without a worktree
+                [ -n "${target}" ] || menu_quit
+                echo "${target}"
+                exit 0
+                ;;
+            130)
+                menu_quit
+                ;;
+        esac
+    done
+}
+
+menu_quit() {
+    if [ -e "${pick_state}.left" ]; then
+        echo "${workdir}"
+        exit 0
+    fi
+    exit 1
+}
+
 RM_CMD="$(command -v trash 2>/dev/null || command -v rm 2>/dev/null)"
-mode="add"
+mode=""
 command_seen=0
 branch_arg=""
 base_arg=""
@@ -645,6 +1093,10 @@ base=""
 fetch_arg=""
 do_fetch=0
 workdir_arg=""
+id="$$"
+add_args_are_defaults=0
+key_result=""
+pick_path=""
 
 while [ "${#}" -gt 0 ]; do
     case "${1}" in
@@ -672,6 +1124,25 @@ while [ "${#}" -gt 0 ]; do
             [ -z "${1}" ] && usage
             workdir_arg="${1}"
             ;;
+        # the commands the interactive picker calls back with
+        --id)
+            shift
+            [ -z "${1}" ] && usage
+            id="${1}"
+            ;;
+        --pick-print)
+            mode="pick-print"
+            ;;
+        --pick-preview)
+            shift
+            mode="pick-preview"
+            pick_path="${1}"
+            ;;
+        --pick-key)
+            shift
+            mode="pick-key"
+            key_result="${1}"
+            ;;
         -*)
             error "Unknown option: ${1}"
             usage
@@ -683,6 +1154,8 @@ while [ "${#}" -gt 0 ]; do
     shift
 done
 
+[ -n "${mode}" ] || mode="menu"
+
 [ -n "${WORKSPACE:-}" ] || fail "WORKSPACE is not set"
 [ -n "${WORKSPACE_WORKTREE:-}" ] || fail "WORKSPACE_WORKTREE is not set"
 
@@ -693,16 +1166,28 @@ mkdir -p "${WORKSPACE_WORKTREE}" ||
 workspace_worktree_root="$(canonical_dir "${WORKSPACE_WORKTREE}")" ||
     fail "WORKSPACE_WORKTREE does not exist: ${WORKSPACE_WORKTREE}"
 
+pick_state="${TMPDIR:-/tmp}/${APP_NAME}-${id}"
+case "${mode}" in
+    pick-*)
+        workdir_arg="$(cat "${pick_state}.workdir" 2>/dev/null)" ||
+            fail "No interactive picker runs with id ${id}"
+        { IFS= read -r branch_arg; IFS= read -r base_arg; IFS= read -r fetch_arg; } \
+            < "${pick_state}.add" 2>/dev/null
+        ;;
+esac
+
 if [ -n "${workdir_arg}" ]; then
     resolve_workdir "${workdir_arg}"
 else
     resolve_workdir "$(pwd -P)"
 fi
 
-if [ "${mode}" != "add" ]; then
-    [ -z "${base_arg}" ] || fail "--base can only be used with add"
-    [ -z "${fetch_arg}" ] || fail "--fetch/--no-fetch can only be used with add"
-fi
+case "${mode}" in
+    list|go|delete|move-to-main)
+        [ -z "${base_arg}" ] || fail "--base cannot be used with ${mode}"
+        [ -z "${fetch_arg}" ] || fail "--fetch/--no-fetch cannot be used with ${mode}"
+        ;;
+esac
 
 case "${mode}" in
     add)
@@ -724,5 +1209,22 @@ case "${mode}" in
     move-to-main)
         [ -z "${branch_arg}" ] || fail "--branch cannot be used with move-to-main"
         move_to_main
+        ;;
+    menu)
+        trap 'rm -f "${pick_state}".*' EXIT
+        menu
+        ;;
+    interactive)
+        trap 'rm -f "${pick_state}".*' EXIT
+        interactive_worktrees
+        ;;
+    pick-print)
+        pick_print
+        ;;
+    pick-preview)
+        pick_preview "${pick_path}"
+        ;;
+    pick-key)
+        pick_key
         ;;
 esac
