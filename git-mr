@@ -960,7 +960,7 @@ show_item_pipeline() {
     source_branch="$(item_json "${n}" | jq -r '.source // empty')"
     [ -z "${source_branch}" ] && return 0
     echo 1>&2
-    git-pipe status --ref "${source_branch}" --no-tags
+    git-pipe status --ref "${source_branch}" --no-tags --quiet
     return 0
 }
 
@@ -1261,7 +1261,7 @@ watch_item_pipeline() {
         wait_for_item_pipeline "${n}"
         return 0
     fi
-    if git-pipe status --ref "${source_branch}" --no-tags --wait --exit-on-success </dev/tty >/dev/tty; then
+    if git-pipe status --ref "${source_branch}" --no-tags --wait --exit-on-success --quiet </dev/tty >/dev/tty; then
         # git-pipe saw it succeed, the request may take a moment to follow
         wait_for_item_pipeline "${n}"
         return 0
