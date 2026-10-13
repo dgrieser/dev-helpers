@@ -59,17 +59,21 @@ __dh_commits()
     LC_ALL=C git log --max-count=50 --pretty=format:'%h' 2>/dev/null
 }
 
-# Branches of the worktrees git-worktree can switch to, read off its own list
-# output so the WORKSPACE/WORKSPACE_WORKTREE mapping stays in one place. The
-# bracketed branch is the last field, which skips the main tree, detached heads
-# and unregistered directories.
+# Branches of the worktrees git-worktree can switch to or delete, read off its
+# own list output so the WORKSPACE/WORKSPACE_WORKTREE mapping stays in one place.
+# The bracketed branch is the last field, which skips the main tree, detached
+# heads and unregistered directories. A prunable worktree has no dir to switch
+# into, so only delete (${1}) takes the branch in front of its marker.
 __dh_worktree_branches()
 {
     local current
     current="$(LC_ALL=C git symbolic-ref --quiet --short HEAD 2>/dev/null)"
     git-worktree list 2>/dev/null |
-        awk -v current="${current}" '$NF ~ /^\[.*\]$/ {
-            branch = substr($NF, 2, length($NF) - 2)
+        awk -v current="${current}" -v command="${1}" '{
+            field = $NF
+            if (command == "delete" && field == "(prunable)") field = $(NF - 1)
+            if (field !~ /^\[.*\]$/) next
+            branch = substr(field, 2, length(field) - 2)
             if (branch != current) print branch
         }'
 }
@@ -723,11 +727,10 @@ _git-worktree()
     __dh_init
     case "${prev}" in
         -b|--branch)
-            if [ "$(__dh_worktree_command)" = "go" ]; then
-                __dh_compgen "$(__dh_worktree_branches)"
-            else
-                __dh_compgen "$(__dh_local_branches)"
-            fi
+            case "$(__dh_worktree_command)" in
+                go|delete) __dh_compgen "$(__dh_worktree_branches "$(__dh_worktree_command)")" ;;
+                *) __dh_compgen "$(__dh_local_branches)" ;;
+            esac
             return 0 ;;
         -B|--base)
             __dh_compgen "$(__dh_all_branches)"

@@ -15,23 +15,31 @@ Commands:
   add                   Add mirrored worktree for BRANCH at:
     WORKSPACE_WORKTREE/<path under WORKSPACE>/BRANCH
     If BRANCH does not exist, ask before creating it.
-  list                  List the main tree and every mirrored worktree of the
-                        resolved repository, including mirrored dirs that the
-                        repository no longer registers as a worktree
+  list                  List every worktree of the resolved repository: the
+                        main tree, the mirrored worktrees, worktrees elsewhere,
+                        and mirrored dirs that the repository no longer
+                        registers as a worktree
   go                    Print the path of an existing worktree, picked
                         interactively when BRANCH is omitted
-  delete                Delete the resolved mirrored worktree and print its main dir
-  move-to-main          Move uncommitted changes from a mirrored worktree to its main tree
+  delete                Delete a worktree and print its main dir; without
+                        BRANCH the current linked worktree, or one picked
+                        interactively when run from the main tree
+  move-to-main          Move uncommitted changes from a linked worktree to its main tree
 
 If COMMAND is omitted, add is used.
 
+Only add is bound to WORKSPACE_WORKTREE; the other commands work on any
+worktree of a repository whose main tree is under WORKSPACE, wherever the
+worktree lives, and can run from inside it.
+
 Options:
-  -b, --branch BRANCH    Branch to add/delete/go to; defaults to the current
-                         workspace branch (asked interactively for add/delete)
+  -b, --branch BRANCH    Branch to add, or whose worktree to delete/go to;
+                         add asks for it, defaulting to the current branch
   -B, --base REF         Start point for a branch that has to be created;
                          asked interactively when omitted, defaulting to the
                          default remote branch
-  -w, --workdir DIR      Workspace repo dir; defaults to current dir
+  -w, --workdir DIR      Dir inside any worktree of the repository; defaults
+                         to current dir
       --fetch            Fetch the base before creating the branch
       --no-fetch         Do not fetch the base before creating the branch
                          (asked interactively when neither is given)
@@ -174,7 +182,7 @@ check_untracked_targets() {
 
 copy_untracked_files() {
     [ -s "${move_untracked_list}" ] || return 0
-    (cd "${source_mirror_worktree}" && tar --null -T "${move_untracked_list}" -cf "${move_untracked_tar}") ||
+    (cd "${source_worktree}" && tar --null -T "${move_untracked_list}" -cf "${move_untracked_tar}") ||
         return 1
     (cd "${workdir}" && tar -xf "${move_untracked_tar}") ||
         return 1
@@ -307,65 +315,31 @@ resolve_branch() {
     validate_branch_name "${branch}"
 }
 
-resolve_from_mirror() {
-    mirror_source="$(canonical_dir "${1}")" ||
-        fail "Workdir does not exist: ${1}"
-    require_git_repo "${mirror_source}"
-
-    mirror_repo="$(git -C "${mirror_source}" rev-parse --show-toplevel 2>/dev/null)" ||
-        fail "Cannot resolve mirrored git root: ${mirror_source}"
-    mirror_repo="$(canonical_dir "${mirror_repo}")" ||
-        fail "Cannot resolve mirrored git root: ${mirror_source}"
-
-    inside_path "${mirror_repo}" "${workspace_worktree_root}" ||
-        fail "Git root is not under WORKSPACE_WORKTREE: ${mirror_repo}"
-
-    mirror_branch="$(current_branch "${mirror_repo}")" ||
-        fail "Cannot map detached mirrored worktree: ${mirror_repo}"
-
-    rel_with_branch="$(relative_to "${mirror_repo}" "${workspace_worktree_root}")"
-    if [ "${rel_with_branch}" = "${mirror_branch}" ]; then
-        rel=""
-    else
-        branch_suffix="/${mirror_branch}"
-        case "${rel_with_branch}" in
-            *"${branch_suffix}")
-                rel="${rel_with_branch%"${branch_suffix}"}"
-                ;;
-            *)
-                fail "Mirrored path does not end with current branch: ${mirror_repo}"
-                ;;
-        esac
-    fi
-
-    if [ -n "${rel}" ]; then
-        workdir_candidate="${workspace_root}/${rel}"
-    else
-        workdir_candidate="${workspace_root}"
-    fi
-
-    workdir="$(canonical_dir "${workdir_candidate}")" ||
-        fail "Mapped workspace dir does not exist: ${workdir_candidate}"
-    source_kind="mirror"
-    source_mirror_worktree="${mirror_repo}"
-}
-
+# The repository is resolved through git: the worktree the dir is in, wherever it
+# lives, and the main tree, which git always lists first. Only the main tree has
+# to be under WORKSPACE, as add mirrors its path.
 resolve_workdir() {
     source_path="$(canonical_dir "${1}")" ||
         fail "Workdir does not exist: ${1}"
+    require_git_repo "${source_path}"
 
-    source_kind="workspace"
-    source_mirror_worktree=""
+    source_worktree="$(git -C "${source_path}" rev-parse --show-toplevel 2>/dev/null)" ||
+        fail "Cannot resolve git root: ${source_path}"
+    source_worktree="$(canonical_dir "${source_worktree}")" ||
+        fail "Cannot resolve git root: ${source_path}"
 
-    if inside_path "${source_path}" "${workspace_worktree_root}"; then
-        resolve_from_mirror "${source_path}"
-        return 0
+    main_tree="$(git -C "${source_worktree}" worktree list --porcelain 2>/dev/null |
+        sed -n "1s/^worktree //p")"
+    workdir="$(canonical_dir "${main_tree}")" ||
+        fail "Cannot resolve main tree: ${source_worktree}"
+    inside_path "${workdir}" "${workspace_root}" ||
+        fail "Main tree is not under WORKSPACE: ${workdir}"
+
+    if [ "${source_worktree}" = "${workdir}" ]; then
+        source_kind="main"
+    else
+        source_kind="linked"
     fi
-
-    inside_path "${source_path}" "${workspace_root}" ||
-        fail "Workdir must be under WORKSPACE or WORKSPACE_WORKTREE: ${source_path}"
-
-    workdir="${source_path}"
 }
 
 target_path_for() {
@@ -396,6 +370,13 @@ add_worktree() {
         fail "Target exists and is not a git worktree: ${target}"
     fi
 
+    # --force below also lifts the guard against a branch checked out twice, so
+    # only a stale registration of the target itself may already hold it
+    checked_out_at="$(worktree_of_branch "${branch}")"
+    if [ -n "${checked_out_at}" ] && [ "${checked_out_at}" != "${target}" ]; then
+        fail "${branch} is already checked out at ${checked_out_at}"
+    fi
+
     if ! branch_exists "${branch}"; then
         prompt-yes-no "Branch ${branch} does not exist. Create it?" || abort
         create_branch=1
@@ -421,44 +402,63 @@ add_worktree() {
     echo "${target}"
 }
 
+# Every worktree the repository registers, wherever it lives, one
+# "path<TAB>head<TAB>is_main<TAB>prunable<TAB>branch" row each. The branch goes
+# last as it is empty for a detached HEAD, and read merges adjacent tabs.
 worktree_rows() {
     worktree_output="$(git -C "${workdir}" worktree list --porcelain)" ||
         fail "git worktree list failed"
     printf "%s\n" "${worktree_output}" |
-        awk -v main="${workdir}" -v mirror_dir="$(mirror_dir_for_workdir)" '
+        awk '
+            function flush() {
+                if (path != "" && !bare)
+                    printf "%s\t%s\t%d\t%d\t%s\n", path, head, is_main, prunable, branch
+                path = ""
+                head = ""
+                branch = ""
+                bare = 0
+                prunable = 0
+            }
             /^worktree / {
+                flush()
                 path = substr($0, 10)
-                is_main = path == main ? 1 : 0
-                show = is_main || index(path, mirror_dir "/") == 1
+                is_main = ++count == 1
                 next
             }
-            show && /^HEAD / {
+            /^HEAD / {
                 head = substr($0, 6, 7)
                 next
             }
-            show && /^branch / {
+            /^branch / {
                 branch = substr($0, 8)
                 sub("^refs/heads/", "", branch)
-                printf "%s\t%s\t%s\t%d\n", path, head, branch, is_main
-                show = 0
                 next
             }
-            show && /^detached$/ {
-                printf "%s\t%s\t\t%d\n", path, head, is_main
-                show = 0
+            /^bare$/ {
+                bare = 1
                 next
+            }
+            /^prunable/ {
+                prunable = 1
+                next
+            }
+            END {
+                flush()
             }
         '
 }
 
 format_worktree_row() {
-    if [ -n "${3}" ]; then
-        entry="$(printf "%s %s [%s]" "${1}" "${2}" "${3}")"
+    if [ -n "${5}" ]; then
+        entry="$(printf "%s %s [%s]" "${1}" "${2}" "${5}")"
     else
         entry="$(printf "%s %s (detached HEAD)" "${1}" "${2}")"
     fi
-    if [ "${4}" = "1" ]; then
+    if [ "${3}" = "1" ]; then
         entry="${entry} (main tree)"
+    fi
+    if [ "${4}" = "1" ]; then
+        entry="${entry} (prunable)"
     fi
     echo "${entry}"
 }
@@ -502,64 +502,81 @@ unregistered_mirror_worktrees() {
 list_worktrees() {
     rows="$(worktree_rows)" || exit 1
     printf "%s\n" "${rows}" |
-        while IFS="$(printf "\t")" read -r path head branch is_main; do
+        while IFS="$(printf "\t")" read -r path head is_main prunable branch; do
             [ -n "${path}" ] || continue
-            format_worktree_row "${path}" "${head}" "${branch}" "${is_main}"
+            format_worktree_row "${path}" "${head}" "${is_main}" "${prunable}" "${branch}"
         done
     unregistered_mirror_worktrees "$(printf "%s\n" "${rows}" | cut -f1)"
 }
 
-go_items() {
-    if [ "${source_kind}" = "mirror" ]; then
-        current_worktree="${source_mirror_worktree}"
-    else
-        current_worktree="${workdir}"
-    fi
-
+worktree_of_branch() {
     rows="$(worktree_rows)" || exit 1
     printf "%s\n" "${rows}" |
-        while IFS="$(printf "\t")" read -r path head branch is_main; do
+        awk -F "\t" -v branch="${1}" '$5 == branch { print $1; exit }'
+}
+
+# Picker items "path<TAB>title", never the worktree the run started in. go (${1})
+# offers the main tree but no prunable worktree, as there is no dir to change
+# into, delete the other way round. A worktree outside the mirrored dir of the
+# repository names its path in the title.
+worktree_items() {
+    mirror_dir="$(mirror_dir_for_workdir)"
+    rows="$(worktree_rows)" || exit 1
+    printf "%s\n" "${rows}" |
+        while IFS="$(printf "\t")" read -r path head is_main prunable branch; do
             [ -n "${path}" ] || continue
-            [ "${path}" = "${current_worktree}" ] && continue
+            [ "${path}" = "${source_worktree}" ] && continue
+            if [ "${1}" = "go" ]; then
+                [ "${prunable}" = "1" ] && continue
+            else
+                [ "${is_main}" = "1" ] && continue
+            fi
             if [ -n "${branch}" ]; then
                 title="${branch}"
             else
                 title="${head} (detached HEAD)"
             fi
-            [ "${is_main}" = "1" ] && title="${title} (main tree)"
+            if [ "${is_main}" = "1" ]; then
+                title="${title} (main tree)"
+            elif ! inside_path "${path}" "${mirror_dir}"; then
+                title="${title} (${path})"
+            fi
+            [ "${prunable}" = "1" ] && title="${title} (prunable)"
             printf "%s\t%s\n" "${path}" "${title}"
         done
 }
 
+pick_worktree() {
+    need_cmd prompt-select
+    items="$(worktree_items "${mode}")" || exit 1
+    [ -n "${items}" ] || fail "${2}"
+    target="$(printf "%s\n" "${items}" |
+        prompt-select --prompt "${1}" --delimiter "\t")" || abort
+    [ -n "${target}" ] || abort
+}
+
 go_worktree() {
     if [ -n "${branch_arg}" ]; then
-        target="$(target_path_for "${branch}")"
+        target="$(worktree_of_branch "${branch}")"
+        [ -n "${target}" ] || fail "No worktree has ${branch} checked out"
         [ -d "${target}" ] || fail "Worktree does not exist: ${target}"
-        require_git_repo "${target}"
-        same_git_repo "${workdir}" "${target}" ||
-            fail "Target belongs to a different git repository: ${target}"
-        echo "${target}"
-        return 0
+    else
+        pick_worktree "Go to:" "No other worktree to go to"
     fi
-
-    need_cmd prompt-select
-    items="$(go_items)" || exit 1
-    [ -n "${items}" ] || fail "No other worktree to go to"
-    target="$(printf "%s\n" "${items}" |
-        prompt-select --prompt "Go to:" --delimiter "\t")" || abort
-    [ -n "${target}" ] || abort
     echo "${target}"
 }
 
 delete_worktree() {
-    if [ "${source_kind}" = "mirror" ] && [ -z "${branch_arg}" ]; then
-        target="${source_mirror_worktree}"
+    if [ -n "${branch_arg}" ]; then
+        target="$(worktree_of_branch "${branch}")"
+        [ -n "${target}" ] || fail "No worktree has ${branch} checked out"
+    elif [ "${source_kind}" = "linked" ]; then
+        target="${source_worktree}"
     else
-        target="$(target_path_for "${branch}")"
+        pick_worktree "Delete:" "No worktree to delete"
     fi
 
-    [ -n "${target}" ] || fail "Worktree target is empty"
-    [ -d "${target}" ] || fail "Worktree does not exist: ${target}"
+    [ "${target}" != "${workdir}" ] || fail "Cannot delete the main tree: ${workdir}"
     git-color -C "${workdir}" worktree remove "${target}" ||
         fail "git worktree remove failed"
     echo "Deleted worktree: ${target}" 1>&2
@@ -567,12 +584,10 @@ delete_worktree() {
 }
 
 move_to_main() {
-    [ "${source_kind}" = "mirror" ] ||
-        fail "move-to-main must run from a mirrored worktree or use --workdir"
-    same_git_repo "${source_mirror_worktree}" "${workdir}" ||
-        fail "Mapped main tree belongs to a different git repository: ${workdir}"
-    has_uncommitted_changes "${source_mirror_worktree}" ||
-        fail "No uncommitted changes to move: ${source_mirror_worktree}"
+    [ "${source_kind}" = "linked" ] ||
+        fail "move-to-main must run from a linked worktree or use --workdir"
+    has_uncommitted_changes "${source_worktree}" ||
+        fail "No uncommitted changes to move: ${source_worktree}"
     require_clean_tree "${workdir}" "Main tree"
 
     move_staged_patch="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.staged.XXXXXX")" ||
@@ -584,11 +599,11 @@ move_to_main() {
     move_untracked_tar="$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.untracked.XXXXXX.tar")" ||
         move_fail "Cannot create temp file"
 
-    git -C "${source_mirror_worktree}" diff --no-color --cached --binary > "${move_staged_patch}" ||
+    git -C "${source_worktree}" diff --no-color --cached --binary > "${move_staged_patch}" ||
         move_fail "Cannot generate staged diff"
-    git -C "${source_mirror_worktree}" diff --no-color --binary > "${move_unstaged_patch}" ||
+    git -C "${source_worktree}" diff --no-color --binary > "${move_unstaged_patch}" ||
         move_fail "Cannot generate unstaged diff"
-    git -C "${source_mirror_worktree}" ls-files --others --exclude-standard -z > "${move_untracked_list}" ||
+    git -C "${source_worktree}" ls-files --others --exclude-standard -z > "${move_untracked_list}" ||
         move_fail "Cannot list untracked files"
 
     if [ -s "${move_staged_patch}" ]; then
@@ -612,10 +627,10 @@ move_to_main() {
             rollback_move_fail "Cannot copy untracked files to main tree"
     fi
 
-    git -C "${source_mirror_worktree}" reset --hard >/dev/null ||
-        move_fail "Changes copied, but source worktree reset failed: ${source_mirror_worktree}"
-    git -C "${source_mirror_worktree}" clean -fd >/dev/null ||
-        move_fail "Changes copied, but source worktree clean failed: ${source_mirror_worktree}"
+    git -C "${source_worktree}" reset --hard >/dev/null ||
+        move_fail "Changes copied, but source worktree reset failed: ${source_worktree}"
+    git -C "${source_worktree}" clean -fd >/dev/null ||
+        move_fail "Changes copied, but source worktree clean failed: ${source_worktree}"
 
     cleanup_move_files
     echo "${workdir}"
@@ -678,19 +693,11 @@ mkdir -p "${WORKSPACE_WORKTREE}" ||
 workspace_worktree_root="$(canonical_dir "${WORKSPACE_WORKTREE}")" ||
     fail "WORKSPACE_WORKTREE does not exist: ${WORKSPACE_WORKTREE}"
 
-current_dir="$(pwd -P)"
-if ! inside_path "${current_dir}" "${workspace_worktree_root}" &&
-    ! inside_path "${current_dir}" "${workspace_root}"; then
-    fail "Run from inside WORKSPACE or WORKSPACE_WORKTREE"
-fi
-
 if [ -n "${workdir_arg}" ]; then
     resolve_workdir "${workdir_arg}"
 else
-    resolve_workdir "${current_dir}"
+    resolve_workdir "$(pwd -P)"
 fi
-
-require_git_repo "${workdir}"
 
 if [ "${mode}" != "add" ]; then
     [ -z "${base_arg}" ] || fail "--base can only be used with add"
@@ -711,9 +718,7 @@ case "${mode}" in
         go_worktree
         ;;
     delete)
-        if [ "${source_kind}" != "mirror" ] || [ -n "${branch_arg}" ]; then
-            resolve_branch
-        fi
+        [ -z "${branch_arg}" ] || resolve_branch
         delete_worktree
         ;;
     move-to-main)

@@ -633,21 +633,37 @@ git-track-branches [-C|--clear]
 ```
 
 ### git-worktree
-Manage mirrored git worktrees under `$WORKSPACE_WORKTREE`.
+Manage mirrored git worktrees under `$WORKSPACE_WORKTREE`, alongside any other
+worktrees of the repository.
 ```bash
 git-worktree [add|list|go|delete|move-to-main] [-b <branch>] [-B <base>] [--fetch|--no-fetch] [-w <dir>]
 ```
-`list` prints the main tree of the resolved repository together with every
-mirrored worktree it has under `$WORKSPACE_WORKTREE`, and works the same from the
-main tree and from a mirrored worktree. It also looks at the branch directories in
-the repository's mirrored directory: one that belongs to the repository but is no
-longer registered as a worktree is listed as `(unregistered)`, while directories
-that hold no worktree at all are ignored silently.
+Only `add` is bound to `$WORKSPACE_WORKTREE`. The repository is resolved through
+git from any of its worktrees, so `list`, `go`, `delete` and `move-to-main` also
+see worktrees that live elsewhere (another tool's, under `/tmp` or inside the
+repository) and run from inside them; the main tree only has to be under
+`$WORKSPACE`.
+
+`list` prints every worktree the resolved repository registers, the main tree
+first, and works the same from any of them. A worktree whose directory is gone is
+marked `(prunable)`. It also looks at the branch directories in the repository's
+mirrored directory: one that belongs to the repository but is no longer
+registered as a worktree is listed as `(unregistered)`, while directories that
+hold no worktree at all are ignored silently.
 
 `go` prints the path of an existing worktree, so `cd "$(git-worktree go)"` changes
 into it; without `-b/--branch` a `prompt-select` menu lists the other worktrees of
-the repository, including the main tree. For `go`, `-b/--branch` completes the
-branches that already have a worktree instead of every local branch.
+the repository, including the main tree, and names the path of each one outside
+`$WORKSPACE_WORKTREE`.
+
+`delete` removes the worktree that has `-b/--branch` checked out, wherever it
+lives. Without it, the linked worktree the command runs in is removed, and from
+the main tree a `prompt-select` menu offers the other worktrees, prunable ones
+included. For `go` and `delete`, `-b/--branch` completes the branches that
+already have a worktree instead of every local branch.
+
+`add` refuses a branch that another worktree, the main tree included, already
+has checked out, and prints where it is.
 
 When `add` has to create the branch, the start point is taken from `-B/--base`
 (asked interactively when omitted, defaulting to the default remote branch) and
