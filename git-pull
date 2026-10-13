@@ -12,10 +12,11 @@ usage: ${APP_NAME} [GIT PULL OPTIONS] [REPOSITORY [REFSPEC...]]
 Run git pull, and offer to pull the submodules along with it.
 
 Every argument is handed to git pull as it is. When the repository has
-submodules, pulling them too is offered (default yes) and done with
---recurse-submodules. The question is skipped when the command line already
-says --recurse-submodules or --no-recurse-submodules, or submodule.recurse is
-configured.
+initialized submodules, pulling them too is offered (default yes) and done with
+--recurse-submodules. Submodules that were never initialized are left out, as
+git pull --recurse-submodules does not clone them. The question is skipped when
+the command line already says --recurse-submodules or --no-recurse-submodules,
+or submodule.recurse is configured.
 
 Options:
     -h|--help   show this help
@@ -47,11 +48,12 @@ git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
 
 [ -n "$(git -C "${git_dir}" config --get submodule.recurse)" ] && recurse_decided=1
 
-# a submodule is a gitlink in the index, whether it is initialized or not
+# only initialized submodules are pulled: git submodule status marks the
+# others with a leading '-'
 recurse_args=()
 if [ "${recurse_decided}" -eq 0 ] \
-    && git -C "${git_dir}" ls-files --stage | grep -q '^160000 '; then
-    prompt-yes-no "Repository has submodules. Pull them too?"
+    && git -C "${git_dir}" submodule status 2>/dev/null | grep -q '^[^-]'; then
+    prompt-yes-no "Repository has initialized submodules. Pull them too?"
     case "${?}" in
         0) recurse_args=( --recurse-submodules ) ;;
         # ctrl-c leaves the pull undone rather than running it without them

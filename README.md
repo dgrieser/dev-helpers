@@ -540,10 +540,11 @@ Run `git pull`, and offer to pull the submodules along with it.
 git-pull [<git pull options>] [<repository> [<refspec>...]]
 ```
 Every argument is handed to `git pull` as it is. When the repository has
-submodules, pulling them too is offered (default yes) and done with
-`--recurse-submodules`. The question is skipped when the command line already
-says `--recurse-submodules` or `--no-recurse-submodules`, or `submodule.recurse`
-is configured.
+initialized submodules, pulling them too is offered (default yes) and done with
+`--recurse-submodules`. Submodules that were never initialized are left out, as
+`git pull --recurse-submodules` does not clone them. The question is skipped
+when the command line already says `--recurse-submodules` or
+`--no-recurse-submodules`, or `submodule.recurse` is configured.
 
 ### git-push
 Push current or named branch; optional push-only or force-with-lease.
