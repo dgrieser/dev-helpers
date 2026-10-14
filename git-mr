@@ -156,8 +156,8 @@ Before a create, a branch the remote has but GitLab does not know yet is waited
 for; GitLab registers a pushed branch in the background, and a create before
 that fails with "source_branch does not exist". A create that fails that way
 after glab pushed the branch itself is retried once GitLab knows the branch.
-Once a create or a recover went through, a question asks whether to copy a
-channel message for the new request (default no).
+Once a create or a recover went through, a channel message for the new request
+goes to the clipboard history (clip --history-only), not the clipboard itself.
 
 Showing a request prints the view of the provider, without its diff, and asks
 what to do with it: approve + merge (tab switches to approve or merge only),
@@ -683,24 +683,36 @@ open_item() {
     fi
 }
 
-# not every new request gets announced, so its channel message only goes to the
-# clipboard when the user asks for it, never by default
-ask_copy_message() {
-    local n="${1}"
-
-    prompt-no-yes "Copy a channel message for '$(item_ref "${n}")'?" || return 0
-    copy_message "${n}"
-}
-
-copy_message() {
+channel_message() {
     local n="${1}"
     local json message
 
-    need_cmd clip
     json="$(item_json "${n}")"
     [ -z "${json}" ] && { error "Failed to read $(item_ref "${n}")"; return 1; }
     message="$(jq -r '"@hier *" + .title + "* (`" + .source + "` → `" + .target + "`)\n" + .url' <<< "${json}")"
     [ -z "${message}" ] && { error "Failed to build the channel message"; return 1; }
+    printf '%s' "${message}"
+}
+
+# not every new request gets announced, so its channel message only goes to the
+# clipboard history and the clipboard keeps what it holds; the request is already
+# there, so a missing clip does not fail it
+record_message() {
+    local n="${1}"
+    local message
+
+    command -v clip >/dev/null 2>&1 || { warning "clip not found, the channel message is not recorded"; return 0; }
+    message="$(channel_message "${n}")" || return 1
+    printf '%s' "${message}" | clip --history-only || { error "Failed to record the channel message"; return 1; }
+    echo "Channel message for $(item_ref "${n}") recorded in the clipboard history." 1>&2
+}
+
+copy_message() {
+    local n="${1}"
+    local message
+
+    need_cmd clip
+    message="$(channel_message "${n}")" || return 1
     printf '%s' "${message}" | clip || { error "Failed to copy the channel message"; return 1; }
     echo "Channel message for $(item_ref "${n}") copied to clipboard." 1>&2
 }
@@ -1872,7 +1884,7 @@ recover_request() {
     submit_recovery "${source_branch}" || fail "Failed to recover the ${NOUN}"
 
     n="$(wait_for_request "${source_branch}")" || return 0
-    ask_copy_message "${n}"
+    record_message "${n}"
     return 0
 }
 
@@ -1960,7 +1972,7 @@ create_request() {
     fi
 
     n="$(wait_for_request "${source_branch}")" || return 0
-    ask_copy_message "${n}"
+    record_message "${n}"
     return 0
 }
 
