@@ -74,6 +74,16 @@ record_history() {
     printf '%s\n' "${history_entry}" >> "${history_file}" || fail "Could not update history cache ${history_file}"
 }
 
+record_switch() {
+    local target_dir
+
+    target_dir="${1}"
+    # the repo being left goes in first, so that "-" can go back to it even
+    # when it was not entered through here
+    [ -n "${current_dir}" ] && [ "${current_dir}" != "${target_dir}" ] && record_history "${current_dir}"
+    record_history "${target_dir}"
+}
+
 print_history() {
     local history_file
 
@@ -582,8 +592,11 @@ if [ "${print_history_only}" -eq 1 ]; then
     exit 0
 fi
 
+# taken before anything changes directory
+current_dir="$(current_project_dir)"
+
 if [ "${project}" = "-" ]; then
-    history_entries="$(recent_history_entries "$(current_project_dir)")"
+    history_entries="$(recent_history_entries "${current_dir}")"
     [ -n "${history_entries}" ] || fail "No project history found"
     project="$(choose_history_entry "${history_entries}")" || exit 1
 fi
@@ -597,7 +610,7 @@ if [[ "${project}" =~ ^!?[0-9]+$ ]]; then
     checkout_mr_id="${project#!}"
     git_root_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not inside a Git repository"
     checkout_requested_ref "${git_root_dir}"
-    record_history "${git_root_dir}"
+    record_switch "${git_root_dir}"
     echo "${git_root_dir}"
     exit 0
 fi
@@ -668,7 +681,7 @@ if [[ "${project}" == *"/"* ]]; then
         folder="${workspace}/${prj_candidate}"
         if cd "${folder}"; then
             checkout_requested_ref "${folder}"
-            record_history "${folder}"
+            record_switch "${folder}"
             echo "${folder}"
             exit 0
         fi
@@ -726,12 +739,12 @@ if [ -z "${match}" ] && [ "${no_git_clone}" -eq 0 ]; then
     echo 1>&2
     folder="$(git-clone "${clone_url}")" || fail "Could not clone ${clone_url}"
     checkout_requested_ref "${folder}"
-    record_history "${folder}"
+    record_switch "${folder}"
     echo "${folder}"
     exit 0
 fi
 
 [ -z "${match}" ] && fail "${project} was not found locally."
 checkout_requested_ref "${match}"
-record_history "${match}"
+record_switch "${match}"
 echo "${match}"
