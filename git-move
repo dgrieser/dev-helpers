@@ -236,6 +236,7 @@ if [ -z "${branch}" ]; then
         else
             cmai_args+=( "--diff" "${reset_point}...HEAD" )
         fi
+        print-text-muted "+ cmai ${cmai_args[*]}" 1>&2
         suggestion="$(timeout 10 cmai "${cmai_args[@]}" 2>/dev/null)"; exit_code=$?
         [ ${exit_code} -eq 0 ] && [ -n "${suggestion}" ] && prompt_args+=( "--default" "${suggestion}" )
     fi
