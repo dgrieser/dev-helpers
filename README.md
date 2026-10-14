@@ -5,6 +5,7 @@ Collection of git helper scripts for everyday workflows across GitHub and GitLab
 ## Install
 
 ```bash
+sudo make setup-dirs         # once: make the install folders group-writable, then install without sudo
 sudo make install            # copy scripts to /usr/local/bin, bash completions and shell integration
 sudo make install-links      # symlink scripts, completions and shell integration back to this repo
 sudo make uninstall          # remove installed files
