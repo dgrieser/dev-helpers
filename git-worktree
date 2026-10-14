@@ -634,6 +634,19 @@ go_worktree() {
     echo "${target}"
 }
 
+# a shell may still be in the removed worktree; the hook of
+# shell/dev-helpers.bash moves it to the main tree recorded here. Only the last
+# 100 removals are kept
+record_removed_worktree() {
+    local file="${HOME}/.cache/dev-helpers/removed-worktrees"
+
+    mkdir -p "${file%/*}" &&
+        printf '%s\t%s\n' "${1}" "${workdir}" >> "${file}" &&
+        tail -n 100 "${file}" > "${file}.$$" &&
+        mv "${file}.$$" "${file}" ||
+        { rm -f "${file}.$$"; warning "Cannot record removed worktree ${1} in ${file}"; }
+}
+
 delete_worktree() {
     if [ -n "${branch_arg}" ]; then
         target="$(worktree_of_branch "${branch}")"
@@ -647,6 +660,7 @@ delete_worktree() {
     [ "${target}" != "${workdir}" ] || fail "Cannot delete the main tree: ${workdir}"
     git-color -C "${workdir}" worktree remove "${target}" ||
         fail "git worktree remove failed"
+    record_removed_worktree "${target}"
     echo "Deleted worktree: ${target}" 1>&2
     echo "${workdir}"
 }
@@ -909,6 +923,7 @@ pick_delete() {
     else
         git -C "${workdir}" worktree remove "${1}" >/dev/null || exit 1
     fi
+    record_removed_worktree "${1}"
     # the shell the picker was started from is in the deleted dir, so leaving the
     # picker sends it to the main tree
     if [ "${1}" = "$(cat "${pick_state}.current" 2>/dev/null)" ]; then

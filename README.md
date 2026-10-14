@@ -5,8 +5,8 @@ Collection of git helper scripts for everyday workflows across GitHub and GitLab
 ## Install
 
 ```bash
-sudo make install            # copy scripts to /usr/local/bin and bash completions
-sudo make install-links      # symlink scripts and completions back to this repo
+sudo make install            # copy scripts to /usr/local/bin, bash completions and shell integration
+sudo make install-links      # symlink scripts, completions and shell integration back to this repo
 sudo make uninstall          # remove installed files
 make list                    # show targets and available commands
 make list-install            # show install destination
@@ -27,6 +27,20 @@ source /usr/local/share/bash-completion/completions/dev-helpers
 __dh_register_aliases                          # auto-map aliases to git-* commands
 __dh_complete_alias g git-find-repo            # map wrapper functions explicitly
 __dh_complete_alias gwdel git-worktree delete  # ... calling it with leading words
+```
+
+The shell integration (`shell/dev-helpers.bash`), installed to
+`/usr/local/share/dev-helpers`, adds a hook to `PROMPT_COMMAND`. A command can
+not change the directory of the shell that started it, so a shell left in a
+worktree that [git-mr](#git-mr) or [git-worktree](#git-worktree) removed is moved
+at its next prompt: to the main tree recorded at the removal (the same
+subdirectory when it exists there), else to the main tree a worktree under
+`$WORKSPACE_WORKTREE` mirrors, else to the nearest directory that still exists.
+This holds for every shell in that worktree, not just the one that ran the
+command. Source it after the prompt is set up, so the hook runs first:
+
+```bash
+source /usr/local/share/dev-helpers/dev-helpers.bash
 ```
 
 ## Tools
@@ -457,8 +471,9 @@ source branch on the remote (GitHub `--delete-branch`, GitLab
 is checked out instead and pulled with [git-pull](#git-pull). Checked out in a
 linked worktree, such as one [git-worktree](#git-worktree) adds, the worktree is
 removed once the run ends and the main tree takes the target branch instead; a
-worktree with uncommitted changes is kept. The shell stays in the removed
-directory, the path of the main tree is printed to change into. An auto-merge
+worktree with uncommitted changes is kept. The path of the main tree is
+printed, and with the [shell integration](#install) the shell changes into it at
+its next prompt; without it the shell stays in the removed directory. An auto-merge
 keeps the local branch, nothing is merged yet. `-n` shows one request
 without the picker, `-p` prints the list. `-A` starts with every state instead
 of the open ones.

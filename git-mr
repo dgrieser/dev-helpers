@@ -1039,6 +1039,19 @@ cleanup_merged_branch() {
     delete_merged_branch "${source_branch}"
 }
 
+# the shell the run started from, and any other, may still be in the removed
+# worktree; the hook of shell/dev-helpers.bash moves them to the main tree
+# recorded here. Only the last 100 removals are kept
+record_removed_worktree() {
+    local file="${HOME}/.cache/dev-helpers/removed-worktrees"
+
+    mkdir -p "${file%/*}" \
+        && printf '%s\t%s\n' "${1}" "${2}" >> "${file}" \
+        && tail -n 100 "${file}" > "${file}.$$" \
+        && mv "${file}.$$" "${file}" \
+        || { rm -f "${file}.$$"; warning "Failed to record removed worktree ${1} in ${file}"; }
+}
+
 # the picker that merged, and every key it calls back with, still runs in the
 # worktree of the merged branch, and a shell started in a removed directory
 # complains on every call, so the worktree is only removed once the run ends.
@@ -1059,6 +1072,7 @@ cleanup_merged_worktree() {
     echo 1>&2
     git-color worktree remove "${worktree}" 1>&2 \
         || { error "Failed to remove worktree ${worktree}"; return 1; }
+    record_removed_worktree "${worktree}" "${main_dir}"
     echo "Removed worktree ${worktree}, the main tree is ${main_dir}" 1>&2
     switch_to_target_branch "${target_branch}" || return 1
     delete_merged_branch "${source_branch}"
