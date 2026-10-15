@@ -33,9 +33,10 @@ Commands:
                         printed
 
 If COMMAND is omitted, a menu offers to add a worktree or to list them in the
-interactive picker. -b, -B, --fetch and --no-fetch are then only what the
-questions of the add offer, there and on alt-a in the picker. Esc in the picker
-or in a question goes back to the menu, ctrl-c ends it.
+interactive picker, starting on the add when the main tree is the only
+worktree. -b, -B, --fetch and --no-fetch are then only what the questions of
+the add offer, there and on alt-a in the picker. Esc in the picker or in a
+question goes back to the menu, ctrl-c ends it.
 
 Only add is bound to WORKSPACE_WORKTREE; the other commands work on any
 worktree of a repository whose main tree is under WORKSPACE, wherever the
@@ -577,6 +578,11 @@ list_worktrees() {
         sed "s/\$/ (unregistered)/"
 }
 
+# any worktree but the main tree, a prunable one included
+has_linked_worktrees() {
+    worktree_rows | awk -F "\t" '$3 == 0 { found = 1 } END { exit !found }'
+}
+
 worktree_of_branch() {
     rows="$(worktree_rows)" || exit 1
     printf "%s\n" "${rows}" |
@@ -1049,7 +1055,8 @@ interactive_worktrees() {
 }
 
 # Without a command a menu asks whether to add a worktree or to open the picker,
-# starting on the add when the arguments are about one.
+# starting on the add when the arguments are about one or when the main tree is
+# the only worktree, as there is nothing to list yet.
 #
 # Esc in the picker or in a question of the add comes back here, as does a failed
 # add; esc here, or ctrl-c anywhere, ends the run. The worktree picked or added is
@@ -1058,7 +1065,9 @@ menu() {
     need_cmd prompt-select
     : > "${pick_state}.menu" || fail "Cannot write ${pick_state}.menu"
     menu_default="list"
-    [ -n "${branch_arg}${base_arg}${fetch_arg}" ] && menu_default="add"
+    if [ -n "${branch_arg}${base_arg}${fetch_arg}" ] || ! has_linked_worktrees; then
+        menu_default="add"
+    fi
     while true; do
         choice="$(printf "add\tAdd worktree\nlist\tList worktrees\n" |
             prompt-select --prompt "Worktree:" --delimiter "\t" --default "${menu_default}")" ||

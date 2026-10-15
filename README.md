@@ -685,8 +685,8 @@ has checked out, and prints where it is.
 Without a command `git-worktree` asks in a `prompt-select` menu whether to add a
 worktree or to list them in the `interactive` picker. `-b`, `-B`, `--fetch` and
 `--no-fetch` are then only the defaults the questions of the add offer, and the
-menu starts on the add when one of them is given; `add` itself takes them as
-they are. Esc in the picker or in a question of the add goes back to the menu,
+menu starts on the add when one of them is given or when the main tree is the
+only worktree of the repository; `add` itself takes them as they are. Esc in the picker or in a question of the add goes back to the menu,
 ctrl-c ends the run, and Tab completes the branches the questions ask for.
 `interactive` opens an `fzf-with-header` picker over every worktree of the
 repository, the main tree on top, listing branch, HEAD and state (main tree,
