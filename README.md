@@ -479,6 +479,12 @@ keeps the local branch, nothing is merged yet. `-n` shows one request
 without the picker, `-p` prints the list. `-A` starts with every state instead
 of the open ones.
 
+`<project>` is looked up with [git-find-repo](#git-find-repo). The URL of a
+request - GitLab `.../-/merge_requests/<id>`, GitHub `.../pull/<id>` - names
+the repository and the request at once: the request is acted on as with
+`-n <id>`, and its source branch is not checked out. So `git-pr -m <url>`
+copies the channel message of a request straight from its link.
+
 A request that needs no approval - its rules ask for none or it has every
 approval it needs - is merged by `Approve + Merge` without approving it; a
 GitLab merge status that still reports the approvals of rules changed a moment
@@ -513,7 +519,7 @@ git-mr [-c|--create] [-a|--approve] [-M|--merge] [-C|--close] [-D|--delete] \
        [-m|--copy-message] [-i|--issue] [--feedback] [-u|--unresolved] [-r|--raw] \
        [-b|--branch <branch>] [-k|--checkout] [--prod-branch <branch>] \
        [-A|--all] [-n|--number <id>] [-q|--query <query>] [-l|--limit <n>] \
-       [-p|--print] [-o txt|json] [<project>]
+       [-p|--print] [-o txt|json] [<project>|<url>]
 ```
 
 ### git-package
@@ -548,7 +554,7 @@ git-pipe search [-r <project>] [--ref <ref>|--all-refs] [--tags <N>|--no-tags] \
 Symlink to [git-mr](#git-mr), which handles GitHub pull requests and GitLab
 merge requests alike.
 ```bash
-git-pr [OPTIONS] [<project>]
+git-pr [OPTIONS] [<project>|<url>]
 ```
 
 ### git-pull

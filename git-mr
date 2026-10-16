@@ -136,7 +136,7 @@ key_help() {
 
 usage() {
     cat <<EOF 1>&2
-usage: ${APP_NAME} [OPTIONS] [<project>]
+usage: ${APP_NAME} [OPTIONS] [<project>|<url>]
 
 Work with GitLab merge requests and GitHub pull requests. The provider is
 detected from the remote, so ${APP_NAME} handles both; git-mr and git-pr are
@@ -236,7 +236,10 @@ Options:
   -h, --help              show this help message and exit
 
 <project> is looked up with git-find-repo, so requests of another repository
-can be handled without changing directory first.
+can be handled without changing directory first. The URL of a request (GitLab
+.../-/merge_requests/<id>, GitHub .../pull/<id>) names the repository and the
+request at once: the request is acted on as with -n <id>, and its source branch
+is not checked out, so ${APP_NAME} -m <url> copies its channel message.
 EOF
     exit 1
 }
@@ -357,6 +360,22 @@ repository_from_url() {
 
     [ "${repository}" = "${repository#*/}" ] && return 1
     printf '%s\n' "${repository}"
+}
+
+# the number of the request a URL points to, GitLab .../-/merge_requests/<n> or
+# GitHub .../<owner>/<repo>/pull/<n>, with or without a tab or anchor after it;
+# a URL without a scheme counts when it starts with a host name, the same as
+# git-find-repo takes it
+request_number_from_url() {
+    local url="${1}"
+    local host_re='([^:/]+://[^/]+|[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})'
+
+    if [[ "${url}" =~ ^${host_re}/.+/-/merge_requests/([0-9]+)([/?#]|$) ]] \
+        || [[ "${url}" =~ ^${host_re}/[^/]+/[^/]+/pull/([0-9]+)([/?#]|$) ]]; then
+        printf '%s\n' "${BASH_REMATCH[3]}"
+        return 0
+    fi
+    return 1
 }
 
 # the remote gh resolved to wins, then origin; only an ambiguous set of remotes
@@ -2492,6 +2511,18 @@ case "${mode}" in
         ;;
 esac
 
+# the URL of a request names the repository and the request at once, so it is
+# acted on as with -n; git-find-repo would check out its source branch otherwise
+find_repo_args=()
+if [ -n "${project}" ] && url_number="$(request_number_from_url "${project}")"; then
+    [ "${action}" = "create" ] \
+        && error "A request URL can not be combined with -c|--create" && usage
+    [ -n "${number}" ] && [ "${number}" != "${url_number}" ] \
+        && error "-n|--number ${number} does not match the request URL: ${project}" && usage
+    number="${url_number}"
+    find_repo_args+=("--no-checkout")
+fi
+
 [ "${state}" != "open" ] && [ "${action}" = "create" ] \
     && error "-A|--all can not be combined with -c|--create" && usage
 [ -n "${number}" ] && [ "${action}" = "create" ] \
@@ -2512,7 +2543,7 @@ need_cmd prompt-multiline
 cded=0
 if [ -n "${project}" ]; then
     need_cmd git-find-repo
-    folder="$(git-find-repo "${project}")" || fail "Failed to find project: ${project}"
+    folder="$(git-find-repo "${find_repo_args[@]}" "${project}")" || fail "Failed to find project: ${project}"
     cd "${folder}" 1>/dev/null || fail "Failed to change to: ${folder}"
     cded=1
 fi
