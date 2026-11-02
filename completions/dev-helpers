@@ -482,7 +482,7 @@ _git-find-repo()
             return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-W --workspace -F --vc-folder -U --update-listing -L --list -R --list-remote -H --history --print-history --no-git-clone --no-history --no-checkout -h --help"
+        __dh_compgen "-W --workspace -F --vc-folder -U --update-listing --update-remote-listing -L --list -R --list-remote -H --history --print-history --no-git-clone --no-history --no-checkout -h --help"
     else
         __dh_compgen "$(__dh_projects) $(__dh_remote_projects)"
     fi

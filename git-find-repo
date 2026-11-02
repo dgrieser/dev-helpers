@@ -5,7 +5,7 @@ git-color() { command git-color --color=always "$@"; }
 
 usage() {
     cat <<EOF 1>&2
-usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--list|-L] [--list-remote|-R] [--print-history|--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-url|pr-url|mr-id|->
+usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--update-remote-listing] [--list|-L] [--list-remote|-R] [--print-history|--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-url|pr-url|mr-id|->
 EOF
     exit 1
 }
@@ -451,6 +451,8 @@ list_source_repos() {
     local group
     local endpoint
     local pages
+    local page_dir
+    local status
 
     host="${1%%/*}"
     group="${1#*/}"
@@ -476,8 +478,13 @@ list_source_repos() {
     pages="$(glab api -i "${endpoint}&page=1" 2>/dev/null | tr -d '\r' | awk -F ': ' 'tolower($1) == "x-total-pages" { print $2; exit }')"
     if [[ "${pages}" =~ ^[0-9]+$ ]]; then
         [ "${pages}" -eq 0 ] && return 0
-        seq 1 "${pages}" | xargs -P 8 -I '{}' glab api "${endpoint}&page={}" \
-            | jq -r '.[].path_with_namespace'
+        # each page goes to a file of its own, their output would interleave
+        page_dir="$(mktemp -d)" || return 1
+        seq 1 "${pages}" | xargs -P 8 -I '{}' sh -c 'glab api "${1}&page=${2}" > "${3}/${2}"' _ "${endpoint}" '{}' "${page_dir}" \
+            && cat "${page_dir}"/* | jq -r '.[].path_with_namespace'
+        status=$?
+        rm -rf "${page_dir}"
+        return "${status}"
     else
         glab api --paginate "${endpoint}" | jq -r '.[].path_with_namespace'
     fi
@@ -619,10 +626,11 @@ forget_remote_repo() {
 
 # like pick_remote_repo, but a repo that no longer exists is dropped from the
 # cached listing and left to the usual lookup, as is one missing from it; the
-# listing is never fetched again here
+# listing is only fetched here when there is none yet
 resolve_remote_repo() {
     local remote_repo
 
+    [ -s "$(remote_listing_cache_file)" ] || update_remote_listing || return 1
     remote_repo="$(pick_remote_repo "${1}")" || return 1
     remote_repo_exists "${remote_repo}" && {
         printf '%s\n' "${remote_repo}"
@@ -705,6 +713,7 @@ project=""
 workspace="${WORKSPACE}"
 vc_folder="${VC_FOLDER}"
 update_listing_only=0
+update_remote_listing_only=0
 list_only=0
 list_remote_only=0
 print_history_only=0
@@ -727,6 +736,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --update-listing|-U)
             update_listing_only=1
+            ;;
+        --update-remote-listing)
+            update_remote_listing_only=1
             ;;
         --list|-L)
             list_only=1
@@ -767,14 +779,20 @@ if [ -d "${HOME}/.cache/dev-find-project" ] && [ ! -e "${HOME}/.cache/git-find-r
         || warning "Could not migrate cache from ${HOME}/.cache/dev-find-project"
 fi
 [ "${list_remote_only}" -eq 1 ] && [ -n "${project}" ] && usage
-[ "$((update_listing_only + list_only + list_remote_only + print_history_only))" -gt 1 ] && usage
+[ "${update_remote_listing_only}" -eq 1 ] && [ -n "${project}" ] && usage
+[ "$((update_listing_only + update_remote_listing_only + list_only + list_remote_only + print_history_only))" -gt 1 ] && usage
 [ "${update_listing_only}" -eq 1 ] && [ -n "${project}" ] && usage
 [ "${list_only}" -eq 1 ] && [ -n "${project}" ] && usage
 [ "${print_history_only}" -eq 1 ] && [ -n "${project}" ] && usage
-[ "$((update_listing_only + list_only + list_remote_only + print_history_only))" -eq 0 ] && [ -z "${project}" ] && usage
+[ "$((update_listing_only + update_remote_listing_only + list_only + list_remote_only + print_history_only))" -eq 0 ] && [ -z "${project}" ] && usage
 
 if [ "${update_listing_only}" -eq 1 ]; then
     update_listing
+    exit 0
+fi
+
+if [ "${update_remote_listing_only}" -eq 1 ]; then
+    update_remote_listing || fail "Could not update remote listing $(remote_listing_cache_file)"
     exit 0
 fi
 
