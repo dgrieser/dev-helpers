@@ -526,11 +526,13 @@ update_remote_listing() {
     [ "${failed}" -eq 0 ]
 }
 
-# remote repo paths not cloned to ${workspace}/<path>; the listing is kept for
-# good and only fetched when missing, resolve_remote_repo refetches it when it
-# turns out to be out of date
+# the names of the remote repos not cloned to ${workspace}/<path>, made unique
+# the way the local listing is: a name shared with another remote or local repo
+# gets the shortest #<parent suffix> telling it apart; the listing is kept for
+# good and only fetched when missing
 list_remote_repos() {
     local cache_file
+    local local_cache_file
     local source
     local remote_repo
 
@@ -538,16 +540,70 @@ list_remote_repos() {
     if [ ! -s "${cache_file}" ]; then
         update_remote_listing || return 0
     fi
+    local_cache_file="$(listing_cache_file)"
 
-    while IFS=$'\t' read -r source remote_repo; do
-        [ -z "${remote_repo}" ] && continue
-        [ -d "${workspace}/${remote_repo}" ] && continue
-        printf '%s\n' "${remote_repo}"
-    done < "${cache_file}" | awk '!seen[$0]++'
+    {
+        [ -f "${local_cache_file}" ] && awk -F '\t' -v workspace="${workspace}" '
+            NF >= 2 {
+                path = $2
+                if (index(path, workspace "/") == 1) path = substr(path, length(workspace) + 2)
+                else if (path == workspace) path = "."
+                print "L\t" path
+            }
+        ' "${local_cache_file}"
+        while IFS=$'\t' read -r source remote_repo; do
+            [ -z "${remote_repo}" ] && continue
+            [ -d "${workspace}/${remote_repo}" ] && continue
+            printf 'R\t%s\n' "${remote_repo}"
+        done < "${cache_file}"
+    } | awk -F '\t' '
+        function parent_of(path,   copy) {
+            copy = path
+            if (copy !~ /\//) return "."
+            sub(/\/[^\/]+$/, "", copy)
+            return copy
+        }
+        function suffix_of(path, count,   n, parts, out, i) {
+            n = split(path, parts, "/")
+            if (count > n) return ""
+            out = parts[n - count + 1]
+            for (i = n - count + 2; i <= n; i++) out = out "/" parts[i]
+            return out
+        }
+        seen[$2]++ { next }
+        {
+            total++
+            kind[total] = $1
+            name[total] = $2
+            sub(/^.*\//, "", name[total])
+            parent[total] = parent_of($2)
+            members[name[total]] = members[name[total]] " " total
+        }
+        END {
+            for (i = 1; i <= total; i++) {
+                if (kind[i] != "R") continue
+                split(substr(members[name[i]], 2), group, " ")
+                if (length(group) == 1) { print name[i]; continue }
+                qualifier = parent[i]
+                parts = split(parent[i], _, "/")
+                for (count = 1; count <= parts; count++) {
+                    suffix = suffix_of(parent[i], count)
+                    unique = 1
+                    for (j in group) {
+                        other = group[j]
+                        if (other != i && suffix_of(parent[other], count) == suffix) { unique = 0; break }
+                    }
+                    if (unique) { qualifier = suffix; break }
+                }
+                print name[i] "#" qualifier
+            }
+        }
+    '
 }
 
-# the <source>\t<path> lines of the remote repos that a path or a bare repo name
-# names, ignoring case, all from the first source in remote_sources having any
+# the <source>\t<path> lines of the remote repos that a path, a bare repo name
+# or a name#<parent suffix> as list_remote_repos prints it names, ignoring case,
+# all from the first source in remote_sources having any
 find_remote_repos() {
     local requested_project
     local cache_file
@@ -556,14 +612,26 @@ find_remote_repos() {
     cache_file="$(remote_listing_cache_file)"
     [ -f "${cache_file}" ] && [ -n "${requested_project}" ] || return 1
     awk -F '\t' -v requested="${requested_project,,}" '
+        BEGIN {
+            qualifier = ""
+            if (index(requested, "#")) {
+                qualifier = substr(requested, index(requested, "#") + 1)
+                requested = substr(requested, 1, index(requested, "#") - 1)
+            }
+        }
         {
             path = tolower($2)
-            if (requested ~ /\//) {
-                if (path != requested) next
-            } else {
-                name = path
-                sub(/^.*\//, "", name)
+            name = path
+            sub(/^.*\//, "", name)
+            parent = path
+            sub(/\/[^\/]+$/, "", parent)
+            if (qualifier != "") {
                 if (name != requested) next
+                if (parent != qualifier && substr(parent, length(parent) - length(qualifier)) != "/" qualifier) next
+            } else if (requested ~ /\//) {
+                if (path != requested) next
+            } else if (name != requested) {
+                next
             }
             if (source == "") source = $1
             if ($1 == source) { print; found = 1 }
