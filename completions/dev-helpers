@@ -110,6 +110,13 @@ __dh_projects()
     git-find-repo --list 2>/dev/null
 }
 
+# repos of the GitHub owners and GitLab groups git-find-repo clones on demand,
+# as their path, minus the ones already cloned
+__dh_remote_projects()
+{
+    git-find-repo --list-remote 2>/dev/null
+}
+
 __dh_changed_files()
 {
     LC_ALL=C git status --porcelain 2>/dev/null | cut -c4-
@@ -475,9 +482,9 @@ _git-find-repo()
             return 0 ;;
     esac
     if [[ "${cur}" == -* ]]; then
-        __dh_compgen "-W --workspace -F --vc-folder -U --update-listing -L --list -H --history --print-history --no-git-clone --no-history --no-checkout -h --help"
+        __dh_compgen "-W --workspace -F --vc-folder -U --update-listing -L --list -R --list-remote -H --history --print-history --no-git-clone --no-history --no-checkout -h --help"
     else
-        __dh_compgen "$(__dh_projects)"
+        __dh_compgen "$(__dh_projects) $(__dh_remote_projects)"
     fi
     return 0
 }

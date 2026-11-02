@@ -5,7 +5,7 @@ git-color() { command git-color --color=always "$@"; }
 
 usage() {
     cat <<EOF 1>&2
-usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--list|-L] [--print-history|--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-url|pr-url|mr-id|->
+usage: $(basename "${0}") [--workspace|-W <path, default \$WORKSPACE>] [--vc-folder|-F <folder, default \$VC_FOLDER>] [--update-listing|-U] [--list|-L] [--list-remote|-R] [--print-history|--history|-H] [--no-git-clone] [--no-history] [--no-checkout] <project|url|mr-url|pr-url|mr-id|->
 EOF
     exit 1
 }
@@ -432,6 +432,207 @@ choose_similar_repo() {
     } | prompt-select --prompt "Choose repository:" --delimiter '\t'
 }
 
+# the sources whose repos are completed and cloned even when not cloned yet, in
+# the order a bare repo name is looked up in: github.com/<owner> lists the
+# repos of a GitHub owner with gh, <host>/<group> the projects of a GitLab group
+# and its subgroups with glab, and a bare <host> all GitLab projects of the
+# groups and namespaces one is a member of
+remote_sources() {
+    printf '%s\n' ${GIT_FIND_REPO_REMOTES:-github.com/dgrieser github.com/mittwald gitlab.mittwald.it}
+}
+
+remote_listing_cache_file() {
+    echo "${HOME}/.cache/git-find-repo/remote-listing"
+}
+
+# the repo paths of one source, one per line
+list_source_repos() {
+    local host
+    local group
+    local endpoint
+    local pages
+
+    host="${1%%/*}"
+    group="${1#*/}"
+    [ "${group}" = "${1}" ] && group=""
+    case "${host}" in
+        github.com)
+            command -v gh &>/dev/null || return 1
+            gh repo list "${group}" --limit 10000 --json nameWithOwner -q '.[].nameWithOwner'
+            return
+            ;;
+    esac
+
+    command -v glab &>/dev/null || return 1
+    if [ -n "${group}" ]; then
+        endpoint="groups/${group//\//%2F}/projects?include_subgroups=true&simple=true&per_page=100"
+    else
+        endpoint="projects?membership=true&simple=true&per_page=100"
+    fi
+    export GITLAB_HOST="${host}"
+    # the pages are fetched side by side, which takes a second or two instead of
+    # many; GitLab leaves out the page count for very large results, which are
+    # then paged through one after the other
+    pages="$(glab api -i "${endpoint}&page=1" 2>/dev/null | tr -d '\r' | awk -F ': ' 'tolower($1) == "x-total-pages" { print $2; exit }')"
+    if [[ "${pages}" =~ ^[0-9]+$ ]]; then
+        [ "${pages}" -eq 0 ] && return 0
+        seq 1 "${pages}" | xargs -P 8 -I '{}' glab api "${endpoint}&page={}" \
+            | jq -r '.[].path_with_namespace'
+    else
+        glab api --paginate "${endpoint}" | jq -r '.[].path_with_namespace'
+    fi
+}
+
+# <source>\t<path> per line for all repos of the remote sources, in source
+# order; the sources are fetched side by side
+update_remote_listing() {
+    local cache_file
+    local temp_dir
+    local source
+    local index
+    local failed
+
+    cache_file="$(remote_listing_cache_file)"
+    mkdir -p "$(dirname "${cache_file}")" || return 1
+    temp_dir="$(mktemp -d "${cache_file}.tmp.XXXXXX")" || return 1
+    index=0
+    for source in $(remote_sources); do
+        index=$((index + 1))
+        (
+            set -o pipefail
+            list_source_repos "${source}" 2>/dev/null | LC_ALL=C sort -u \
+                | awk -v source="${source}" '{ print source "\t" $0 }' > "${temp_dir}/${index}" \
+                || rm -f "${temp_dir}/${index}"
+        ) &
+    done
+    wait
+    # a failing source keeps the old listing rather than dropping its repos
+    failed=0
+    for (( ; index > 0; index-- )); do
+        [ -f "${temp_dir}/${index}" ] || failed=1
+    done
+    if [ "${failed}" -eq 0 ]; then
+        cat $(ls "${temp_dir}" | sort -n | sed "s|^|${temp_dir}/|") > "${temp_dir}/listing" \
+            && mv "${temp_dir}/listing" "${cache_file}" || failed=1
+    fi
+    rm -rf "${temp_dir}"
+    [ "${failed}" -eq 0 ]
+}
+
+# remote repo paths not cloned to ${workspace}/<path>; the listing is kept for
+# good and only fetched when missing, resolve_remote_repo refetches it when it
+# turns out to be out of date
+list_remote_repos() {
+    local cache_file
+    local source
+    local remote_repo
+
+    cache_file="$(remote_listing_cache_file)"
+    if [ ! -s "${cache_file}" ]; then
+        update_remote_listing || return 0
+    fi
+
+    while IFS=$'\t' read -r source remote_repo; do
+        [ -z "${remote_repo}" ] && continue
+        [ -d "${workspace}/${remote_repo}" ] && continue
+        printf '%s\n' "${remote_repo}"
+    done < "${cache_file}" | awk '!seen[$0]++'
+}
+
+# the <source>\t<path> lines of the remote repos that a path or a bare repo name
+# names, ignoring case, all from the first source in remote_sources having any
+find_remote_repos() {
+    local requested_project
+    local cache_file
+
+    requested_project="${1}"
+    cache_file="$(remote_listing_cache_file)"
+    [ -f "${cache_file}" ] && [ -n "${requested_project}" ] || return 1
+    awk -F '\t' -v requested="${requested_project,,}" '
+        {
+            path = tolower($2)
+            if (requested ~ /\//) {
+                if (path != requested) next
+            } else {
+                name = path
+                sub(/^.*\//, "", name)
+                if (name != requested) next
+            }
+            if (source == "") source = $1
+            if ($1 == source) { print; found = 1 }
+        }
+        END { exit !found }
+    ' "${cache_file}"
+}
+
+# the <source>\t<path> of the one remote repo a path or bare name names, picked
+# when the first source has several
+pick_remote_repo() {
+    local found
+    local choice
+
+    found="$(find_remote_repos "${1}")" || return 1
+    if [ "$(wc -l <<< "${found}")" -gt 1 ]; then
+        choice="$(awk -F '\t' '{ host = $1; sub(/\/.*/, "", host); print NR "\t" host "/" $2 }' <<< "${found}" \
+            | prompt-select --prompt "Choose repository:" --delimiter '\t')" || return 1
+        found="$(sed -n "${choice}p" <<< "${found}")"
+    fi
+    printf '%s\n' "${found}"
+}
+
+remote_repo_url() {
+    local source
+
+    source="${1%%$'\t'*}"
+    printf 'git@%s:%s.git\n' "${source%%/*}" "${1#*$'\t'}"
+}
+
+# whether a <source>\t<path> repo still exists; only an API answering 404
+# counts as gone, so being offline or the like does not refetch the listing
+remote_repo_exists() {
+    local source
+    local path
+    local host
+    local output
+
+    source="${1%%$'\t'*}"
+    path="${1#*$'\t'}"
+    host="${source%%/*}"
+    if [ "${host}" = "github.com" ]; then
+        output="$(gh api "repos/${path}" --silent 2>&1)"
+    else
+        output="$(GITLAB_HOST="${host}" glab api "projects/${path//\//%2F}" 2>&1 >/dev/null)"
+    fi
+    [[ "${output}" != *"HTTP 404"* ]]
+}
+
+# drops a <source>\t<path> line from the cached remote listing
+forget_remote_repo() {
+    local cache_file
+    local temp_file
+
+    cache_file="$(remote_listing_cache_file)"
+    temp_file="$(mktemp "${cache_file}.tmp.XXXXXX")" || return 1
+    grep -vxF -- "${1}" "${cache_file}" > "${temp_file}"
+    mv "${temp_file}" "${cache_file}" || rm -f "${temp_file}"
+}
+
+# like pick_remote_repo, but a repo that no longer exists is dropped from the
+# cached listing and left to the usual lookup, as is one missing from it; the
+# listing is never fetched again here
+resolve_remote_repo() {
+    local remote_repo
+
+    remote_repo="$(pick_remote_repo "${1}")" || return 1
+    remote_repo_exists "${remote_repo}" && {
+        printf '%s\n' "${remote_repo}"
+        return 0
+    }
+    note "$(remote_repo_url "${remote_repo}") no longer exists, removing it from the remote listing"
+    forget_remote_repo "${remote_repo}"
+    return 1
+}
+
 update_listing() {
     local cache_file
     local cache_dir
@@ -505,6 +706,7 @@ workspace="${WORKSPACE}"
 vc_folder="${VC_FOLDER}"
 update_listing_only=0
 list_only=0
+list_remote_only=0
 print_history_only=0
 no_git_clone=0
 no_history=0
@@ -528,6 +730,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --list|-L)
             list_only=1
+            ;;
+        --list-remote|-R)
+            list_remote_only=1
             ;;
         --print-history|--history|-H)
             print_history_only=1
@@ -561,13 +766,12 @@ if [ -d "${HOME}/.cache/dev-find-project" ] && [ ! -e "${HOME}/.cache/git-find-r
     mv "${HOME}/.cache/dev-find-project" "${HOME}/.cache/git-find-repo" \
         || warning "Could not migrate cache from ${HOME}/.cache/dev-find-project"
 fi
+[ "${list_remote_only}" -eq 1 ] && [ -n "${project}" ] && usage
+[ "$((update_listing_only + list_only + list_remote_only + print_history_only))" -gt 1 ] && usage
 [ "${update_listing_only}" -eq 1 ] && [ -n "${project}" ] && usage
 [ "${list_only}" -eq 1 ] && [ -n "${project}" ] && usage
 [ "${print_history_only}" -eq 1 ] && [ -n "${project}" ] && usage
-[ "${update_listing_only}" -eq 1 ] && [ "${list_only}" -eq 1 ] && usage
-[ "${update_listing_only}" -eq 1 ] && [ "${print_history_only}" -eq 1 ] && usage
-[ "${list_only}" -eq 1 ] && [ "${print_history_only}" -eq 1 ] && usage
-[ "${update_listing_only}" -eq 0 ] && [ "${list_only}" -eq 0 ] && [ "${print_history_only}" -eq 0 ] && [ -z "${project}" ] && usage
+[ "$((update_listing_only + list_only + list_remote_only + print_history_only))" -eq 0 ] && [ -z "${project}" ] && usage
 
 if [ "${update_listing_only}" -eq 1 ]; then
     update_listing
@@ -584,6 +788,11 @@ if [ "${list_only}" -eq 1 ]; then
     fi
 
     printf '%s\n' "${listing}"
+    exit 0
+fi
+
+if [ "${list_remote_only}" -eq 1 ]; then
+    list_remote_repos
     exit 0
 fi
 
@@ -706,6 +915,14 @@ if [ -z "${matches}" ] && [ "${listing_refreshed}" -eq 0 ]; then
     update_listing
     listing="$(cat "${cache_file}")"
     matches="$(find_matching_repos "${project}" "${listing}")"
+fi
+
+# a repo of a remote source, named by its path or by its name alone, is cloned
+# from there right away, without offering similar repos or searching for it
+if [ -z "${matches}" ] && [ -z "${url}" ] && [ "${no_git_clone}" -eq 0 ] \
+    && remote_repo="$(resolve_remote_repo "${project}")" && [ -n "${remote_repo}" ]; then
+    project="${remote_repo#*$'\t'}"
+    url="$(remote_repo_url "${remote_repo}")"
 fi
 
 # without an exact match the repos containing the name are offered before going
