@@ -655,11 +655,44 @@ pick_remote_repo() {
     printf '%s\n' "${found}"
 }
 
+remote_ssh_prefix_cache_file() {
+    echo "${HOME}/.cache/git-find-repo/remote-ssh-prefixes"
+}
+
+# the SSH clone URL of a <source>\t<path> repo; a GitLab host is asked for it,
+# as its SSH may listen on another port than 22 (ssh://git@<host>:<port>/...),
+# falling back to the scp-like git@<host>:<path>.git when that fails; the part
+# before <path>.git is the same for all repos of a host and is cached per host
 remote_repo_url() {
     local source
+    local path
+    local host
+    local url
+    local prefix
+    local cache_file
 
     source="${1%%$'\t'*}"
-    printf 'git@%s:%s.git\n' "${source%%/*}" "${1#*$'\t'}"
+    path="${1#*$'\t'}"
+    host="${source%%/*}"
+    if [ "${host}" != "github.com" ]; then
+        cache_file="$(remote_ssh_prefix_cache_file)"
+        prefix="$([ -f "${cache_file}" ] && awk -F '\t' -v host="${host}" '$1 == host { print $2; exit }' "${cache_file}")"
+        [ -n "${prefix}" ] && {
+            printf '%s%s.git\n' "${prefix}" "${path}"
+            return 0
+        }
+        command -v glab &>/dev/null \
+            && url="$(GITLAB_HOST="${host}" glab api "projects/${path//\//%2F}" 2>/dev/null | jq -r '.ssh_url_to_repo // empty' 2>/dev/null)"
+        [ -n "${url}" ] && {
+            prefix="${url%"${path}.git"}"
+            if [ "${prefix}" != "${url}" ] && mkdir -p "$(dirname "${cache_file}")"; then
+                printf '%s\t%s\n' "${host}" "${prefix}" >> "${cache_file}"
+            fi
+            printf '%s\n' "${url}"
+            return 0
+        }
+    fi
+    printf 'git@%s:%s.git\n' "${host}" "${path}"
 }
 
 # whether a <source>\t<path> repo still exists; only an API answering 404
