@@ -376,9 +376,6 @@ PICK_KEY_DESCS = (
 PICK_HELPERS = (
     "fzf",
     "fzf-with-header",
-    "prompt-input",
-    "prompt-multiline",
-    "prompt-select",
 )
 
 C_REF = "\033[33m"
@@ -502,8 +499,19 @@ def helper_path(name: str) -> str | None:
     return shutil.which(name)
 
 
+def prompt_module_available() -> bool:
+    try:
+        import prompt  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def missing_pick_helpers() -> list[str]:
-    return [name for name in PICK_HELPERS if helper_path(name) is None]
+    missing = [name for name in PICK_HELPERS if helper_path(name) is None]
+    if not prompt_module_available():
+        missing.append("the prompt module of cli-helpers")
+    return missing
 
 
 def tty_available() -> bool:
@@ -949,41 +957,27 @@ def activity_block(state: dict[str, Any], width: int) -> str:
     return "\n".join(lines)
 
 
-def run_prompt(cmd: list[str]) -> tuple[int, str]:
-    """Run a cli-helpers prompt; its UI is on the tty, its answer on stdout."""
-    proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE)
-    return proc.returncode, (proc.stdout or "").strip("\n")
+def ask(function: str, *arguments: Any, **options: Any) -> Any:
+    """Ask with the prompt module of cli-helpers: it draws on the terminal and
+    returns the answer, None when aborted (Esc, Ctrl-D or Ctrl-C)."""
+    import prompt
+
+    try:
+        return getattr(prompt, function)(*arguments, **options)
+    except KeyboardInterrupt:
+        return None
 
 
 def ask_line(question: str, default: str = "") -> str | None:
-    cmd = ["prompt-input", question]
-    if default:
-        cmd.extend(["--default", default])
-    code, answer = run_prompt(cmd)
-    if code != 0:
-        return None
-    return answer
+    return ask("input_line", question, default)
 
 
 def ask_text(default: str = "") -> str | None:
-    cmd = ["prompt-multiline"]
-    if default:
-        cmd.extend(["--default", default])
-    code, answer = run_prompt(cmd)
-    if code != 0:
-        return None
-    return answer
+    return ask("multiline", None, default)
 
 
 def ask_select(question: str, entries: list[tuple[str, str]], default: str = "") -> str | None:
-    cmd = ["prompt-select", "--prompt", question, "--return", "key"]
-    if default:
-        cmd.extend(["--default", default])
-    cmd.extend(f"{key}={title}" for key, title in entries)
-    code, answer = run_prompt(cmd)
-    if code != 0:
-        return None
-    return answer
+    return ask("select", question, entries, default or None)
 
 
 def glab_write(
@@ -1071,10 +1065,8 @@ def create_issue_interactively(
     """Walk the user through creating an issue. None means they aborted."""
     default_project = str(state.get("project_path") or "")
     paths = known_project_paths(state, candidates)
-    code, answer = run_prompt(
-        ["prompt-complete", "--prompt", "Project:", "--default", default_project] + paths
-    )
-    if code != 0:
+    answer = ask("complete", "Project:", paths, default_project)
+    if answer is None:
         return None
     project_path = answer.strip() or default_project
     if not project_path:
@@ -1121,8 +1113,7 @@ def create_issue_interactively(
 
     print(file=sys.stderr)
     print(f"{project_path}: {title}", file=sys.stderr)
-    proc = subprocess.run(["prompt-continue"], check=False)
-    if proc.returncode != 0:
+    if not ask("confirm", "Continue?"):
         return None
 
     fields: list[tuple[str, str]] = [("title", title), ("description", description)]
