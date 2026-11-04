@@ -1,0 +1,4 @@
+#!/bin/bash
+
+# extra arguments go to golangci-lint run, e.g. packages or --fix
+exec golangci-lint run --enable modernize "$@"

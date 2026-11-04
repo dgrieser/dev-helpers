@@ -1,6 +1,6 @@
 # dev-helpers
 
-Collection of git helper scripts for everyday workflows across GitHub and GitLab.
+Collection of developer tools for everyday workflows: git helpers for GitHub and GitLab, plus Go tooling.
 
 ## Install
 
@@ -792,3 +792,11 @@ every failed call is listed again as the command that repeats it, and the
 script exits with status 1. Re-running the script adds the links that are
 still missing; for a sync that failed on its own, use `--force-sync` or the
 printed command.
+
+### go-lint
+Run `golangci-lint` with the `modernize` linter enabled. Extra arguments are
+passed to `golangci-lint run`.
+```bash
+go-lint [<golangci-lint run args>...]
+```
+Requires `golangci-lint` (v2).
