@@ -7,8 +7,8 @@
 # command cannot change the directory of the shell that started it. Before each
 # prompt __dh_fix_cwd moves a shell whose directory is gone to the main tree the
 # worktree was recorded with when it was removed, else to the main tree a
-# mirrored worktree under WORKSPACE_WORKTREE belongs to, else to the nearest
-# directory that still exists.
+# mirrored worktree under WORKSPACE_WORKTREE belongs to, under WORKSPACE or
+# HOME, else to the nearest directory that still exists.
 
 __dh_removed_worktrees_file="${HOME}/.cache/dev-helpers/removed-worktrees"
 
@@ -40,31 +40,41 @@ __dh_recorded_main_tree() {
 
 # prints the main tree of the mirrored worktree holding ${1}:
 # WORKSPACE_WORKTREE/<path under WORKSPACE>/<branch> belongs to
-# WORKSPACE/<path under WORKSPACE>. A branch may hold slashes, so the deepest
-# path with a repository under WORKSPACE wins
+# WORKSPACE/<path under WORKSPACE>, and, for a repository outside WORKSPACE,
+# WORKSPACE_WORKTREE/home.dir/<path under HOME>/<branch> to HOME/<path under
+# HOME>, see HOME_MIRROR_DIR of git-worktree. A branch may hold slashes, so the
+# deepest path with a repository wins, down to the root itself, as a repository
+# of dotfiles at HOME has its worktrees right below home.dir
 __dh_mirrored_main_tree() {
-    local worktree_root workspace_root rel
+    local worktree_root source_root rel
 
     worktree_root="${WORKSPACE_WORKTREE%/}"
-    workspace_root="${WORKSPACE%/}"
-    [ -n "${worktree_root}" ] && [ -n "${workspace_root}" ] || return 1
+    [ -n "${worktree_root}" ] || return 1
     case "${1}" in
+        "${worktree_root}"/home.dir/*)
+            source_root="${HOME%/}"
+            rel="${1#"${worktree_root}"/home.dir/}"
+            ;;
         "${worktree_root}"/*)
+            source_root="${WORKSPACE%/}"
             rel="${1#"${worktree_root}"/}"
             ;;
         *)
             return 1
             ;;
     esac
+    [ -n "${source_root}" ] || return 1
 
     while :; do
-        if [ -d "${workspace_root}/${rel}/.git" ]; then
-            printf '%s\n' "${workspace_root}/${rel}"
+        if [ -d "${source_root}/${rel}/.git" ]; then
+            printf '%s\n' "${source_root}/${rel}"
             return 0
         fi
-        [[ "${rel}" == */* ]] || return 1
+        [[ "${rel}" == */* ]] || break
         rel="${rel%/*}"
     done
+    [ -d "${source_root}/.git" ] || return 1
+    printf '%s\n' "${source_root}"
 }
 
 __dh_fix_cwd() {

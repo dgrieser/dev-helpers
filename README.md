@@ -36,7 +36,8 @@ not change the directory of the shell that started it, so a shell left in a
 worktree that [git-mr](#git-mr) or [git-worktree](#git-worktree) removed is moved
 at its next prompt: to the main tree recorded at the removal (the same
 subdirectory when it exists there), else to the main tree a worktree under
-`$WORKSPACE_WORKTREE` mirrors, else to the nearest directory that still exists.
+`$WORKSPACE_WORKTREE` mirrors (under `$WORKSPACE`, or under `$HOME` for one below
+`$WORKSPACE_WORKTREE/home.dir`), else to the nearest directory that still exists.
 This holds for every shell in that worktree, not just the one that ran the
 command. Source it after the prompt is set up, so the hook runs first:
 
@@ -665,7 +666,15 @@ Only `add` is bound to `$WORKSPACE_WORKTREE`. The repository is resolved through
 git from any of its worktrees, so `list`, `go`, `delete` and `move-to-main` also
 see worktrees that live elsewhere (another tool's, under `/tmp` or inside the
 repository) and run from inside them; the main tree only has to be under
-`$WORKSPACE`.
+`$WORKSPACE`, or else under `$HOME`.
+
+`add` mirrors the path of the main tree: a repository under `$WORKSPACE` gets its
+worktrees at `$WORKSPACE_WORKTREE/<path under $WORKSPACE>/<branch>`, one elsewhere
+in `$HOME` at `$WORKSPACE_WORKTREE/home.dir/<path under $HOME>/<branch>`, so
+`~/Downloads/chisel/chisel-scan` has them below
+`$WORKSPACE_WORKTREE/home.dir/Downloads/chisel/chisel-scan`. A main tree outside
+both, inside `$WORKSPACE_WORKTREE`, or below `$WORKSPACE/home.dir`, whose mirror
+would be the one of `$HOME`, is refused.
 
 `list` prints every worktree the resolved repository registers, the main tree
 first, and works the same from any of them. A worktree whose directory is gone is

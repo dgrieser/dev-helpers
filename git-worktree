@@ -4,16 +4,22 @@ git() { LC_ALL=C command git -c color.ui=always "$@"; }
 git-color() { command git-color --color=always "$@"; }
 
 APP_NAME="$(basename "${0}")"
+# the dir below WORKSPACE_WORKTREE that mirrors HOME, for the repositories
+# outside WORKSPACE; shell/dev-helpers.bash maps it back
+HOME_MIRROR_DIR="home.dir"
 
 usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} [COMMAND] [OPTIONS]
 
-Create, list, or move mirrored git worktree changes back to WORKSPACE.
+Add, list, go to or delete mirrored git worktrees, or move their changes back
+to the main tree.
 
 Commands:
   add                   Add mirrored worktree for BRANCH at:
     WORKSPACE_WORKTREE/<path under WORKSPACE>/BRANCH
+    or, for a main tree outside WORKSPACE but under HOME, at:
+    WORKSPACE_WORKTREE/${HOME_MIRROR_DIR}/<path under HOME>/BRANCH
     If BRANCH does not exist, ask before creating it.
   list                  List every worktree of the resolved repository: the
                         main tree, the mirrored worktrees, worktrees elsewhere,
@@ -39,8 +45,8 @@ the add offer, there and on alt-a in the picker. Esc in the picker or in a
 question goes back to the menu, ctrl-c ends it.
 
 Only add is bound to WORKSPACE_WORKTREE; the other commands work on any
-worktree of a repository whose main tree is under WORKSPACE, wherever the
-worktree lives, and can run from inside it.
+worktree of a repository whose main tree is under WORKSPACE or HOME, wherever
+the worktree lives, and can run from inside it.
 
 Options:
   -b, --branch BRANCH    Branch to add, or whose worktree to delete/go to;
@@ -58,6 +64,8 @@ Options:
 Environment:
   WORKSPACE              Source workspace root
   WORKSPACE_WORKTREE     Mirrored worktree root
+  HOME                   Root of the repositories outside WORKSPACE, mirrored
+                         below WORKSPACE_WORKTREE/${HOME_MIRROR_DIR}
 EOF
     exit 1
 }
@@ -383,7 +391,10 @@ resolve_branch() {
 
 # The repository is resolved through git: the worktree the dir is in, wherever it
 # lives, and the main tree, which git always lists first. Only the main tree has
-# to be under WORKSPACE, as add mirrors its path.
+# to be under WORKSPACE, or else under HOME, as add mirrors its path: one under
+# WORKSPACE below WORKSPACE_WORKTREE, one elsewhere in HOME below
+# WORKSPACE_WORKTREE/HOME_MIRROR_DIR. A main tree inside WORKSPACE_WORKTREE would
+# mirror into the mirrors, one below WORKSPACE/HOME_MIRROR_DIR into those of HOME.
 resolve_workdir() {
     source_path="$(canonical_dir "${1}")" ||
         fail "Workdir does not exist: ${1}"
@@ -398,8 +409,20 @@ resolve_workdir() {
         sed -n "1s/^worktree //p")"
     workdir="$(canonical_dir "${main_tree}")" ||
         fail "Cannot resolve main tree: ${source_worktree}"
-    inside_path "${workdir}" "${workspace_root}" ||
-        fail "Main tree is not under WORKSPACE: ${workdir}"
+    inside_path "${workdir}" "${workspace_worktree_root}" &&
+        fail "Main tree is inside WORKSPACE_WORKTREE: ${workdir}"
+    if inside_path "${workdir}" "${workspace_root}"; then
+        repo_mirror_dir="${workspace_worktree_root}"
+        repo_mirror_rel="$(relative_to "${workdir}" "${workspace_root}")"
+        inside_path "${repo_mirror_rel}" "${HOME_MIRROR_DIR}" &&
+            fail "Main tree is below WORKSPACE/${HOME_MIRROR_DIR}, whose mirror is HOME's: ${workdir}"
+    elif [ -n "${home_root}" ] && inside_path "${workdir}" "${home_root}"; then
+        repo_mirror_dir="${workspace_worktree_root}/${HOME_MIRROR_DIR}"
+        repo_mirror_rel="$(relative_to "${workdir}" "${home_root}")"
+    else
+        fail "Main tree is neither under WORKSPACE nor under HOME: ${workdir}"
+    fi
+    [ -z "${repo_mirror_rel}" ] || repo_mirror_dir="${repo_mirror_dir}/${repo_mirror_rel}"
 
     if [ "${source_worktree}" = "${workdir}" ]; then
         source_kind="main"
@@ -409,12 +432,7 @@ resolve_workdir() {
 }
 
 target_path_for() {
-    rel="$(relative_to "${workdir}" "${workspace_root}")"
-    if [ -n "${rel}" ]; then
-        echo "${workspace_worktree_root}/${rel}/${1}"
-    else
-        echo "${workspace_worktree_root}/${1}"
-    fi
+    echo "${repo_mirror_dir}/${1}"
 }
 
 add_worktree() {
@@ -531,26 +549,16 @@ format_worktree_row() {
     echo "${entry}"
 }
 
-mirror_dir_for_workdir() {
-    rel="$(relative_to "${workdir}" "${workspace_root}")"
-    if [ -n "${rel}" ]; then
-        echo "${workspace_worktree_root}/${rel}"
-    else
-        echo "${workspace_worktree_root}"
-    fi
-}
-
 mirror_gitdir_of() {
     [ -f "${1}/.git" ] || return 1
     sed -n "s/^gitdir: //p" "${1}/.git" | head -n 1
 }
 
 unregistered_mirror_worktrees() {
-    mirror_dir="$(mirror_dir_for_workdir)"
-    [ -d "${mirror_dir}" ] || return 0
+    [ -d "${repo_mirror_dir}" ] || return 0
     repo_common_dir="$(git_common_dir "${workdir}")" || return 0
 
-    find "${mirror_dir}" -mindepth 2 -name .git -print 2>/dev/null |
+    find "${repo_mirror_dir}" -mindepth 2 -name .git -print 2>/dev/null |
         sed "s|/\.git$||" |
         sort |
         while IFS= read -r candidate; do
@@ -594,7 +602,6 @@ worktree_of_branch() {
 # into, delete the other way round. A worktree outside the mirrored dir of the
 # repository names its path in the title.
 worktree_items() {
-    mirror_dir="$(mirror_dir_for_workdir)"
     rows="$(worktree_rows)" || exit 1
     printf "%s\n" "${rows}" |
         while IFS="$(printf "\t")" read -r path head is_main prunable branch; do
@@ -612,7 +619,7 @@ worktree_items() {
             fi
             if [ "${is_main}" = "1" ]; then
                 title="${title} (main tree)"
-            elif ! inside_path "${path}" "${mirror_dir}"; then
+            elif ! inside_path "${path}" "${repo_mirror_dir}"; then
                 title="${title} (${path})"
             fi
             [ "${prunable}" = "1" ] && title="${title} (prunable)"
@@ -1117,6 +1124,9 @@ base=""
 fetch_arg=""
 do_fetch=0
 workdir_arg=""
+home_root=""
+repo_mirror_dir=""
+repo_mirror_rel=""
 id="$$"
 add_args_are_defaults=0
 key_result=""
@@ -1189,6 +1199,9 @@ mkdir -p "${WORKSPACE_WORKTREE}" ||
     fail "Cannot create WORKSPACE_WORKTREE: ${WORKSPACE_WORKTREE}"
 workspace_worktree_root="$(canonical_dir "${WORKSPACE_WORKTREE}")" ||
     fail "WORKSPACE_WORKTREE does not exist: ${WORKSPACE_WORKTREE}"
+# without a HOME only the repositories under WORKSPACE are supported
+home_root="$(canonical_dir "${HOME:-}")"
+[ "${home_root}" != "/" ] || home_root=""
 
 pick_state="${TMPDIR:-/tmp}/${APP_NAME}-${id}"
 case "${mode}" in
