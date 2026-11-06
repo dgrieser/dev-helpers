@@ -87,6 +87,37 @@ if [ -d "${DIR_NAME}" ]; then
     rm -rf "${DIR_NAME}" 1>&2
 fi
 
+has_remote_branch() { command git -C "${1}" rev-parse --verify -q "refs/remotes/origin/${2}" >/dev/null; }
+
+# Some servers do not advertise HEAD (e.g. GitLab with a stale on-disk HEAD),
+# which leaves the clone without a checkout. Fall back to the forge's default
+# branch, then to main/master.
+checkout_default_branch() {
+    local dir="${1}" branch=""
+    command git -C "${dir}" rev-parse --verify -q HEAD >/dev/null && return 0
+
+    if [[ "${URL}" =~ github\.com ]]; then
+        branch="$(cd "${dir}" && gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null)"
+    else
+        branch="$(cd "${dir}" && glab repo view -F json 2>/dev/null | jq -r '.default_branch // empty')"
+    fi
+    if [ -z "${branch}" ] || ! has_remote_branch "${dir}" "${branch}"; then
+        branch=""
+        for b in main master; do
+            has_remote_branch "${dir}" "${b}" && branch="${b}" && break
+        done
+    fi
+    if [ -z "${branch}" ]; then
+        echo "WARNING: Remote HEAD is missing and no default branch was found, nothing checked out." 1>&2
+        return 1
+    fi
+
+    echo "Remote HEAD is missing, checking out default branch: ${branch}" 1>&2
+    git -C "${dir}" remote set-head origin "${branch}" 1>&2
+    git -C "${dir}" checkout "${branch}" 1>&2
+}
+
 git-color clone "${URL}" 1>&2
+[ -d "${DIR_NAME}/.git" ] && checkout_default_branch "${DIR_NAME}"
 git-find-repo --update-listing
 echo "${PARENT_DIR}/${DIR_NAME}"
