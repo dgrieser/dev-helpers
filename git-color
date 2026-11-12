@@ -178,6 +178,14 @@ EDITOR_CMDS = {
 
 # commands that drive the terminal themselves; painting would swallow their
 # prompts, so they are handed over to git untouched
+# commands whose hooks draw on the terminal (the status line of the
+# prepare-commit-msg hook of git-commit-ai, which only runs for a plain
+# commit): stderr goes to the terminal as it is, since a hook that writes into
+# a pipe falls back to plain lines and the escapes it draws would be stripped
+# anyway; for a commit, stderr only carries hook output, hints and errors,
+# which stay unpainted then, the summary on stdout still gets painted
+HOOK_CMDS = {'commit'}
+
 RAW_CMDS = {
     'citool', 'difftool', 'gitk', 'gui', 'instaweb', 'mergetool', 'p4',
     'send-email', 'svn',
@@ -1546,10 +1554,12 @@ def main():
                                      and sys.stdout.isatty()):
         pager = start_pager()
 
+    stderr_to_terminal = cmd in HOOK_CMDS and sys.stderr.isatty()
     try:
         process = subprocess.Popen(
             ['git', '--no-pager', '-c', 'color.ui=never'] + args,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            stdout=subprocess.PIPE,
+            stderr=None if stderr_to_terminal else subprocess.PIPE, env=env)
     except OSError as error:
         print(f'ERROR: {error}', file=sys.stderr)
         return 1
@@ -1560,13 +1570,16 @@ def main():
     writers = {
         process.stdout: LineWriter(pager.stdin if pager else sys.stdout.buffer,
                                    Painter(theme, cmd, listing)),
-        process.stderr: LineWriter(sys.stderr.buffer, Painter(theme, cmd)),
     }
+    if process.stderr:
+        writers[process.stderr] = LineWriter(sys.stderr.buffer,
+                                             Painter(theme, cmd))
     broken = pump(process, writers)
 
     status = process.wait()
     process.stdout.close()
-    process.stderr.close()
+    if process.stderr:
+        process.stderr.close()
     if pager:
         try:
             pager.stdin.close()
