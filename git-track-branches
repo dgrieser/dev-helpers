@@ -60,7 +60,9 @@ while read -r branch committer_date; do
 done <<< "${remote_branches}"
 if [ "${clear_local_branches}" -eq 1 ]; then
     git-color fetch --prune
-    git -c color.ui=false branch -vv \
-        | awk '/^[^*].*: gone]/{print $1}' \
+    # Skip branches checked out in any worktree (incl. current); they can't be deleted
+    git -c color.ui=false for-each-ref \
+        --format='%(refname:short) %(upstream:track) %(worktreepath)' refs/heads \
+        | awk '$2=="[gone]" && $3=="" {print $1}' \
         | xargs -r git-color --color=always branch -D
 fi
