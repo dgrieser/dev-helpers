@@ -177,6 +177,11 @@ if [ "${create}" -eq 1 ]; then
     # the pipeline of interest is the one the tag just pushed triggered, so ask
     # for that ref instead of the branch and skip the tag queries; it takes a
     # moment to exist, hence --wait; once it succeeded there is nothing left to
-    # look at, so the view ends on its own
-    git-pipe status --ref "${tag}" --no-tags --wait --exit-on-success --quiet
+    # look at, so the view ends on its own. A tag that was recreated still has
+    # the pipelines of the commit it was on before, so the commit it is on now
+    # is the one to wait for and to watch
+    pipe_args=(--ref "${tag}" --no-tags --wait --exit-on-success --quiet)
+    tagged_sha="$(git rev-parse -q --verify "${tag}^{commit}" 2>/dev/null)" \
+        && pipe_args+=(--sha "${tagged_sha}")
+    git-pipe status "${pipe_args[@]}"
 fi

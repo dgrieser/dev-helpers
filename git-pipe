@@ -9,7 +9,7 @@ WATCH_SECONDS_DEFAULT=5
 WATCH_FIRST_DELAY=10
 # a pipeline a push just triggered may not be there yet, see wait_for_pipelines
 WAIT_SECONDS_DEFAULT=30
-WAIT_POLL_SECONDS=3
+WAIT_POLL_SECONDS=1
 # how many of the most recent tags to include pipelines for, and how many
 # pipelines to fetch per tag
 TAG_LIMIT_DEFAULT=3
@@ -100,8 +100,10 @@ Options:
                             (default ${WATCH_SECONDS_DEFAULT}, 0 disables auto-reloading)
         --wait [SECONDS]    wait up to SECONDS for a pipeline to show up instead
                             of reporting none right away; a pipeline a push just
-                            triggered takes a moment to exist; a commit
-                            without a CI config is not waited for
+                            triggered takes a moment to exist; a commit that
+                            starts none is not waited for, which GitLab is
+                            asked for (a dry run of its CI lint) and the
+                            workflows of the commit say on GitHub (needs yq)
                             (default ${WAIT_SECONDS_DEFAULT} when no value is given)
         --exit-on-success   end the picker with exit code 0 once the pipelines of
                             the newest commit succeeded
@@ -175,11 +177,12 @@ build_qs() {
     printf '?%s' "$*"
 }
 
+# GitLab takes the path of a project wherever it takes the id, and the path is
+# what the remote names already, so no request has to ask for the id first
 project_id() {
     if [ -z "${PROJECT_ID:-}" ]; then
-        PROJECT_ID="$(glab repo view -F json | jq -r '.id')"
-        [ -z "${PROJECT_ID}" ] && fail "failed to determine GitLab project id"
-        [ "${PROJECT_ID}" = "null" ] && fail "failed to determine GitLab project id"
+        [ -z "${remote_repository:-}" ] && fail "failed to determine GitLab project"
+        PROJECT_ID="$(urlenc "${remote_repository}")"
     fi
     printf '%s\n' "${PROJECT_ID}"
 }
@@ -1005,14 +1008,17 @@ retry_job() {
 # The state of the pipelines of one commit: running while any of them is,
 # success once all of them ended in SUCCESS_STATES and one of them succeeded,
 # failed otherwise. Without a sha it is the newest commit of the ref, which on
-# GitHub is where every workflow a push started has a run of its own.
+# GitHub is where every workflow a push started has a run of its own. GitLab
+# lists the pipelines of a merge request with the ones of its source branch,
+# under a ref of the request, so those belong to the ref as well.
 commit_pipelines_state() {
     local json="${1}"
     local sha="${2:-}"
 
     jq -r --arg ref "${ref}" --arg sha "${sha}" --arg ok "${SUCCESS_STATES}" "${JQ_ACTIVE}"'
         ($ok | split(" ")) as $oks
-        | [ .[] | select($ref == "" or .ref == $ref) ] as $p
+        | [ .[] | select($ref == "" or .ref == $ref
+                         or ((.ref // "") | startswith("refs/merge-requests/"))) ] as $p
         | (if $sha != "" then $sha else ($p | first | .sha) end) as $s
         | [ $p[] | select(.sha == $s) | .status ] as $st
         | if ($st | length) == 0 then "none"
@@ -1223,51 +1229,307 @@ count_wait_pipelines() {
     jq --arg sha "${watch_sha}" '[ .[] | select($sha == "" or .sha == $sha) ] | length' <<< "${1}"
 }
 
-# A commit without a CI config in its tree gets no pipeline, so there is nothing
-# to wait for. Only the default place of the config is looked at: a GitLab
-# project that takes it from elsewhere, like a custom ci_config_path or Auto
-# DevOps, is reported as it stands right away. A commit that is not here
-# locally cannot be looked into and is waited for
-commit_has_ci_config() {
-    local commit
+# The same count asked of the provider with the smallest answer it gives: the
+# wait asks every second, and the list of a ref is a lot to fetch only to find
+# the commit still missing from it. The filters of a search are left out, so
+# this may count a pipeline the list does not have, never the other way around.
+probe_wait_pipelines() {
+    local args=("per_page=1")
+    local count
+
+    if [ "${provider}" = "github" ]; then
+        [ -n "${ref}" ] && args+=("branch=$(urlenc "${ref}")")
+        [ -n "${watch_sha}" ] && args+=("head_sha=$(urlenc "${watch_sha}")")
+        count="$(gh api "${github_api_args[@]}" \
+            "repos/${github_repository}/actions/runs$(build_qs "${args[@]}")" --jq '.total_count' 2>/dev/null)"
+    else
+        [ -n "${ref}" ] && args+=("ref=$(urlenc "${ref}")")
+        [ -n "${watch_sha}" ] && args+=("sha=$(urlenc "${watch_sha}")")
+        count="$(glab api "projects/$(project_id)/pipelines$(build_qs "${args[@]}")" 2>/dev/null \
+            | jq 'length' 2>/dev/null)"
+    fi
+    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${count}"
+}
+
+# What the events of GitHub Actions workflows make of a push, read off the "on"
+# of every workflow of the commit: yes when one of them runs for it, no when
+# none does, request when that depends on the pull requests of the branch, whose
+# base branches are handed in once they were asked for, and unknown when an "on"
+# cannot be read. Whatever cannot be told from here counts as running, like a
+# paths filter or an event this does not know: waiting for a run that does not
+# come costs a moment, not waiting for one that does loses it. A
+# pull_request_target runs the workflow of the base branch instead of the one
+# of the commit, so it is left out here and asked for on its own ($target),
+# with the workflows of the base branch.
+JQ_GITHUB_TRIGGERS='
+    # a filter pattern of GitHub as a regex: * stops at a slash, ** does not
+    # and takes no folder at all for **/, and ? + [] mean what they mean in a
+    # regex already
+    def globre:
+        reduce (match("\\\\.|\\*\\*/|\\*\\*|\\*|."; "g").string) as $t ("";
+            . + (if $t == "**/" then "(.*/)?"
+                 elif $t == "**" then ".*"
+                 elif $t == "*" then "[^/]*"
+                 elif ($t | length) > 1 then $t
+                 elif ($t | test("[.(){}^$|]")) then "\\" + $t
+                 else $t end))
+        | "^" + . + "$";
+    def patterns: if . == null then [] elif type == "array" then map(tostring) else [tostring] end;
+    # the last pattern that matches decides, one led by ! takes the name out again
+    def included($name):
+        reduce patterns[] as $p (false;
+            if ($p | startswith("!")) then (if ($name | test($p[1:] | globre)) then false else . end)
+            elif ($name | test($p | globre)) then true
+            else . end);
+    def passes($name; $only; $ignore):
+        (if $only != null then ($only | included($name)) else true end)
+        and (any($ignore | patterns[]; . as $p | $name | test($p | globre)) | not);
+    # a push with filters for branches alone leaves out tags and the other way
+    # around, without either it runs for both
+    def push_runs($c; $kind):
+        if ($c | type) != "object" then true
+        else
+            ($c.branches != null or $c["branches-ignore"] != null) as $branches
+            | ($c.tags != null or $c["tags-ignore"] != null) as $tags
+            | if $kind == "branch" then
+                  if $branches then passes($ref; $c.branches; $c["branches-ignore"]) else ($tags | not) end
+              else
+                  if $tags then passes($ref; $c.tags; $c["tags-ignore"]) else ($branches | not) end
+              end
+        end;
+    # a push to the branch of a pull request synchronizes it, a new one is opened
+    def request_runs($c):
+        if ($c | type) != "object" then ($bases | length) > 0
+        else
+            ($c.types == null
+             or any($c.types | patterns[]; . == "opened" or . == "synchronize" or . == "reopened"))
+            and any($bases[]; . as $base | passes($base; $c.branches; $c["branches-ignore"]))
+        end;
+    # the events a push never sets off; a workflow_run follows another workflow,
+    # which answers for itself
+    def inert:
+        ["branch_protection_rule", "delete", "discussion", "discussion_comment", "fork",
+         "gollum", "issue_comment", "issues", "label", "milestone", "public",
+         "pull_request_review", "pull_request_review_comment", "release",
+         "repository_dispatch", "schedule", "watch", "workflow_call",
+         "workflow_dispatch", "workflow_run"];
+    def event($name; $c):
+        if $target then
+            if $name == "pull_request_target" and request_runs($c) then "yes" else "no" end
+        elif $name == "push" then
+            if $skip then "no"
+            elif any($kinds[]; . as $kind | push_runs($c; $kind)) then "yes"
+            else "no" end
+        elif $name == "pull_request" then
+            if $skip or (any($kinds[]; . == "branch") | not) then "no"
+            elif $bases == null then "request"
+            elif request_runs($c) then "yes"
+            else "no" end
+        elif $name == "pull_request_target" or any(inert[]; . == $name) then "no"
+        else "yes" end;
+    def verdict:
+        if any(. == "yes") then "yes"
+        elif any(. == "unknown") then "unknown"
+        elif any(. == "request") then "request"
+        else "no" end;
+    def workflow:
+        if type == "string" then [event(.; null)]
+        elif type == "array" then map(if type == "string" then event(.; null) else "unknown" end)
+        elif type == "object" then (to_entries | map(event(.key; .value)))
+        else ["unknown"] end
+        | verdict;
+    map(try workflow catch "unknown") | verdict
+'
+
+github_triggers_verdict() {
+    local triggers="${1}" skip="${2}" kinds="${3}" bases="${4}" target="${5}"
+
+    jq -rs --arg ref "${ref}" --argjson skip "${skip}" --argjson kinds "${kinds}" \
+        --argjson bases "${bases}" --argjson target "${target}" \
+        "${JQ_GITHUB_TRIGGERS}" <<< "${triggers}" 2>/dev/null
+}
+
+# the "on" of every workflow of a commit, one JSON value a line: nothing for a
+# commit without workflows, and a failure without yq to read them
+github_workflow_triggers() {
+    local commit="${1}"
+    local files file
+
+    files="$(git ls-tree --name-only "${commit}" .github/workflows/ 2>/dev/null | grep -E '\.ya?ml$')"
+    [ -z "${files}" ] && return 0
+    command -v yq >/dev/null 2>&1 || return 1
+    while IFS= read -r file; do
+        git show "${commit}:${file}" 2>/dev/null | yq -o=json -I=0 '.on' - 2>/dev/null || echo "false"
+    done <<< "${files}"
+}
+
+# Whether a workflow of any branch of the remote, as far as they are known here,
+# names pull_request_target at all. Most branches share one tree of workflows,
+# so every tree is looked into once. A clone that does not track every branch
+# of the remote cannot rule it out.
+remote_has_request_target() {
+    local tree
+
+    git config --get-all remote.origin.fetch 2>/dev/null \
+        | grep -qxF '+refs/heads/*:refs/remotes/origin/*' || return 0
+    while IFS= read -r tree; do
+        git grep -q "pull_request_target" "${tree}" 2>/dev/null && return 0
+    done < <(git for-each-ref --format='%(refname):.github/workflows' refs/remotes/origin 2>/dev/null \
+        | git cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null \
+        | awk '$2 == "tree" { print $1 }' | sort -u)
+    return 1
+}
+
+# GitHub has nothing to ask whether a push starts a workflow, so the workflows
+# of the commit are read here: without yq to read them, or without the commit,
+# nothing is known. A commit message that skips CI keeps push and pull_request
+# from running. The open pull requests of a branch are the one thing that takes
+# a request, for their base branches: a pull_request filters by them, and a
+# pull_request_target is the workflow of the base branch, read from where the
+# remote had it last. Without a workflow to run for either there is nothing to
+# ask them for.
+github_pipeline_expected() {
+    local commit triggers verdict bases base base_commit
+    local skip="false" kinds=""
 
     commit="$(git rev-parse -q --verify "${watch_sha:-${ref}}^{commit}" 2>/dev/null)" \
-        || return 0
+        || { echo "unknown"; return 0; }
+    triggers="$(github_workflow_triggers "${commit}")" || { echo "unknown"; return 0; }
+    git log -1 --format=%B "${commit}" 2>/dev/null \
+        | grep -qE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]' && skip="true"
+    # a ref that is not here locally may be either
+    { git show-ref --verify -q "refs/heads/${ref}" || git show-ref --verify -q "refs/remotes/origin/${ref}"; } \
+        && kinds='"branch"'
+    git show-ref --verify -q "refs/tags/${ref}" && kinds="${kinds:+${kinds},}\"tag\""
+    [ -z "${kinds}" ] && kinds='"branch","tag"'
+
+    verdict="$(github_triggers_verdict "${triggers}" "${skip}" "[${kinds}]" "null" "false")"
+    case "${verdict}" in
+        no|request) ;;
+        yes)        echo "yes"; return 0 ;;
+        *)          echo "unknown"; return 0 ;;
+    esac
+    # a tag has no pull requests
+    [[ "${kinds}" == *branch* ]] || { echo "no"; return 0; }
+    [ "${verdict}" = "no" ] && ! remote_has_request_target && { echo "no"; return 0; }
+
+    bases="$(gh api "${github_api_args[@]}" \
+        "repos/${github_repository}/pulls?state=open&per_page=100&head=$(urlenc "${github_repository%%/*}:${ref}")" \
+        2>/dev/null | jq -c '[ .[].base.ref ] | unique' 2>/dev/null)"
+    [ -z "${bases}" ] && { echo "unknown"; return 0; }
+    [ "${bases}" = "[]" ] && { echo "no"; return 0; }
+    if [ "${verdict}" = "request" ]; then
+        verdict="$(github_triggers_verdict "${triggers}" "${skip}" "[${kinds}]" "${bases}" "false")"
+        [ "${verdict}" = "no" ] || { echo "${verdict:-unknown}"; return 0; }
+    fi
+
+    while IFS= read -r base; do
+        base_commit="$(git rev-parse -q --verify "refs/remotes/origin/${base}^{commit}" 2>/dev/null)" \
+            || { echo "unknown"; return 0; }
+        triggers="$(github_workflow_triggers "${base_commit}")" || { echo "unknown"; return 0; }
+        verdict="$(github_triggers_verdict "${triggers}" "false" '["branch"]' \
+            "$(jq -cn --arg base "${base}" '[$base]')" "true")"
+        [ "${verdict}" = "no" ] || { echo "${verdict:-unknown}"; return 0; }
+    done < <(jq -r '.[]' <<< "${bases}")
+    echo "no"
+}
+
+# GitLab answers itself: a dry run of the CI lint creates the pipeline of a push
+# to the ref without keeping it, with the config of the commit from wherever the
+# project takes it, includes and rules applied. A config that leaves nothing to
+# run for a push may still run for a merge request, which the dry run does not
+# cover, so an open request of the branch is waited for. Asking takes the
+# content_ref and dry_run_ref of GitLab 16.5. An answer that says neither is not
+# one, and only without any answer the config in the tree of the commit decides.
+gitlab_pipeline_expected() {
+    local lint verdict requests commit
+
+    lint="$(glab api "projects/$(project_id)/ci/lint?dry_run=true&content_ref=$(urlenc "${watch_sha:-${ref}}")&dry_run_ref=$(urlenc "${ref}")" 2>/dev/null)" \
+        || lint=""
+    verdict="$(jq -r '
+        if .valid == true then "yes"
+        elif (.errors | type) != "array" or (.errors | length) == 0 then "unknown"
+        elif any(.errors[]; test("Missing CI config file")) then "no"
+        elif all(.errors[]; test("workflow:rules|workflow rules|No stages / jobs|prevented any jobs")) then "request"
+        else "unknown" end
+    ' <<< "${lint}" 2>/dev/null)"
+
+    case "${verdict}" in
+        yes|no)
+            echo "${verdict}"
+            ;;
+        request)
+            requests="$(glab api "projects/$(project_id)/merge_requests?state=opened&per_page=1&source_branch=$(urlenc "${ref}")" 2>/dev/null \
+                | jq 'length' 2>/dev/null)"
+            case "${requests}" in
+                0)  echo "no" ;;
+                "") echo "unknown" ;;
+                *)  echo "yes" ;;
+            esac
+            ;;
+        unknown)
+            echo "unknown"
+            ;;
+        *)
+            commit="$(git rev-parse -q --verify "${watch_sha:-${ref}}^{commit}" 2>/dev/null)" \
+                || { echo "unknown"; return 0; }
+            if git cat-file -e "${commit}:.gitlab-ci.yml" 2>/dev/null; then
+                echo "unknown"
+            else
+                echo "no"
+            fi
+            ;;
+    esac
+}
+
+# Whether the commit that is waited for gets a pipeline at all: yes, no or
+# unknown. Only a no ends the wait before it started.
+pipeline_expected() {
+    [ -z "${ref}" ] && { echo "unknown"; return 0; }
     if [ "${provider}" = "github" ]; then
-        git ls-tree --name-only "${commit}" .github/workflows/ 2>/dev/null \
-            | grep -qE '\.ya?ml$'
+        github_pipeline_expected
     else
-        git cat-file -e "${commit}:.gitlab-ci.yml" 2>/dev/null
+        gitlab_pipeline_expected
     fi
 }
 
 # The pipeline of a ref that was just pushed does not exist the moment the push
 # returns, so asking for it right away answers with nothing. --wait keeps asking
 # until one shows up or the time is up. With --sha the older pipelines of the
-# ref do not count, only one of that commit does.
+# ref do not count, only one of that commit does. What the provider makes of the
+# commit is asked first: nothing is waited for when it starts no pipeline, and
+# the time that question took is the pause before the next look.
 wait_for_pipelines() {
     local pipelines="${1}"
-    local count deadline left nap
+    local count deadline
 
     count="$(count_wait_pipelines "${pipelines}")"
     { [ "${count}" -gt 0 ] || [ "${wait_seconds}" -le 0 ]; } \
         && { printf '%s\n' "${pipelines}"; return 0; }
-    if ! commit_has_ci_config; then
-        note "No CI config in the commit, not waiting for a pipeline."
+    if [ "$(pipeline_expected)" = "no" ]; then
+        note "Nothing starts a pipeline for the commit, not waiting for one."
         printf '%s\n' "${pipelines}"
         return 0
     fi
 
     log "No pipelines yet, waiting up to ${wait_seconds}s for one to show up..."
     deadline=$((SECONDS + wait_seconds))
-    while [ "${SECONDS}" -lt "${deadline}" ]; do
-        left=$((deadline - SECONDS))
-        nap="${WAIT_POLL_SECONDS}"
-        [ "${left}" -lt "${nap}" ] && nap="${left}"
-        sleep "${nap}"
-        pipelines="$(fetch_pipelines)" || return 1
-        count="$(count_wait_pipelines "${pipelines}")"
-        [ "${count}" -gt 0 ] && break
+    while :; do
+        # the pipelines of the tags that are listed along are not what the probe
+        # asks for, so with them the whole list is fetched every time
+        count=1
+        if [ "${tag_limit}" -le 0 ] || [ -z "${ref}" ]; then
+            count="$(probe_wait_pipelines)" \
+                || { error "failed to ask for the pipelines of the commit"; return 1; }
+        fi
+        if [ "${count}" -gt 0 ]; then
+            pipelines="$(fetch_pipelines)" || return 1
+            count="$(count_wait_pipelines "${pipelines}")"
+            [ "${count}" -gt 0 ] && break
+        fi
+        [ "${SECONDS}" -ge "${deadline}" ] && break
+        sleep "${WAIT_POLL_SECONDS}"
     done
     printf '%s\n' "${pipelines}"
 }
@@ -1733,6 +1995,13 @@ fi
 if [ -z "${ref}" ] && [ "${all_refs}" -eq 0 ] && [ -z "${jobs_pipeline_id}" ]; then
     ref="$(git branch --show-current)"
     [ -z "${ref}" ] && fail "failed to determine current branch (detached HEAD?); use --ref$([ "${action}" = "search" ] && echo " or --all-refs")"
+fi
+
+# the pipelines name their commit in full, so a short sha is spelled out where
+# the commit is here to do it
+if [ -n "${watch_sha}" ]; then
+    full_sha="$(git rev-parse -q --verify "${watch_sha}^{commit}" 2>/dev/null)" \
+        && watch_sha="${full_sha}"
 fi
 
 remote_url="$(git remote get-url origin)" || fail "failed to determine origin remote"
