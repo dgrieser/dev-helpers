@@ -128,8 +128,13 @@ the first entry, which is where the sort puts whatever is next to act on. A refu
 action, such as staging a file whose conflict markers are still in it, is reported
 above the header until the next key press. `ctrl-d` prints the diff and `enter` the
 selected path, so both end the picker.
+
+`+` / `insert` and `-` / `del` stage and unstage the selected file, `alt-+` and
+`alt--` / `shift-delete` act on every path at once: they stage all untracked and
+unstaged files and unstage all staged ones. Conflicts follow the single-path rules: they are only staged
+once their markers are gone, and never unstaged.
 ```bash
-git-add [-p] [<path>...] [-s <path>] [-u <path>] [-d <path>] [-r <path>] [-i <path>] [-q <query>]
+git-add [-p] [<path>...] [-s <path>] [-u <path>] [-d <path>] [-r <path>] [-i <path>] [-S] [-U] [-q <query>]
 ```
 
 ### git-blame

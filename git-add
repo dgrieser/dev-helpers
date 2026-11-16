@@ -8,6 +8,7 @@ usage() {
     cat <<EOF 1>&2
 usage: ${APP} [-h|--help] [-p|--print] [-q|--query <query>] [<path ...>]
        ${APP} [-s|--stage <path>] [-u|--unstage <path>] [-d|--delete <path>] [-r|--reset <path>] [-i|--ignore <path>]
+       ${APP} [-S|--stage-all] [-U|--unstage-all]
 
 Interactively stage, unstage, delete, reset, or ignore git changes.
 
@@ -19,6 +20,8 @@ Options:
   -d, --delete <path>     Delete one path
   -r, --reset <path>      Reset one path
   -i, --ignore <path>     Ignore one path
+  -S, --stage-all         Stage all untracked and unstaged paths
+  -U, --unstage-all       Unstage all staged paths
   -h, --help              Show this help message
 EOF
     exit 1
@@ -50,10 +53,12 @@ NC='\e[0m'
 HEADER="KEY\tTYPE\tPATH"
 # all keys but the ones that end the picker run inside it: the ones that change
 # the working tree silently, the editor and vimdiff with the terminal handed over
-RELOAD_KEYS="alt-+,alt--,alt-d,alt-r,alt-i,del,insert,+,-"
+# + and - act on one path, alt-+ and alt-- on all of them; shift-delete is the
+# "all" variant of del
+RELOAD_KEYS="alt-+,alt--,alt-d,alt-r,alt-i,del,shift-delete,insert,+,-"
 EXEC_RELOAD_KEYS="ctrl-e,alt-v"
 EXPECT_KEYS="ctrl-d,esc,ctrl-c,enter"
-KEY_DESCS="+:stage,-:unstage,alt-d:delete,alt-r:reset,alt-i:ignore,alt-v:vimdiff,ctrl-d:diff,ctrl-e:edit,del:unstage,insert:stage"
+KEY_DESCS="+:stage,-:unstage,alt-d:delete,alt-r:reset,alt-i:ignore,alt-v:vimdiff,ctrl-d:diff,ctrl-e:edit,del:unstage,insert:stage,alt-+:stage all,alt--:unstage all,shift-delete:unstage all"
 
 print_diff() {
     local current_state="${1}"; shift
@@ -172,6 +177,8 @@ unstage_path=""
 delete_path=""
 reset_path=""
 ignore_path=""
+stage_all=0
+unstage_all=0
 mode="list"
 key_result=""
 query=""
@@ -221,6 +228,14 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ -z "${1}" ] && fail "Missing argument for ignore"
             ignore_path="${1}"
+            mode="update"
+            ;;
+        -S|--stage-all)
+            stage_all=1
+            mode="update"
+            ;;
+        -U|--unstage-all)
+            unstage_all=1
             mode="update"
             ;;
         --key)
@@ -309,11 +324,17 @@ if [ -n "${key_result}" ]; then
             fi
             exit 0
             ;;
-        alt-+|insert|+)
+        insert|+)
             stage_path="${path}"
             ;;
-        alt--|del|-)
+        del|-)
             unstage_path="${path}"
+            ;;
+        alt-+)
+            stage_all=1
+            ;;
+        alt--|shift-delete)
+            unstage_all=1
             ;;
         alt-d)
             delete_path="${path}"
@@ -344,6 +365,55 @@ if [ -n "${stage_path}" ]; then
     elif is_unstaged "${stage_path}" || is_untracked "${stage_path}"; then
         ${STAGE_CMD} "${stage_path}"
         [ -n "${key_result}" ] && echo -e "stage\n${stage_path}" > "${PREVIOUS_UPDATE_FILE}"
+    fi
+fi
+if [ "${stage_all}" -eq 1 ]; then
+    # the same rules as for a single path: a conflict is only staged once its
+    # markers are gone
+    # an intent-to-add file can make a rename listed under its new name alone,
+    # which would leave the deletion of the old one unstaged
+    mapfile -d '' -t candidates < <(${UNSTAGED_LIST_CMD} --no-renames; list_untracked)
+    mapfile -d '' -t conflicts < <(list_conflict)
+    declare -A is_conflict_path=()
+    for f in "${conflicts[@]}"; do
+        is_conflict_path["${f}"]=1
+    done
+    declare -A seen_path=()
+    to_stage=()
+    for f in "${candidates[@]}"; do
+        [[ -n "${seen_path["${f}"]}" ]] && continue
+        seen_path["${f}"]=1
+        if [[ -n "${is_conflict_path["${f}"]}" ]] && has_conflict_markers "${f}"; then
+            error "Not staging '${f}': conflict markers still present"
+            continue
+        fi
+        to_stage+=("${f}")
+    done
+    if [ "${#to_stage[@]}" -gt 0 ]; then
+        # the names are files, not patterns: a "*.txt" would stage the conflicts
+        # skipped above as well
+        GIT_LITERAL_PATHSPECS=1 ${STAGE_CMD} "${to_stage[@]}"
+        [ -n "${key_result}" ] && echo -e "stage\n" > "${PREVIOUS_UPDATE_FILE}"
+    fi
+fi
+if [ "${unstage_all}" -eq 1 ]; then
+    # unmerged paths are listed as staged as well, but restoring their index
+    # entry would throw away the conflict
+    # a staged rename is listed under its new name alone, which would leave the
+    # deletion of the old one staged, so both sides are listed
+    mapfile -d '' -t staged < <(${STAGED_LIST_CMD} --no-renames)
+    mapfile -d '' -t conflicts < <(list_conflict)
+    declare -A is_conflict_path=()
+    for f in "${conflicts[@]}"; do
+        is_conflict_path["${f}"]=1
+    done
+    to_unstage=()
+    for f in "${staged[@]}"; do
+        [[ -n "${is_conflict_path["${f}"]}" ]] || to_unstage+=("${f}")
+    done
+    if [ "${#to_unstage[@]}" -gt 0 ]; then
+        GIT_LITERAL_PATHSPECS=1 ${UNSTAGE_CMD} "${to_unstage[@]}"
+        [ -n "${key_result}" ] && echo -e "unstage\n" > "${PREVIOUS_UPDATE_FILE}"
     fi
 fi
 if [ -n "${unstage_path}" ]; then
