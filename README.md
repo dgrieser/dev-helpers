@@ -679,7 +679,7 @@ git-track-branches [-C|--clear]
 Manage mirrored git worktrees under `$WORKSPACE_WORKTREE`, alongside any other
 worktrees of the repository.
 ```bash
-git-worktree [add|list|go|delete|move-to-main|interactive] [-b <branch>] [-B <base>] [--fetch|--no-fetch] [-w <dir>]
+git-worktree [add|list|go|delete|move-to-main|interactive] [-b <branch>] [-B <base>] [-c] [--fetch|--no-fetch] [-w <dir>]
 ```
 Only `add` is bound to `$WORKSPACE_WORKTREE`. The repository is resolved through
 git from any of its worktrees, so `list`, `go`, `delete` and `move-to-main` also
@@ -741,6 +741,10 @@ When `add` has to create the branch, the start point is taken from `-B/--base`
 (asked interactively when omitted, defaulting to the default remote branch) and
 the base can be fetched beforehand (asked interactively when neither `--fetch`
 nor `--no-fetch` is given).
+`add -c/--create` creates a missing branch without any question: from
+`-B/--base`, else from the default remote branch, and the base is fetched unless
+`--no-fetch` is given. An existing branch is added as it is. `--create` is only
+accepted by `add`.
 
 ### gitlab-move-ldap-sync
 Move LDAP group links from a GitLab group down to its subgroups, so that the
