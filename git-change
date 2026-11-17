@@ -67,14 +67,13 @@ if [ -z "${branch}" ]; then
     if [ "${current_branch}" != "${default_branch}" ]; then
         prompt_args+=( "--default" "${current_branch}" )
     else
-        cmai_args=( "--branch-name-only" )
         if [ -n "${reset_hash_default_branch}" ] && [ "${anychanges}" -eq 0 ]; then
-            cmai_args+=( "--diff" "${reset_hash_default_branch}...HEAD" )
+            suggest_args=( "--diff" "${reset_hash_default_branch}...HEAD" )
         else
-            cmai_args+=( "--unstaged" )
+            suggest_args=( "--unstaged" )
         fi
-        print-text-muted "+ cmai ${cmai_args[*]}" 1>&2
-        suggestion="$(timeout 10 cmai "${cmai_args[@]}" 2>/dev/null)"; exit_code=$?
+        suggestion="$(git-branch-suggest "${suggest_args[@]}")"; exit_code=$?
+        [ ${exit_code} -eq 130 ] && abort
         [ ${exit_code} -eq 0 ] && [ -n "${suggestion}" ] && prompt_args+=( "--default" "${suggestion}" )
     fi
     branch="$(prompt "${prompt_args[@]}")" || abort

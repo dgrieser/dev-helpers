@@ -186,6 +186,20 @@ Create a branch starting from an existing tag.
 git-branch-from-tag [<tag>]
 ```
 
+### git-branch-suggest
+Print a branch name that `cmai` generates for the staged changes, the unstaged
+and untracked ones (`--unstaged`) or a diff (`--diff`). [git-change](#git-change)
+and [git-move](#git-move) offer it as the default branch name.
+
+`cmai` gets up to 3 attempts, with time limits of 30, 45 and 68 seconds: the
+limits of the `prepare-commit-msg` hook of
+[ai-developer-tools](https://github.com/mittwald/ai-developer-tools). Only an
+attempt that timed out is repeated. `Ctrl-C` stops the generation, and the
+calling command with it.
+```bash
+git-branch-suggest [-u|--unstaged] [-d|--diff <diff>]
+```
+
 ### git-browse
 Open the current repo (and optionally a branch, file or line range) in the browser.
 

@@ -230,14 +230,13 @@ fi
 if [ -z "${branch}" ]; then
     prompt_args=( "--single-line" "--prompt" "Enter branch name:" )
     if command -v cmai 1>/dev/null; then
-        cmai_args=( "--branch-name-only" )
         if [ "${has_changes}" -eq 1 ]; then
-            cmai_args+=( "--unstaged" )
+            suggest_args=( "--unstaged" )
         else
-            cmai_args+=( "--diff" "${reset_point}...HEAD" )
+            suggest_args=( "--diff" "${reset_point}...HEAD" )
         fi
-        print-text-muted "+ cmai ${cmai_args[*]}" 1>&2
-        suggestion="$(timeout 10 cmai "${cmai_args[@]}" 2>/dev/null)"; exit_code=$?
+        suggestion="$(git-branch-suggest "${suggest_args[@]}")"; exit_code=$?
+        [ ${exit_code} -eq 130 ] && abort
         [ ${exit_code} -eq 0 ] && [ -n "${suggestion}" ] && prompt_args+=( "--default" "${suggestion}" )
     fi
     branch="$(prompt "${prompt_args[@]}")" || abort

@@ -300,6 +300,20 @@ _git-branch-from-tag()
 }
 complete -F _git-branch-from-tag git-branch-from-tag
 
+_git-branch-suggest()
+{
+    local cur prev
+    __dh_init
+    case "${prev}" in
+        -d|--diff)
+            __dh_compgen "$(__dh_all_branches)"
+            return 0 ;;
+    esac
+    __dh_compgen "-u --unstaged -d --diff -h --help"
+    return 0
+}
+complete -F _git-branch-suggest git-branch-suggest
+
 _git-browse()
 {
     local cur prev
