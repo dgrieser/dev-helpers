@@ -2,118 +2,20 @@
 
 APP_NAME="$(basename "${0}")"
 
-# The same limits as the prepare-commit-msg hook of
-# https://github.com/mittwald/ai-developer-tools
-MAX_ATTEMPTS=3
-TIMEOUT_SECONDS=30            # limit of the first attempt
-TIMEOUT_INCREASE_PERCENT=50   # growth of the limit after each timeout: 30s, 45s, 68s
-KILL_AFTER_SECONDS=2          # time for cmai to stop before it is killed
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    cat <<EOF
+usage: ${APP_NAME} [-u|--unstaged] [-d|--diff <diff>]
 
-usage() {
-    cat <<EOF 1>&2
-usage: ${APP_NAME} [OPTIONS]
-
-Prints a branch name that cmai generates for the staged changes.
-
-cmai gets up to ${MAX_ATTEMPTS} attempts, with time limits of 30, 45 and 68 seconds. Only an
-attempt that timed out is repeated. Ctrl-C stops the generation.
-
-Options:
-    -u, --unstaged      Use the unstaged and untracked changes instead
-    -d, --diff <diff>   Use the changes of <diff> instead, e.g. "main...HEAD"
-    -h, --help          Show this help
-
-Exit status:
-    0      A branch name was printed
-    124    Every attempt timed out
-    130    Stopped with Ctrl-C
-    other  cmai failed
+Prints a branch name from git branch-ai without creating a branch.
+Uses staged changes by default. --unstaged uses unstaged and untracked
+changes, and --diff uses the specified diff, for example main...HEAD.
 EOF
-    exit 1
-}
+    exit 0
+fi
 
-# Reports why there is no branch name. The callers go on without one.
-note() {
-    print-text-muted "${1}" 1>&2
-}
-
-cmai_args=( "--branch-name-only" )
-
-while [ ${#} -gt 0 ]; do
-    case "${1}" in
-        -h|--help)
-            usage
-            ;;
-        -u|--unstaged)
-            cmai_args+=( "--unstaged" )
-            ;;
-        -d|--diff)
-            [ -n "${2}" ] || usage
-            cmai_args+=( "--diff" "${2}" )
-            shift
-            ;;
-        *)
-            usage
-            ;;
-    esac
-    shift
-done
-
-if ! command -v cmai 1>/dev/null; then
-    note "cmai not found"
+if ! command -v git-branch-ai >/dev/null; then
+    print-text-muted "git branch-ai not found. Install it with updater git-commit-ai." >&2
     exit 127
 fi
 
-out_file="$(mktemp)" || exit 1
-child=""
-
-# timeout runs in a process group of its own, together with cmai and the
-# processes that cmai started. The ID of the group is the process ID of timeout.
-cleanup() {
-    if [ -n "${child}" ]; then
-        kill -TERM -- "-${child}" 2>/dev/null || kill -TERM "${child}" 2>/dev/null
-    fi
-    rm -f "${out_file}"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM HUP
-
-attempt=0
-while true; do
-    attempt=$(( attempt + 1 ))
-    note "+ cmai ${cmai_args[*]} (attempt ${attempt}/${MAX_ATTEMPTS}, limit ${TIMEOUT_SECONDS}s)"
-    # Ctrl-C does not reach the process group of timeout. With timeout in the
-    # background, the wait ends at Ctrl-C and cleanup stops the group.
-    timeout -k "${KILL_AFTER_SECONDS}" "${TIMEOUT_SECONDS}" cmai "${cmai_args[@]}" \
-        1>"${out_file}" 2>/dev/null </dev/null &
-    child=$!
-    wait "${child}"; exit_code=$?
-
-    # 124: timed out, 137: killed because it did not stop
-    if [ "${exit_code}" -ne 124 ] && [ "${exit_code}" -ne 137 ]; then
-        child=""
-        break
-    fi
-    # Not every timeout kills the whole group when cmai does not stop.
-    kill -KILL -- "-${child}" 2>/dev/null
-    child=""
-    if [ "${attempt}" -ge "${MAX_ATTEMPTS}" ]; then
-        note "cmai timed out after ${TIMEOUT_SECONDS}s (attempt ${attempt}/${MAX_ATTEMPTS})"
-        exit 124
-    fi
-    note "Timed out after ${TIMEOUT_SECONDS}s"
-    TIMEOUT_SECONDS=$(( TIMEOUT_SECONDS + (TIMEOUT_SECONDS * TIMEOUT_INCREASE_PERCENT + 99) / 100 ))
-done
-
-if [ "${exit_code}" -ne 0 ]; then
-    note "cmai failed (exit ${exit_code})"
-    exit "${exit_code}"
-fi
-
-suggestion="$(tr -d '\r' < "${out_file}")"
-if [ -z "${suggestion}" ]; then
-    note "cmai returned no branch name"
-    exit 1
-fi
-echo "${suggestion}"
+exec git branch-ai --print "${@}"

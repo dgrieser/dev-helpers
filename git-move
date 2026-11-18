@@ -229,7 +229,7 @@ fi
 # Ask for the branch name, suggesting one based on the changes.
 if [ -z "${branch}" ]; then
     prompt_args=( "--single-line" "--prompt" "Enter branch name:" )
-    if command -v cmai 1>/dev/null; then
+    if command -v git-branch-ai 1>/dev/null; then
         if [ "${has_changes}" -eq 1 ]; then
             suggest_args=( "--unstaged" )
         else
