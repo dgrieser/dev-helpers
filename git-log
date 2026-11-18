@@ -186,7 +186,7 @@ term_cols() {
 # the picker moves the hash to the last column and pads the message past the
 # width of the terminal, so the hash sits beyond the right edge of the list:
 # fzf still matches it and hands it to the preview and the key command, it only
-# takes no screen space (--no-hscroll keeps it out there while a hash is typed)
+# takes no screen space because fzf-with-header keeps rows left-aligned.
 print_log() {
     local rows header="${LOG_HEADER}" picker="${1:-0}" minw=""
 
@@ -567,7 +567,6 @@ pick_log() {
                     --preview="${APP} --id ${id} --preview {-1}" \
                     --preview-window=right:60%,nowrap \
                     --expect="${LOG_KEYS}" \
-                    --no-hscroll \
                     --ellipsis= \
                     --no-sort
 }
