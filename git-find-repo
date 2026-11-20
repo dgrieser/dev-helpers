@@ -765,20 +765,34 @@ update_listing() {
     }
 }
 
+# prints the worktree of the repo that has the branch checked out, if any
+worktree_of_branch() {
+    git -C "${1}" worktree list --porcelain | awk -v ref="refs/heads/${2}" '
+        /^worktree / { path = substr($0, 10) }
+        $0 == "branch " ref { print path; exit }
+    '
+}
+
+# checks out the requested MR, PR or branch and prints the directory to go to:
+# the repo itself, or the linked worktree that already has the branch checked
+# out, since Git refuses to check out a branch in two places
 checkout_requested_ref() {
     local repo_path
     local branch
     local info
+    local fork
+    local worktree
 
     repo_path="${1}"
-    [ "${no_checkout}" -eq 1 ] && return 0
-    [ -z "${checkout_mr_id}" ] && [ -z "${checkout_pr_id}" ] && [ -z "${checkout_source_branch}" ] && return 0
+    if [ "${no_checkout}" -eq 1 ] || { [ -z "${checkout_mr_id}" ] && [ -z "${checkout_pr_id}" ] && [ -z "${checkout_source_branch}" ]; }; then
+        echo "${repo_path}"
+        return 0
+    fi
 
     (
         cd "${repo_path}" || fail "Unable to change directory to: ${repo_path}"
-        git-checkout 1>&2 || fail "Unable to checkout default branch"
-        git-color pull 1>&2 || fail "Unable to pull default branch"
         branch="${checkout_source_branch}"
+        fork=0
         if [ -n "${checkout_mr_id}" ]; then
             info="$(glab mr view "${checkout_mr_id}" -F json)" || fail "Unable to get MR: ${checkout_mr_id}"
             branch="$(jq -r '.source_branch' <<< "${info}")"
@@ -787,9 +801,7 @@ checkout_requested_ref() {
             # local branch with the fork owner so it cannot clash with ours
             if [ "$(jq -r '.source_project_id != .target_project_id' <<< "${info}")" = "true" ]; then
                 branch="$(jq -r '.author.username' <<< "${info}")/${branch}"
-                note "MR ${checkout_mr_id} is from a fork, checking out as: ${branch}"
-                glab mr checkout "${checkout_mr_id}" --branch "${branch}" 1>&2 || fail "Unable to checkout fork MR: ${checkout_mr_id}"
-                exit 0
+                fork=1
             fi
         elif [ -n "${checkout_pr_id}" ]; then
             info="$(gh pr view "${checkout_pr_id}" --json headRefName,isCrossRepository,headRepositoryOwner)" || fail "Unable to get PR: ${checkout_pr_id}"
@@ -798,15 +810,33 @@ checkout_requested_ref() {
             # see fork MR handling above
             if [ "$(jq -r '.isCrossRepository' <<< "${info}")" = "true" ]; then
                 branch="$(jq -r '.headRepositoryOwner.login' <<< "${info}")/${branch}"
-                note "PR ${checkout_pr_id} is from a fork, checking out as: ${branch}"
-                gh pr checkout "${checkout_pr_id}" --branch "${branch}" 1>&2 || fail "Unable to checkout fork PR: ${checkout_pr_id}"
-                exit 0
+                fork=1
             fi
-        else
-            note "Switching to source branch: ${branch}"
         fi
-        git-checkout "${branch}" 1>&2 || fail "Unable to switch to source branch: ${branch}"
-        git-color pull 1>&2 || fail "Unable to pull source branch: ${branch}"
+
+        worktree="$(worktree_of_branch "${repo_path}" "${branch}")"
+        if [ -n "${worktree}" ] && [ "${worktree}" != "${repo_path}" ]; then
+            note "${branch} is checked out in worktree: ${worktree}"
+            cd "${worktree}" || fail "Unable to change directory to: ${worktree}"
+            git-color pull 1>&2 || fail "Unable to pull source branch: ${branch}"
+            echo "${worktree}"
+            exit 0
+        fi
+
+        git-checkout 1>&2 || fail "Unable to checkout default branch"
+        git-color pull 1>&2 || fail "Unable to pull default branch"
+        if [ "${fork}" -eq 1 ] && [ -n "${checkout_mr_id}" ]; then
+            note "MR ${checkout_mr_id} is from a fork, checking out as: ${branch}"
+            glab mr checkout "${checkout_mr_id}" --branch "${branch}" 1>&2 || fail "Unable to checkout fork MR: ${checkout_mr_id}"
+        elif [ "${fork}" -eq 1 ]; then
+            note "PR ${checkout_pr_id} is from a fork, checking out as: ${branch}"
+            gh pr checkout "${checkout_pr_id}" --branch "${branch}" 1>&2 || fail "Unable to checkout fork PR: ${checkout_pr_id}"
+        else
+            [ -n "${checkout_source_branch}" ] && note "Switching to source branch: ${branch}"
+            git-checkout "${branch}" 1>&2 || fail "Unable to switch to source branch: ${branch}"
+            git-color pull 1>&2 || fail "Unable to pull source branch: ${branch}"
+        fi
+        echo "${repo_path}"
     ) || exit 1
 }
 
@@ -937,9 +967,9 @@ checkout_source_branch=""
 if [[ "${project}" =~ ^!?[0-9]+$ ]]; then
     checkout_mr_id="${project#!}"
     git_root_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "Not inside a Git repository"
-    checkout_requested_ref "${git_root_dir}"
-    record_switch "${git_root_dir}"
-    echo "${git_root_dir}"
+    target_dir="$(checkout_requested_ref "${git_root_dir}")" || exit 1
+    record_switch "${target_dir}"
+    echo "${target_dir}"
     exit 0
 fi
 
@@ -1008,9 +1038,9 @@ if [[ "${project}" == *"/"* ]]; then
     if [ -n "${prj_candidate}" ]; then
         folder="${workspace}/${prj_candidate}"
         if cd "${folder}"; then
-            checkout_requested_ref "${folder}"
-            record_switch "${folder}"
-            echo "${folder}"
+            target_dir="$(checkout_requested_ref "${folder}")" || exit 1
+            record_switch "${target_dir}"
+            echo "${target_dir}"
             exit 0
         fi
     fi
@@ -1074,13 +1104,13 @@ if [ -z "${match}" ] && [ "${no_git_clone}" -eq 0 ]; then
     note "Attempting to clone ${clone_url} ..."
     echo 1>&2
     folder="$(git-clone "${clone_url}")" || fail "Could not clone ${clone_url}"
-    checkout_requested_ref "${folder}"
-    record_switch "${folder}"
-    echo "${folder}"
+    target_dir="$(checkout_requested_ref "${folder}")" || exit 1
+    record_switch "${target_dir}"
+    echo "${target_dir}"
     exit 0
 fi
 
 [ -z "${match}" ] && fail "${project} was not found locally."
-checkout_requested_ref "${match}"
-record_switch "${match}"
-echo "${match}"
+target_dir="$(checkout_requested_ref "${match}")" || exit 1
+record_switch "${target_dir}"
+echo "${target_dir}"
