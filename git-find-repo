@@ -765,23 +765,185 @@ update_listing() {
     }
 }
 
-# prints the worktree of the repo that has the branch checked out, if any
+# prints the worktree of the repo that has the branch checked out, if any,
+# including one rebasing or bisecting it, where HEAD is detached but Git still
+# holds the branch for that work tree
 worktree_of_branch() {
-    git -C "${1}" worktree list --porcelain | awk -v ref="refs/heads/${2}" '
-        /^worktree / { path = substr($0, 10) }
-        $0 == "branch " ref { print path; exit }
-    '
+    local path
+    local line
+    local file
+    local held
+
+    while IFS= read -r line; do
+        case "${line}" in
+            "worktree "*)
+                path="${line#worktree }"
+                ;;
+            "branch refs/heads/${2}")
+                echo "${path}"
+                return 0
+                ;;
+            "detached")
+                for file in rebase-merge/head-name rebase-apply/head-name BISECT_START; do
+                    file="$(git -C "${path}" rev-parse --path-format=absolute --git-path "${file}" 2>/dev/null)" || continue
+                    [ -f "${file}" ] || continue
+                    held="$(cat "${file}")"
+                    if [ "${held#refs/heads/}" = "${2}" ]; then
+                        echo "${path}"
+                        return 0
+                    fi
+                done
+                ;;
+        esac
+    done < <(git -C "${1}" worktree list --porcelain)
+}
+
+# prints why the work tree at ${1} must not be switched to another branch, if
+# it must not: uncommitted changes (untracked files included) would be carried
+# over, and a rebase, merge, cherry-pick, revert or bisect would be disrupted,
+# including a cherry-pick or revert sequence paused between commits
+busy_reason() {
+    local reasons=()
+    local count
+    local state
+    local path
+
+    count="$(git -C "${1}" status --porcelain --untracked-files=normal 2>/dev/null | wc -l)"
+    [ "${count}" -gt 0 ] && reasons+=("${count} uncommitted changes")
+    for state in rebase-merge:rebase rebase-apply:rebase MERGE_HEAD:merge CHERRY_PICK_HEAD:cherry-pick REVERT_HEAD:revert sequencer/todo:cherry-pick/revert BISECT_LOG:bisect; do
+        path="$(git -C "${1}" rev-parse --path-format=absolute --git-path "${state%%:*}" 2>/dev/null)" || continue
+        [ -e "${path}" ] || continue
+        # a sequence stopped on a conflict is reported by its state file above
+        case "${state} ${reasons[*]}" in
+            "sequencer/todo:"*"cherry-pick in progress"*|"sequencer/todo:"*"revert in progress"*) continue ;;
+        esac
+        reasons+=("${state#*:} in progress")
+    done
+    [ "${#reasons[@]}" -gt 0 ] || return 1
+    (IFS=","; echo "${reasons[*]}" | sed 's/,/, /g')
+}
+
+# prints the remote of the repo at ${1} that has the branch ${2}, origin first;
+# without a branch, the remote the MR/PR refs live on: origin, or else the
+# only remote
+remote_of() {
+    local remote
+    local remotes
+
+    remotes="$(git -C "${1}" remote | grep -vFx origin)"
+    git -C "${1}" remote | grep -qFx origin && remotes="$(printf 'origin\n%s' "${remotes}")"
+    if [ -z "${2}" ]; then
+        [ "$(grep -c . <<< "${remotes}")" -eq 1 ] || remotes="$(grep -Fx origin <<< "${remotes}")"
+        [ -n "${remotes}" ] && head -n 1 <<< "${remotes}"
+        return
+    fi
+    while IFS= read -r remote; do
+        [ -n "${remote}" ] || continue
+        if git -C "${1}" ls-remote --exit-code --heads "${remote}" "refs/heads/${2}" >/dev/null 2>&1; then
+            echo "${remote}"
+            return 0
+        fi
+    done <<< "${remotes}"
+    return 1
+}
+
+# prints the remote of the repo at ${1} whose URL points to the repository of
+# the MR/PR web URL ${2}, which holds its refs/merge-requests or refs/pull
+remote_of_web_url() {
+    local repo
+    local remote
+    local url
+
+    repo="$(sed -E 's|^[a-z]+://||; s|/-/merge_requests/[0-9]+.*$||; s|/pull/[0-9]+.*$||' <<< "${2}")"
+    [ -n "${repo}" ] || return 1
+    while IFS= read -r remote; do
+        url="$(git -C "${1}" remote get-url "${remote}" 2>/dev/null)" || continue
+        url="$(sed -E 's|^[a-z+]+://||; s|^[^@/]+@||; s|:[0-9]*/|/|; s|^([^/:]+):|\1/|; s|\.git/?$||; s|/$||' <<< "${url}")"
+        if [ "${url,,}" = "${repo,,}" ]; then
+            echo "${remote}"
+            return 0
+        fi
+    done < <(git -C "${1}" remote)
+    return 1
+}
+
+# checks out the requested ref in a new worktree added by git-worktree, leaving
+# the busy work tree at ${1} alone, and prints the worktree path; ${2} is the
+# branch, ${3} 1 for a fork MR/PR
+checkout_in_worktree() {
+    local repo_path
+    local branch
+    local fork
+    local worktree
+    local base
+    local head_ref
+    local head
+    local remote
+
+    repo_path="${1}"
+    branch="${2}"
+    fork="${3}"
+    if [ "${fork}" -eq 1 ]; then
+        # glab/gh fetch the fork into the branch and check it out, which Git
+        # refuses for a branch checked out anywhere: add the worktree on the
+        # branch, created from the fetched MR/PR head if missing so glab/gh
+        # can update it, then detach it
+        base=()
+        if ! git -C "${repo_path}" show-ref --verify --quiet "refs/heads/${branch}"; then
+            if [ -n "${checkout_mr_id}" ]; then
+                head_ref="refs/merge-requests/${checkout_mr_id}/head"
+            else
+                head_ref="refs/pull/${checkout_pr_id}/head"
+            fi
+            remote="$(remote_of_web_url "${repo_path}" "${checkout_web_url}")" ||
+                remote="$(remote_of "${repo_path}")" ||
+                fail "Unable to find the remote of: ${head_ref}"
+            git-color -C "${repo_path}" fetch "${remote}" "${head_ref}" 1>&2 ||
+                fail "Unable to fetch: ${head_ref}"
+            head="$(git -C "${repo_path}" rev-parse --verify --quiet FETCH_HEAD)" ||
+                fail "Unable to resolve fetched: ${head_ref}"
+            base=(-B "${head}" --no-fetch)
+        fi
+        worktree="$(WORKSPACE="${workspace}" git-worktree add -w "${repo_path}" -b "${branch}" -c "${base[@]}")" ||
+            fail "Unable to add worktree for: ${branch}"
+        cd "${worktree}" || fail "Unable to change directory to: ${worktree}"
+        git checkout --quiet --detach || fail "Unable to detach HEAD in worktree: ${worktree}"
+        if [ -n "${checkout_mr_id}" ]; then
+            note "MR ${checkout_mr_id} is from a fork, checking out as: ${branch}"
+            glab mr checkout "${checkout_mr_id}" --branch "${branch}" 1>&2 ||
+                fail "Unable to checkout fork MR ${checkout_mr_id} in worktree: ${worktree}"
+        else
+            note "PR ${checkout_pr_id} is from a fork, checking out as: ${branch}"
+            gh pr checkout "${checkout_pr_id}" --branch "${branch}" 1>&2 ||
+                fail "Unable to checkout fork PR ${checkout_pr_id} in worktree: ${worktree}"
+        fi
+    else
+        # a missing branch is created from the fetched remote branch, which
+        # also sets it up to track that
+        base=()
+        if ! git -C "${repo_path}" show-ref --verify --quiet "refs/heads/${branch}"; then
+            remote="$(remote_of "${repo_path}" "${branch}")" || fail "No remote has branch: ${branch}"
+            base=(-B "${remote}/${branch}")
+        fi
+        worktree="$(WORKSPACE="${workspace}" git-worktree add -w "${repo_path}" -b "${branch}" -c "${base[@]}")" ||
+            fail "Unable to add worktree for: ${branch}"
+        cd "${worktree}" || fail "Unable to change directory to: ${worktree}"
+        git-color pull 1>&2 || fail "Unable to pull source branch ${branch} in worktree: ${worktree}"
+    fi
+    echo "${worktree}"
 }
 
 # checks out the requested MR, PR or branch and prints the directory to go to:
-# the repo itself, or the linked worktree that already has the branch checked
-# out, since Git refuses to check out a branch in two places
+# the repo itself, the linked worktree that already has the branch checked out,
+# since Git refuses to check out a branch in two places, or a new worktree when
+# the repo is busy with uncommitted changes or an operation in progress
 checkout_requested_ref() {
     local repo_path
     local branch
     local info
     local fork
     local worktree
+    local busy
 
     repo_path="${1}"
     if [ "${no_checkout}" -eq 1 ] || { [ -z "${checkout_mr_id}" ] && [ -z "${checkout_pr_id}" ] && [ -z "${checkout_source_branch}" ]; }; then
@@ -796,6 +958,7 @@ checkout_requested_ref() {
         if [ -n "${checkout_mr_id}" ]; then
             info="$(glab mr view "${checkout_mr_id}" -F json)" || fail "Unable to get MR: ${checkout_mr_id}"
             branch="$(jq -r '.source_branch' <<< "${info}")"
+            checkout_web_url="$(jq -r '.web_url // empty' <<< "${info}")"
             { [ -n "${branch}" ] && [ "${branch}" != "null" ]; } || fail "Unable to get source branch for MR: ${checkout_mr_id}"
             # the source branch of a fork MR does not exist on origin; prefix the
             # local branch with the fork owner so it cannot clash with ours
@@ -804,8 +967,9 @@ checkout_requested_ref() {
                 fork=1
             fi
         elif [ -n "${checkout_pr_id}" ]; then
-            info="$(gh pr view "${checkout_pr_id}" --json headRefName,isCrossRepository,headRepositoryOwner)" || fail "Unable to get PR: ${checkout_pr_id}"
+            info="$(gh pr view "${checkout_pr_id}" --json headRefName,isCrossRepository,headRepositoryOwner,url)" || fail "Unable to get PR: ${checkout_pr_id}"
             branch="$(jq -r '.headRefName' <<< "${info}")"
+            checkout_web_url="$(jq -r '.url // empty' <<< "${info}")"
             { [ -n "${branch}" ] && [ "${branch}" != "null" ]; } || fail "Unable to get source branch for PR: ${checkout_pr_id}"
             # see fork MR handling above
             if [ "$(jq -r '.isCrossRepository' <<< "${info}")" = "true" ]; then
@@ -815,12 +979,27 @@ checkout_requested_ref() {
         fi
 
         worktree="$(worktree_of_branch "${repo_path}" "${branch}")"
-        if [ -n "${worktree}" ] && [ "${worktree}" != "${repo_path}" ]; then
-            note "${branch} is checked out in worktree: ${worktree}"
-            cd "${worktree}" || fail "Unable to change directory to: ${worktree}"
-            git-color pull 1>&2 || fail "Unable to pull source branch: ${branch}"
-            echo "${worktree}"
-            exit 0
+        if [ -n "${worktree}" ]; then
+            # the branch can be checked out only once; pulling would disrupt
+            # the work in progress on it, so leave a busy work tree as it is
+            if busy="$(busy_reason "${worktree}")"; then
+                note "${branch} is checked out in ${worktree}, not pulling as it is busy (${busy})"
+                echo "${worktree}"
+                exit 0
+            fi
+            if [ "${worktree}" != "${repo_path}" ]; then
+                note "${branch} is checked out in worktree: ${worktree}"
+                cd "${worktree}" || fail "Unable to change directory to: ${worktree}"
+                git-color pull 1>&2 || fail "Unable to pull source branch: ${branch}"
+                echo "${worktree}"
+                exit 0
+            fi
+        fi
+
+        if busy="$(busy_reason "${repo_path}")"; then
+            note "${repo_path} is busy (${busy}), checking out ${branch} in a worktree"
+            checkout_in_worktree "${repo_path}" "${branch}" "${fork}"
+            exit
         fi
 
         git-checkout 1>&2 || fail "Unable to checkout default branch"
@@ -960,6 +1139,7 @@ if [ "${project}" = "-" ]; then
 fi
 
 checkout_mr_id=""
+checkout_web_url=""
 checkout_pr_id=""
 checkout_source_branch=""
 
