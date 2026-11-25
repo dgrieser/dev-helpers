@@ -523,7 +523,9 @@ for GitLab to apply that to the merge status, then merges; it is
 preselected unless a pipeline runs, and not offered for a code owner rule or a
 project that prevents editing the rules in merge requests. While the pipeline
 runs, a further way leads: wait for it, then
-merge, or force merge when something besides the pipeline still blocks. The wait
+merge, or force merge when something besides the pipeline still blocks. Where
+`Bypass approval rules and merge` is offered, Tab switches the wait between the
+forced merge and changing the rules, and it starts on changing them. The wait
 opens the pipelines of the source branch in [git-pipe](#git-pipe) with
 `--exit-on-success`, so it continues on its own once they succeeded; a failed
 pipeline keeps git-pipe open to look into and retry, and leaving it brings the

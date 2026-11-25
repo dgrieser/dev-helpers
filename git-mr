@@ -1248,7 +1248,8 @@ wait_for_approval_sync() {
 # required for the merge, so the merge that needs no flag leads the answers. The
 # other answers name the flag they run, what they are answered against stands
 # above them. On GitLab a missing approval the rules make mandatory blocks the
-# forced merge too, getting past it means changing the rules
+# forced merge too, getting past it means changing the rules; the wait then
+# offers both ways past them as variants of one row, see ask_merge_bypass
 bypass_items() {
     local plain="${1}"
     local wait="${2:-}"
@@ -1264,7 +1265,11 @@ bypass_items() {
     fi
     case "${wait}" in
         wait)        printf '%s\t%s\n' "wait" "Wait for ${CI_LABEL,,}, then merge" ;;
-        wait_bypass) printf '%s\t%s\n' "wait_bypass" "Wait for ${CI_LABEL,,}, then force merge (${bypass_flag})" ;;
+        wait_bypass)
+            printf '%s\t%s\n' "wait_bypass" "Wait for ${CI_LABEL,,}, then force merge (${bypass_flag})"
+            [ "${approvals}" -eq 1 ] && printf '%s\t%s\n' "wait_approvals" \
+                "Wait for ${CI_LABEL,,}, then bypass approval rules and merge"
+            ;;
     esac
     [ "${plain}" -eq 1 ] && printf '%s\t%s\n' "merge" "Merge"
     printf '%s\t%s\n' "bypass" "Force merge (${bypass_flag})"
@@ -1340,8 +1345,9 @@ wait_mode() {
 # where waiting is the answer that does what the target branch asks for, so the
 # cursor starts on it. Otherwise a GitLab request that waits for approvals the
 # rules make mandatory starts on changing the rules, the forced merge fails
-# there. A plain merge that comes back blocked asks again, without offering
-# itself a second time
+# there; the wait then starts on changing them too, as the variant of its row
+# that Tab switches with the forced merge. A plain merge that comes back blocked
+# asks again, without offering itself a second time
 ask_merge_bypass() {
     local n="${1}"
     local retry="${2:-0}"
@@ -1370,14 +1376,18 @@ ask_merge_bypass() {
     fi
     if [ "${pipeline_state}" = "running" ]; then
         wait="$(wait_mode "${requirement}")"
-        select_args+=("--default" "${wait}")
+        if [ "${wait}" = "wait_bypass" ] && [ "${approvals}" -eq 1 ]; then
+            select_args+=("--default" "wait_approvals" "--cycle" "wait_bypass|wait_approvals")
+        else
+            select_args+=("--default" "${wait}")
+        fi
     elif [ "${approvals}" -eq 1 ]; then
         select_args+=("--default" "approvals")
     fi
     choice="$(bypass_items "${plain}" "${wait}" "${approvals}" | prompt-select --prompt "${prompt}" \
         --delimiter '\t' "${select_args[@]}")" || { echo "Abort." 1>&2; return 2; }
     case "${choice}" in
-        wait|wait_bypass)
+        wait|wait_bypass|wait_approvals)
             state="$(watch_item_pipeline "${n}")"
             # a pipeline that ended without success is a new situation, the
             # question is asked again against it; so is a wait that was left
@@ -1387,6 +1397,10 @@ ask_merge_bypass() {
             if [ "${choice}" = "wait_bypass" ]; then
                 merge_item "${n}" bypass
                 return "${?}"
+            fi
+            if [ "${choice}" = "wait_approvals" ]; then
+                bypass_approval_rules "${n}" "${rules}" || return 1
+                wait_for_approval_sync "${n}"
             fi
             merge_item "${n}"
             rc=$?
