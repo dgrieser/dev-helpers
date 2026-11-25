@@ -310,7 +310,7 @@ git-create
 ```
 
 ### git-default
-Print the name of the default remote branch.
+Print the name of the default remote branch: the target of `origin/HEAD`. When that is missing, it is fetched from origin with `git remote set-head origin --auto`, without prompting and for at most 10 seconds. When origin does not tell it, `origin/HEAD` is set to `origin/main` or `origin/master`, so the lookup runs once. Without any of these, a local `main`/`master` is used.
 ```bash
 git-default [--fqn]
 ```

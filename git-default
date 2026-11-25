@@ -43,7 +43,47 @@ done
 
 git_dir="$(git rev-parse --show-toplevel)" || fail "Not a git repo?"
 
-if ref="$(git -C "${git_dir}" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"; then
+remote_head() {
+    git -C "${git_dir}" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null
+}
+
+# origin/HEAD is missing in a repo set up with init and remote add, or when it
+# got pruned: ask origin for it once, so it is there from then on; never prompt
+# for credentials or passphrases, and give up after a few seconds whatever the transport
+if ! ref="$(remote_head)" && command -v timeout >/dev/null &&
+    git -C "${git_dir}" remote | grep -qFx origin; then
+    # BatchMode stops OpenSSH from asking on the terminal; it goes right after
+    # the program of the SSH command Git would use anyway, as OpenSSH takes the
+    # first value of an option, so a configured identity stays; any other SSH
+    # program is bounded by the timeout alone
+    ssh_command="${GIT_SSH_COMMAND:-$(git -C "${git_dir}" config --get core.sshCommand)}"
+    [ -n "${ssh_command}" ] || ssh_command="${GIT_SSH:-ssh}"
+    ssh_program="${ssh_command%% *}"
+    if [ "$(basename "${ssh_program}")" = "ssh" ]; then
+        export GIT_SSH_COMMAND="${ssh_program} -o BatchMode=yes${ssh_command#"${ssh_program}"}"
+    fi
+    # a new session has no controlling terminal, so nothing can ask on
+    # /dev/tty, wrapped SSH commands included
+    detach=()
+    command -v setsid >/dev/null && detach=(setsid -w)
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true SSH_ASKPASS_REQUIRE=never "${detach[@]}" timeout -k 2 10 \
+        git -C "${git_dir}" remote set-head origin --auto >/dev/null 2>&1 </dev/null
+    ref="$(remote_head)"
+fi
+
+# origin may not tell its HEAD, or be unreachable: settle on a remote-tracking
+# main/master, set as origin/HEAD so the lookup above is not repeated each run
+if [ -z "${ref}" ]; then
+    for branch in main master; do
+        if git -C "${git_dir}" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+            git -C "${git_dir}" remote set-head origin "${branch}" >/dev/null 2>&1
+            ref="$(remote_head)" || ref="origin/${branch}"
+            break
+        fi
+    done
+fi
+
+if [ -n "${ref}" ]; then
     [ "${fqn}" -eq 0 ] && basename "${ref}" || echo "${ref}"
     exit 0
 fi
@@ -55,4 +95,4 @@ for branch in main master; do
     fi
 done
 
-fail "No remote HEAD and no local main/master branch found"
+fail "No remote HEAD, no origin main/master and no local main/master branch found"
