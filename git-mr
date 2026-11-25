@@ -161,9 +161,9 @@ goes to the clipboard history (clip --history-only), not the clipboard itself.
 
 Showing a request prints the view of the provider, without its diff, and asks
 what to do with it: approve + merge (tab switches to approve or merge only),
-copy a channel message, its comments or its diff. Copying the message ends
-there, reading the comments or the diff comes back to the question, esc returns
-to the picker.
+copy a channel message, switch to its source branch, its comments or its diff.
+Copying the message and switching end there, reading the comments or the diff
+comes back to the question, esc returns to the picker.
 
 A request that needs no approval, because its rules ask for none or it has every
 approval it needs, is merged by approve + merge without approving it. While its
@@ -650,14 +650,15 @@ show_items() {
         "approve=Approve" \
         "merge=Merge" \
         "copy=Copy message" \
+        "switch=Switch to source branch" \
         "comments=Comments" \
         "diff=Diff"
 }
 
 # the view of a request and what to do with it. Reading its comments or its diff
 # hands the terminal to the pager and comes back here, so the view is printed
-# again. Copying the message or getting the request in is what ends the
-# question, and esc leaves it.
+# again. Copying the message, switching to its source branch or getting the
+# request in is what ends the question, and esc leaves it.
 show_request() {
     local n="${1}"
     local choice
@@ -677,6 +678,10 @@ show_request() {
                 ;;
             copy)
                 copy_message "${n}"
+                return "${?}"
+                ;;
+            switch)
+                checkout_item "${n}"
                 return "${?}"
                 ;;
             comments) show_feedback "${n}" ;;

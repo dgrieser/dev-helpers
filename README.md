@@ -468,8 +468,9 @@ Only those reload, since a reload is an API call.
 
 `enter` shows the request the way its provider does - `glab mr view` or
 `gh pr view`, without the diff - and asks what to do with it: `Approve + Merge`,
-which `tab` switches to `Approve` or `Merge` alone, `Copy message`, `Comments`
-or `Diff`. Copying the channel message ends there, reading the comments or the
+which `tab` switches to `Approve` or `Merge` alone, `Copy message`,
+`Switch to source branch`, `Comments` or `Diff`. Copying the channel message and
+switching to the source branch end there, reading the comments or the
 diff comes back to the question, `esc` returns to the picker. Getting the request in needs no confirmation of its own, since the
 question is asked on the view of the request.
 
