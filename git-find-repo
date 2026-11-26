@@ -867,6 +867,77 @@ remote_of_web_url() {
     return 1
 }
 
+# prints "<patch id> <commit>" for each non-merge commit of the range ${1},
+# the patch id taken verbatim from the stored changes, whitespace and binary
+# content and submodule commits included, whatever the diff configuration,
+# never from a textconv or external diff; fails when git does
+patch_ids() {
+    local -
+    set -o pipefail
+    git log --no-merges --no-color --no-ext-diff --no-textconv --no-relative --submodule=short --ignore-submodules=none --binary --full-index -p --format='commit %H' "${1}" | git patch-id --verbatim
+}
+
+# brings the branch checked out in the current dir up to date with its
+# upstream, which a plain pull cannot do once the MR branch was rebased and
+# force-pushed after an earlier checkout: fast-forwards when behind, keeps local
+# commits when only ahead, resets to the upstream when every local commit is in
+# it already as the very same patch, and fails on local commits found nowhere else,
+# local merges included
+update_branch() {
+    local upstream
+    local branch
+    local unique
+    local busy
+    local local_commits
+    local local_ids
+    local upstream_ids
+
+    branch="$(git branch --show-current)"
+    if ! upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"; then
+        git-color pull 1>&2
+        return
+    fi
+    git-color fetch 1>&2 || return 1
+    if git merge-base --is-ancestor HEAD "${upstream}"; then
+        # pull, unlike merge, updates submodules with submodule.recurse set
+        git-color pull --ff-only 1>&2
+    elif git merge-base --is-ancestor "${upstream}" HEAD; then
+        note "${branch} is ahead of ${upstream}, keeping its local commits"
+    else
+        # a local commit is covered when its patch is upstream; unlike git
+        # cherry, patches are compared whitespace included, as that can
+        # matter, and merges and empty commits, having no patch to compare,
+        # are never covered; any failure here stops before the reset
+        local_commits="$(git rev-list "${upstream}..HEAD")" &&
+            local_ids="$(patch_ids "${upstream}..HEAD")" &&
+            upstream_ids="$(patch_ids "HEAD..${upstream}")" ||
+            { error "Unable to compare ${branch} with ${upstream}"; return 1; }
+        # each upstream patch covers one local commit only, so a patch applied
+        # twice locally needs two upstream copies; each input has one line at
+        # least, so the file counter sees all three
+        unique="$(awk '
+            FNR == 1 { file++ }
+            $0 == "" { next }
+            file == 1 { count[$1]++ }
+            file == 2 && count[$1] > 0 { count[$1]--; covered[$2] = 1 }
+            file == 3 && !covered[$1] { print }
+        ' <(printf '%s\n' "${upstream_ids}") <(printf '%s\n' "${local_ids}") <(printf '%s\n' "${local_commits}"))" ||
+            { error "Unable to compare ${branch} with ${upstream}"; return 1; }
+        if [ -n "${unique}" ]; then
+            error "${branch} and ${upstream} have diverged, with local commits not in ${upstream}:"
+            git log --no-walk --format='  %h %s' ${unique} 1>&2
+            error "Rebase them onto ${upstream}, or drop them with: git reset --hard ${upstream}"
+            return 1
+        fi
+        busy="$(busy_reason .)" && {
+            error "${branch} was rewritten on ${upstream}, not resetting as the work tree is busy (${busy})"
+            return 1
+        }
+        note "${branch} was rewritten on ${upstream} and has no local commits of its own, resetting to it"
+        git-color reset --hard "${upstream}" 1>&2
+    fi
+}
+
 # checks out the requested ref in a new worktree added by git-worktree, leaving
 # the busy work tree at ${1} alone, and prints the worktree path; ${2} is the
 # branch, ${3} 1 for a fork MR/PR
@@ -928,7 +999,7 @@ checkout_in_worktree() {
         worktree="$(WORKSPACE="${workspace}" git-worktree add -w "${repo_path}" -b "${branch}" -c "${base[@]}")" ||
             fail "Unable to add worktree for: ${branch}"
         cd "${worktree}" || fail "Unable to change directory to: ${worktree}"
-        git-color pull 1>&2 || fail "Unable to pull source branch ${branch} in worktree: ${worktree}"
+        update_branch || fail "Unable to update source branch ${branch} in worktree: ${worktree}"
     fi
     echo "${worktree}"
 }
@@ -990,7 +1061,7 @@ checkout_requested_ref() {
             if [ "${worktree}" != "${repo_path}" ]; then
                 note "${branch} is checked out in worktree: ${worktree}"
                 cd "${worktree}" || fail "Unable to change directory to: ${worktree}"
-                git-color pull 1>&2 || fail "Unable to pull source branch: ${branch}"
+                update_branch || fail "Unable to update source branch: ${branch}"
                 echo "${worktree}"
                 exit 0
             fi
@@ -1013,7 +1084,7 @@ checkout_requested_ref() {
         else
             [ -n "${checkout_source_branch}" ] && note "Switching to source branch: ${branch}"
             git-checkout "${branch}" 1>&2 || fail "Unable to switch to source branch: ${branch}"
-            git-color pull 1>&2 || fail "Unable to pull source branch: ${branch}"
+            update_branch || fail "Unable to update source branch: ${branch}"
         fi
         echo "${repo_path}"
     ) || exit 1
