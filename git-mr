@@ -149,9 +149,17 @@ request and its diff in the preview, both filters among its keys:
 
 $(key_help "enter:the chosen action (show by default),tab:switch the state filter,ctrl-b:pick the branch filter,ctrl-d:show the diff,ctrl-o:open in the browser,ctrl-y:copy a channel message,ctrl-f:show the comments,ctrl-s:switch to its source branch,alt-a:approve,alt-m:merge,alt-d:toggle draft,alt-i:create an issue,alt-c:close,alt-x:delete,esc:back")
 
-When glab failed to create a merge request from the current branch, the menu
-offers recover as a third way in, and --create asks to recover it first.
-Recovering submits the options glab saved again (glab mr create --recover).
+Creating a request pulls its source and its target branch first: a checked out
+one with git pull --ff-only, any other is moved to its remote branch when that
+only adds commits. When the target would be the source branch itself, as on the
+default branch, the target branch is asked for, the production branch first.
+
+When glab failed to create a merge request in the repository, the menu offers
+recover as a third way in, preselected when it is the current branch that
+failed; it lists the requests to recover and asks whether to recover the chosen
+one or to drop its saved options. --create asks to recover the one of the
+current branch first. Recovering submits the options glab saved again (glab mr
+create --recover).
 Before a create, a branch the remote has but GitLab does not know yet is waited
 for; GitLab registers a pushed branch in the background, and a create before
 that fails with "source_branch does not exist". A create that fails that way
@@ -1923,13 +1931,30 @@ submit_recovery() {
         return 1
     fi
     wait_for_branch "${source_branch}"
-    glab mr create --recover --yes
+    # the branch is named again, the recovery is not bound to the checked out one
+    glab mr create --recover --yes --source-branch "${source_branch}"
+}
+
+# the source branch the saved options of the failed create name, whatever
+# branch is checked out
+recovery_source_branch() {
+    local file
+
+    file="$(recovery_file)" || return 1
+    [ -r "${file}" ] || return 1
+    jq -r '.source_branch // empty' "${file}" 2>/dev/null
+}
+
+# 0 glab saved the options of a failed create in this repository, for any branch
+has_any_recovery() {
+    [ -n "$(recovery_source_branch)" ]
 }
 
 recover_request() {
-    local source_branch n
+    local source_branch="${1:-}"
+    local n
 
-    source_branch="$(create_source_branch)"
+    [ -z "${source_branch}" ] && source_branch="$(create_source_branch)"
     has_recovery "${source_branch}" || fail "No failed ${NOUN} to recover for ${source_branch}"
     echo "Recovering the ${NOUN} for ${source_branch} → $(jq -r '.target_branch // "?"' \
         "$(recovery_file)")..." 1>&2
@@ -1938,6 +1963,69 @@ recover_request() {
     n="$(wait_for_request "${source_branch}")" || return 0
     record_message "${n}"
     return 0
+}
+
+# drops the saved options of a failed create, so neither the menu nor --create
+# offers to recover it any more
+drop_recovery() {
+    local file
+
+    file="$(recovery_file)" || return 1
+    rm -f "${file}" || { error "Failed to remove the recovery file: ${file}"; return 1; }
+    echo "Dropped the recovery of the failed ${NOUN}." 1>&2
+    return 0
+}
+
+# the requests glab failed to create in this repository, one row each: the
+# source branch as the key, then source → target and the title. glab keeps the
+# options of one failed create per repository, so the list holds one row at most
+recovery_rows() {
+    local file
+
+    file="$(recovery_file)" || return 0
+    [ -r "${file}" ] || return 0
+    jq -r 'select(.source_branch != null)
+        | "\(.source_branch)\t\(.source_branch) → \(.target_branch // "?")  \(.title // "")"' \
+        "${file}" 2>/dev/null
+}
+
+# the recover entry of the menu: a list of the requests to recover, then what
+# to do with the chosen one. esc steps back, from the question to the list and
+# from the list to the menu
+# 0 an answer ran, 1 it failed, 2 the menu is to come back, RC_INTERRUPTED
+# ctrl-c ends the run
+recover_menu() {
+    local rows source_branch choice rc
+
+    while true; do
+        rows="$(recovery_rows)"
+        [ -z "${rows}" ] && { warning "No failed ${NOUN_PLURAL} to recover"; return 2; }
+        source_branch="$(prompt-select --prompt "Recover:" --delimiter '\t' \
+            --no-abort-message <<< "${rows}")"
+        rc="${?}"
+        [ "${rc}" -eq "${RC_INTERRUPTED}" ] && return "${rc}"
+        [ "${rc}" -ne 0 ] && return 2
+        choice="$(printf '%s\n' "recover" "drop" | prompt-select \
+            --prompt "${source_branch}:" --no-abort-message)"
+        rc="${?}"
+        [ "${rc}" -eq "${RC_INTERRUPTED}" ] && return "${rc}"
+        [ "${rc}" -ne 0 ] && continue
+        case "${choice}" in
+            recover)
+                recover_request "${source_branch}"
+                return "${?}"
+                ;;
+            drop)
+                prompt-no-yes "Drop the recovery of the ${NOUN} from ${source_branch}?"
+                rc="${?}"
+                [ "${rc}" -eq "${RC_INTERRUPTED}" ] && return "${rc}"
+                [ "${rc}" -ne 0 ] && continue
+                drop_recovery || return 1
+                # nothing is left to recover, the menu comes back without it
+                return 2
+                ;;
+        esac
+    done
 }
 
 # glab pushes a branch the remote does not have yet right before it creates the
@@ -1970,6 +2058,78 @@ create_or_recover() {
     create_request
 }
 
+# every branch git knows, local and remote, newest first and once each
+known_branches() {
+    git for-each-ref --sort=-committerdate --format='%(refname)' refs/heads refs/remotes \
+        2>/dev/null \
+        | sed -e 's|^refs/heads/||' -e 's|^refs/remotes/[^/]*/||' \
+        | awk '$0 != "HEAD" && !seen[$0]++'
+}
+
+# the target of a request from the branch the default target would be, too:
+# the production and the default branch lead the candidates when git knows
+# them, the others follow newest first; the production branch is preselected
+ask_target_branch() {
+    local source_branch="${1}"
+    local branches default_branch candidates preselected b
+
+    branches="$(known_branches | grep -vFx -- "${source_branch}")"
+    default_branch="$(git-default 2>/dev/null)"
+    candidates="$(
+        for b in "${prod_branch}" "${default_branch}"; do
+            [ -n "${b}" ] && grep -qFx -- "${b}" <<< "${branches}" && printf '%s\n' "${b}"
+        done
+        printf '%s\n' "${branches}"
+    )"
+    candidates="$(awk 'NF && !seen[$0]++' <<< "${candidates}")"
+    [ -z "${candidates}" ] && { error "No other branch to target"; return 1; }
+    preselected="$(head -n 1 <<< "${candidates}")"
+    prompt-select --prompt "Target branch for ${source_branch}:" --filter --delimiter '' \
+        --default "${preselected}" <<< "${candidates}"
+}
+
+# the worktree a branch is checked out in, if any; -z keeps the paths as they
+# are, the plain porcelain output quotes unusual ones
+branch_worktree() {
+    git worktree list --porcelain -z 2>/dev/null | awk -v RS='\0' -v ref="refs/heads/${1}" '
+        /^worktree / { wt = substr($0, 10) }
+        $0 == "branch " ref { print wt; exit }'
+}
+
+# brings a local branch up to the remote branch it tracks before a request is
+# created from or into it: a checked out one is pulled (fast-forward only), any
+# other is moved along when the remote one only adds commits. A branch git does
+# not have locally or that tracks nothing is left alone; a failed update is
+# a warning, the request is created all the same. Expects a fetch before
+update_branch() {
+    local b="${1}"
+    local upstream worktree local_rev upstream_rev
+
+    git show-ref --verify --quiet "refs/heads/${b}" || return 0
+    upstream="$(git for-each-ref --format='%(upstream:short)' "refs/heads/${b}")"
+    [ -z "${upstream}" ] && return 0
+    worktree="$(branch_worktree "${b}")"
+    if [ -n "${worktree}" ]; then
+        echo "Pulling ${b}..." 1>&2
+        git-color -C "${worktree}" pull --ff-only 1>&2 \
+            || warning "Failed to pull ${b} in ${worktree}"
+        return 0
+    fi
+    local_rev="$(git rev-parse --verify --quiet "refs/heads/${b}")"
+    upstream_rev="$(git rev-parse --verify --quiet "${upstream}")" || return 0
+    [ "${local_rev}" = "${upstream_rev}" ] && return 0
+    if ! git merge-base --is-ancestor "${local_rev}" "${upstream_rev}"; then
+        warning "${b} has commits ${upstream} does not have, left as it is"
+        return 0
+    fi
+    if git update-ref "refs/heads/${b}" "${upstream_rev}" "${local_rev}"; then
+        echo "Updated ${b}: ${local_rev:0:9}..${upstream_rev:0:9}" 1>&2
+    else
+        warning "Failed to update ${b}"
+    fi
+    return 0
+}
+
 create_request() {
     local source_branch target_branch default_branch title n
     local draft=0
@@ -1983,11 +2143,21 @@ create_request() {
     default_branch="$(git-default 2>/dev/null)"
     target_branch="$(create_target_branch "${source_branch}")"
     [ -z "${target_branch}" ] && fail "Failed to determine the target branch, use -b/--branch"
-    [ "${source_branch}" = "${target_branch}" ] \
-        && fail "Source and target branch are the same: ${source_branch}"
+
+    git-color fetch --all 1>&2
+    if [ "${source_branch}" = "${target_branch}" ]; then
+        # on the default branch the default target is the branch itself, so the
+        # target is asked for, unless no terminal can answer
+        [ -t 0 ] && [ -t 2 ] \
+            || fail "Source and target branch are the same: ${source_branch}, use -b/--branch"
+        echo 1>&2
+        target_branch="$(ask_target_branch "${source_branch}")" || abort
+        [ -z "${target_branch}" ] && abort
+    fi
 
     echo "Creating a ${NOUN} for ${source_branch} → ${target_branch}..." 1>&2
-    git-color fetch --all 1>&2
+    update_branch "${source_branch}"
+    update_branch "${target_branch}"
 
     title="$(commit_to_title)"
     echo 1>&2
@@ -2192,7 +2362,7 @@ run_menu() {
     local choice rc preselected
     local recoverable=0
 
-    has_recovery "$(create_source_branch)" && recoverable=1
+    has_any_recovery && recoverable=1
     # the list decides which way in the menu starts on: with an open request
     # there is one to show, without one there is one to create, or to recover
     # when glab failed to create it. The answer is an API call, so it is taken
@@ -2200,7 +2370,7 @@ run_menu() {
     # the picker
     if has_open_requests; then
         preselected="show"
-    elif [ "${recoverable}" -eq 1 ]; then
+    elif has_recovery "$(create_source_branch)"; then
         preselected="recover"
     else
         preselected="create"
@@ -2215,8 +2385,11 @@ run_menu() {
                 return "${?}"
                 ;;
             recover)
-                recover_request
-                return "${?}"
+                recover_menu
+                rc=$?
+                [ "${rc}" -ne 2 ] && return "${rc}"
+                has_any_recovery || recoverable=0
+                [ "${preselected}" = "recover" ] && [ "${recoverable}" -eq 0 ] && preselected="create"
                 ;;
             show)
                 action="${choice}"
